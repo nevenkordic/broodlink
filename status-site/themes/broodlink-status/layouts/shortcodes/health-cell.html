@@ -1,0 +1,5 @@
+<div class="health-cell" role="status" aria-label="{{ .Get "service" }}: {{ .Get "status" }}">
+  <span class="status-dot status-{{ .Get "status" }}" role="img" aria-label="{{ .Get "status" }}"></span>
+  <span class="health-service">{{ .Get "service" }}</span>
+  {{ if .Get "latency" }}<span class="health-latency">{{ .Get "latency" }}ms</span>{{ end }}
+</div>

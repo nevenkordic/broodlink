@@ -1,0 +1,41 @@
+# Secrets — never commit
+.secrets/
+.age-identity
+secrets.enc.toml.key
+*.pem
+*.key
+.env
+.env.*
+.sops.yaml
+secrets.skeleton.toml
+secrets.enc.toml
+secrets.enc.json
+
+# Spec (local only)
+broodlink-prompt.md
+
+# Build artifacts
+target/
+dist/
+status-site/public/
+.hugo_build.lock
+
+# Runtime
+*.log
+*.pid
+bin/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# Node (vendored JS only, no npm)
+node_modules/
+
+# Podman / Docker
+.docker/

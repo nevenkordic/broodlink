@@ -1,0 +1,43 @@
+# Broodlink — Multi-agent AI orchestration
+# Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[formula]
+name = "build-feature"
+version = "1.0.0"
+description = "End-to-end feature development: plan, implement, test, document"
+
+[[steps]]
+name = "plan"
+agent_role = "architect"
+tools = ["semantic_search", "recall_memory", "log_decision"]
+prompt = "Create a technical plan for implementing {{feature_name}}: {{feature_description}}. Log the architectural decision."
+output = "plan"
+
+[[steps]]
+name = "implement"
+agent_role = "developer"
+tools = ["store_memory", "complete_task", "log_work"]
+prompt = "Implement the feature according to the plan. Update task status as you progress."
+input = "plan"
+output = "implementation"
+
+[[steps]]
+name = "test"
+agent_role = "tester"
+tools = ["store_memory", "complete_task", "log_work"]
+prompt = "Write and run tests for the implementation. Report any issues found."
+input = "implementation"
+output = "test_results"
+
+[[steps]]
+name = "document"
+agent_role = "writer"
+tools = ["store_memory"]
+prompt = "Document the new feature, including usage examples and any configuration needed."
+input = "implementation"
+output = "documentation"
+
+[formula.parameters]
+feature_name = { type = "string", required = true, description = "Name of the feature" }
+feature_description = { type = "string", required = true, description = "Detailed description" }

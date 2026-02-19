@@ -1,0 +1,23 @@
+<aside class="sidebar" aria-label="Main navigation">
+  <h1>
+    <a href="/">
+      <img src="/img/broodlink-logo.svg" alt="Broodlink" class="sidebar-logo">
+    </a>
+  </h1>
+  <nav>
+    <ul>
+      <li><a href="/" {{ if eq .RelPermalink "/" }}aria-current="page"{{ end }}>Dashboard</a></li>
+      <li><a href="/agents/" {{ if hasPrefix .RelPermalink "/agents" }}aria-current="page"{{ end }}>Agents</a></li>
+      <li><a href="/decisions/" {{ if hasPrefix .RelPermalink "/decisions" }}aria-current="page"{{ end }}>Decisions</a></li>
+      <li><a href="/memory/" {{ if hasPrefix .RelPermalink "/memory" }}aria-current="page"{{ end }}>Memory</a></li>
+      <li><a href="/commits/" {{ if hasPrefix .RelPermalink "/commits" }}aria-current="page"{{ end }}>Commits</a></li>
+      <li><a href="/audit/" {{ if hasPrefix .RelPermalink "/audit" }}aria-current="page"{{ end }}>Audit Log</a></li>
+      <li><a href="/beads/" {{ if hasPrefix .RelPermalink "/beads" }}aria-current="page"{{ end }}>Beads</a></li>
+      <li><a href="/approvals/" {{ if hasPrefix .RelPermalink "/approvals" }}aria-current="page"{{ end }}>Approvals</a></li>
+      <li><a href="/delegations/" {{ if hasPrefix .RelPermalink "/delegations" }}aria-current="page"{{ end }}>Delegations</a></li>
+      <li><a href="/guardrails/" {{ if hasPrefix .RelPermalink "/guardrails" }}aria-current="page"{{ end }}>Guardrails</a></li>
+      <li><a href="/a2a/" {{ if hasPrefix .RelPermalink "/a2a" }}aria-current="page"{{ end }}>A2A</a></li>
+    </ul>
+  </nav>
+  <div>v{{ .Site.Params.version }}</div>
+</aside>

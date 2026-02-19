@@ -1,0 +1,22 @@
+[package]
+name = "mcp-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+broodlink-config = { path = "../../crates/broodlink-config" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+reqwest = { workspace = true }
+uuid = { workspace = true }
+broodlink-telemetry = { path = "../../crates/broodlink-telemetry" }
+futures = { workspace = true }
+tokio-stream = { workspace = true }

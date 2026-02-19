@@ -1,0 +1,115 @@
+[broodlink]
+env     = "local"
+version = "0.1.0"
+
+[profile]
+name              = "dev"
+tls_interservice  = false
+nats_cluster      = false
+dolt_replication  = false
+postgres_replicas = 0
+qdrant_distributed = false
+audit_residency   = false
+
+[residency]
+region              = "local"
+data_classification = "internal"
+allowed_egress      = []
+
+[dolt]
+host            = "127.0.0.1"
+port            = 3307
+database        = "agent_ledger"
+user            = "root"
+password_key    = "BROODLINK_DOLT_PASSWORD"
+min_connections = 2
+max_connections = 5
+
+[postgres]
+host            = "127.0.0.1"
+port            = 5432
+database        = "broodlink_hot"
+user            = "postgres"
+password_key    = "BROODLINK_POSTGRES_PASSWORD"
+min_connections = 5
+max_connections = 20
+
+[nats]
+url            = "nats://localhost:4222"
+subject_prefix = "broodlink"
+
+[qdrant]
+url        = "http://localhost:6333"
+collection = "broodlink_memory"
+api_key    = "BROODLINK_QDRANT_API_KEY"
+
+[beads]
+workspace    = "."
+bd_binary    = "bd"
+formulas_dir = ".beads/formulas"
+
+[ollama]
+url             = "http://localhost:11434"
+embedding_model = "nomic-embed-text"
+timeout_seconds = 30
+
+[secrets]
+provider      = "sops"
+sops_file     = "./secrets.enc.json"
+age_identity  = "~/.broodlink/age-identity"
+infisical_url = "http://localhost:8080"
+
+[status_api]
+port         = 3312
+cors_origins = ["http://localhost:1313"]
+api_key_name = "BROODLINK_STATUS_API_KEY"
+
+[rate_limits]
+requests_per_minute_per_agent = 60
+burst                         = 10
+
+[routing]
+new_agent_bonus = 1.0
+
+[routing.weights]
+capability   = 0.35
+success_rate = 0.25
+availability = 0.20
+cost         = 0.15
+recency      = 0.05
+
+[telemetry]
+enabled       = false
+otlp_endpoint = "http://localhost:4317"
+sample_rate   = 1.0
+
+[mcp_server]
+enabled                 = true
+transport               = "http"      # "http" (streamable), "sse" (legacy), or "stdio"
+port                    = 3311
+session_timeout_minutes = 30
+cors_origins            = ["http://localhost:1313"]
+
+[beads_bridge]
+port = 3310
+
+[a2a]
+enabled        = true
+port           = 3313
+api_key_name   = "BROODLINK_A2A_API_KEY"
+bridge_url     = "http://localhost:3310"
+bridge_jwt_path = "~/.broodlink/jwt-a2a-gateway.token"
+
+[agents.claude]
+agent_id           = "claude"
+role               = "strategist"
+transport          = "mcp"
+cost_tier          = "high"
+preferred_formulas = ["research", "build-feature"]
+
+[agents.qwen3]
+agent_id           = "qwen3"
+role               = "worker"
+transport          = "pymysql"
+cost_tier          = "low"
+preferred_formulas = ["daily-review", "knowledge-gap"]

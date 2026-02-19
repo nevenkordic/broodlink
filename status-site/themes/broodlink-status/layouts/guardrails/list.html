@@ -1,0 +1,22 @@
+{{ define "main" }}
+<h2>Guardrail Policies</h2>
+<p class="page-desc">Safety policies that block or limit specific agent actions. Violations are logged for review.</p>
+<div class="card-grid" id="guardrail-policies" aria-live="polite">
+  <!-- Populated by JS -->
+</div>
+
+<h2>Recent Violations</h2>
+<div class="filter-bar" id="violation-filters">
+  <label for="violation-agent-filter">Agent:</label>
+  <select id="violation-agent-filter">
+    <option value="">All</option>
+  </select>
+</div>
+<div class="table-wrap" id="violations-table" aria-live="polite">
+  <!-- Populated by JS -->
+</div>
+{{ end }}
+
+{{ define "scripts" }}
+<script src="/js/guardrails.js"></script>
+{{ end }}

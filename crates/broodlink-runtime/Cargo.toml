@@ -1,0 +1,15 @@
+[package]
+name = "broodlink-runtime"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+broodlink-config = { path = "../broodlink-config" }
+async-nats.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

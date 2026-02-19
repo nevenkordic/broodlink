@@ -1,0 +1,77 @@
+{{ define "main" }}
+<h2>Operations Dashboard</h2>
+<p class="page-desc">Live overview of all agents, tasks, and system health.</p>
+
+<div id="stale-banner" class="stale-banner" role="alert">
+  <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+    <path d="M8 1a7 7 0 100 14A7 7 0 008 1zm0 11a1 1 0 110-2 1 1 0 010 2zm1-4H7V4h2v4z"/>
+  </svg>
+  <span>Status API unreachable. Data may be stale.</span>
+</div>
+
+<section aria-labelledby="metrics-heading">
+  <h3 id="metrics-heading" class="visually-hidden">Key Metrics</h3>
+  <div class="card-grid" id="metrics-grid">
+    <div class="card metric-card">
+      <div class="value" id="metric-agents">—</div>
+      <div class="label" data-tooltip="Agents with activity in the last 24 hours">Active Agents</div>
+    </div>
+    <div class="card metric-card">
+      <div class="value" id="metric-tasks">—</div>
+      <div class="label" data-tooltip="Tasks waiting to be claimed by an agent">Pending Tasks</div>
+    </div>
+    <div class="card metric-card">
+      <div class="value" id="metric-decisions">—</div>
+      <div class="label" data-tooltip="Decisions logged in the current UTC day">Decisions Today</div>
+    </div>
+    <div class="card metric-card">
+      <div class="value" id="metric-memories">—</div>
+      <div class="label">Memory Entries</div>
+    </div>
+  </div>
+</section>
+
+<section aria-labelledby="health-heading">
+  <h3 id="health-heading">System Health</h3>
+  <div class="health-grid" id="health-grid" aria-live="polite">
+    <!-- Populated by JS -->
+  </div>
+</section>
+
+<section aria-labelledby="agents-heading">
+  <h3 id="agents-heading">Agent Roster</h3>
+  <div class="card-grid" id="agent-roster" aria-live="polite">
+    <!-- Populated by JS -->
+  </div>
+</section>
+
+<section aria-labelledby="activity-heading">
+  <h3 id="activity-heading">Recent Activity</h3>
+  <ul class="activity-feed" id="activity-feed" aria-live="polite" aria-relevant="additions">
+    <!-- Populated by JS -->
+  </ul>
+</section>
+
+<section aria-labelledby="tasks-heading">
+  <h3 id="tasks-heading">Task Queue</h3>
+  <table>
+    <caption>Current task queue status</caption>
+    <thead>
+      <tr>
+        <th scope="col">ID</th>
+        <th scope="col">Type</th>
+        <th scope="col">Status</th>
+        <th scope="col">Agent</th>
+        <th scope="col">Created</th>
+      </tr>
+    </thead>
+    <tbody id="tasks-tbody">
+      <!-- Populated by JS -->
+    </tbody>
+  </table>
+</section>
+{{ end }}
+
+{{ define "scripts" }}
+<script src="/js/dashboard.js"></script>
+{{ end }}

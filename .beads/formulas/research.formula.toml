@@ -1,0 +1,34 @@
+# Broodlink — Multi-agent AI orchestration
+# Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[formula]
+name = "research"
+version = "1.0.0"
+description = "Deep research workflow: gather sources, synthesize findings, produce report"
+
+[[steps]]
+name = "gather_sources"
+agent_role = "researcher"
+tools = ["semantic_search", "recall_memory"]
+prompt = "Search for information on {{topic}}. Gather at least 5 relevant sources."
+output = "sources"
+
+[[steps]]
+name = "analyze_sources"
+agent_role = "researcher"
+tools = ["semantic_search", "recall_memory"]
+prompt = "Analyze the gathered sources and identify key themes, contradictions, and gaps."
+input = "sources"
+output = "analysis"
+
+[[steps]]
+name = "synthesize_report"
+agent_role = "writer"
+tools = ["store_memory", "log_decision"]
+prompt = "Produce a comprehensive research report based on the analysis. Store key findings as memories."
+input = "analysis"
+output = "report"
+
+[formula.parameters]
+topic = { type = "string", required = true, description = "The research topic" }

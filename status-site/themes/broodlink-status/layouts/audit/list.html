@@ -1,0 +1,29 @@
+{{ define "main" }}
+<h2>Audit Log</h2>
+<p class="page-desc">Every tool call made by every agent, with parameters, result, and timing.</p>
+<div class="filter-bar">
+  <label for="audit-agent-filter">Agent</label>
+  <input type="text" id="audit-agent-filter" placeholder="Filter by agent…">
+  <label for="audit-operation-filter">Operation</label>
+  <input type="text" id="audit-operation-filter" placeholder="Filter by operation…">
+</div>
+<table>
+  <caption>System audit trail</caption>
+  <thead>
+    <tr>
+      <th scope="col">ID</th>
+      <th scope="col">Agent</th>
+      <th scope="col">Operation</th>
+      <th scope="col" data-tooltip="ok, error, or timeout">Result</th>
+      <th scope="col">Time</th>
+    </tr>
+  </thead>
+  <tbody id="audit-tbody" aria-live="polite">
+    <!-- Populated by JS -->
+  </tbody>
+</table>
+{{ end }}
+
+{{ define "scripts" }}
+<script src="/js/audit.js"></script>
+{{ end }}

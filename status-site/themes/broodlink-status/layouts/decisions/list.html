@@ -1,0 +1,15 @@
+{{ define "main" }}
+<h2>Decision Log</h2>
+<p class="page-desc">Logged decisions with reasoning — an audit trail of what each agent decided and why.</p>
+<div class="filter-bar">
+  <label for="decision-search" class="visually-hidden">Search decisions</label>
+  <input type="search" id="decision-search" placeholder="Filter decisions…" aria-controls="decisions-list">
+</div>
+<div class="card-grid" id="decisions-list" aria-live="polite">
+  <!-- Populated by JS -->
+</div>
+{{ end }}
+
+{{ define "scripts" }}
+<script src="/js/decisions.js"></script>
+{{ end }}

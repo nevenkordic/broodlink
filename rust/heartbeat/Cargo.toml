@@ -1,0 +1,24 @@
+[package]
+name = "heartbeat"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+broodlink-secrets = { path = "../../crates/broodlink-secrets" }
+broodlink-config = { path = "../../crates/broodlink-config" }
+broodlink-telemetry = { path = "../../crates/broodlink-telemetry" }
+broodlink-runtime = { path = "../../crates/broodlink-runtime" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+sqlx = { workspace = true }
+async-nats = { workspace = true }
+reqwest = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }

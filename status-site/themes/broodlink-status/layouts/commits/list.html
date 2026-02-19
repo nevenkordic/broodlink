@@ -1,0 +1,22 @@
+{{ define "main" }}
+<h2>Dolt Commits</h2>
+<p class="page-desc">Version history of the Dolt knowledge database. Every 5 minutes, the heartbeat service commits changes.</p>
+<table>
+  <caption>Recent Dolt version history</caption>
+  <thead>
+    <tr>
+      <th scope="col" data-tooltip="Dolt commit hash — like a git SHA for the knowledge database">Hash</th>
+      <th scope="col">Author</th>
+      <th scope="col">Message</th>
+      <th scope="col">Date</th>
+    </tr>
+  </thead>
+  <tbody id="commits-tbody" aria-live="polite">
+    <!-- Populated by JS -->
+  </tbody>
+</table>
+{{ end }}
+
+{{ define "scripts" }}
+<script src="/js/commits.js"></script>
+{{ end }}

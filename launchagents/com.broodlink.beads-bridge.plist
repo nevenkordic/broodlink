@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.broodlink.beads-bridge</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__BROOD_DIR__/target/release/beads-bridge</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>BROODLINK_CONFIG</key>
+        <string>__BROOD_DIR__/config.toml</string>
+        <key>PATH</key>
+        <string>__HOMEBREW_PREFIX__/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>__BROOD_DIR__</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/beads-bridge.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/beads-bridge.stderr.log</string>
+</dict>
+</plist>

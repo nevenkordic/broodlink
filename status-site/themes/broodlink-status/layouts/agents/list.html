@@ -1,0 +1,11 @@
+{{ define "main" }}
+<h2>Agent Roster</h2>
+<p class="page-desc">Registered AI agents with their roles, capabilities, and performance metrics.</p>
+<div class="card-grid" id="agent-roster" aria-live="polite">
+  <!-- Populated by JS -->
+</div>
+{{ end }}
+
+{{ define "scripts" }}
+<script src="/js/agents.js"></script>
+{{ end }}

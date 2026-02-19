@@ -1,0 +1,15 @@
+baseURL          = "http://localhost:1313"
+languageCode     = "en-us"
+title            = "Broodlink Operations"
+theme            = "broodlink-status"
+
+[params]
+  statusApiUrl    = "http://localhost:3312"
+  statusApiKey    = "dev-api-key"  # override in production
+  refreshInterval = 10000
+  company         = "Broodlink"
+  version         = "0.3.0"
+
+[build]
+  [build.environment]
+    BROODLINK_ENV = "development"

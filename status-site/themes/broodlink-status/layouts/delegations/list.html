@@ -1,0 +1,22 @@
+{{ define "main" }}
+<h2>Delegations</h2>
+<p class="page-desc">Tasks delegated from one agent to another, with acceptance status and results.</p>
+<div class="filter-bar" id="delegation-filters">
+  <label for="delegation-status-filter">Status:</label>
+  <select id="delegation-status-filter">
+    <option value="">All</option>
+    <option value="pending">Pending</option>
+    <option value="accepted">Accepted</option>
+    <option value="rejected">Rejected</option>
+    <option value="completed">Completed</option>
+    <option value="failed">Failed</option>
+  </select>
+</div>
+<div class="table-wrap" id="delegations-table" aria-live="polite">
+  <!-- Populated by JS -->
+</div>
+{{ end }}
+
+{{ define "scripts" }}
+<script src="/js/delegations.js"></script>
+{{ end }}

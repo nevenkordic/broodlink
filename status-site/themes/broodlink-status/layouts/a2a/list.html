@@ -1,0 +1,18 @@
+{{ define "main" }}
+<h2>A2A Gateway</h2>
+<p class="page-desc">Agent-to-Agent gateway for communicating with external AI agents using Google's A2A protocol.</p>
+
+<div class="card" id="a2a-card-section" aria-live="polite">
+  <h3>Agent Card</h3>
+  <pre id="a2a-card">Loading...</pre>
+</div>
+
+<h3 style="margin-top:1.5rem;">A2A Task Mappings</h3>
+<div id="a2a-tasks" aria-live="polite">
+  <!-- Populated by JS -->
+</div>
+{{ end }}
+
+{{ define "scripts" }}
+<script src="/js/a2a.js"></script>
+{{ end }}

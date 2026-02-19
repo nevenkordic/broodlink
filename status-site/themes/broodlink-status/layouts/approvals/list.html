@@ -1,0 +1,89 @@
+{{ define "main" }}
+<h2>Approval Gates</h2>
+<p class="page-desc">Human-in-the-loop gates that pause agent work until approved. Policies can auto-approve based on confidence thresholds.</p>
+<div class="filter-bar" id="approval-filters">
+  <label for="approval-status-filter">Status:</label>
+  <select id="approval-status-filter">
+    <option value="">All</option>
+    <option value="pending" selected>Pending</option>
+    <option value="approved">Approved</option>
+    <option value="auto_approved">Auto-Approved</option>
+    <option value="rejected">Rejected</option>
+    <option value="expired">Expired</option>
+  </select>
+</div>
+<div class="table-wrap" id="approvals-table" aria-live="polite">
+  <!-- Populated by JS -->
+</div>
+
+<h2>Approval Policies
+  <button class="btn" id="btn-new-policy" style="margin-left:12px;font-size:0.85em;">+ New Policy</button>
+</h2>
+
+<div id="policy-editor" style="display:none;margin-bottom:24px;padding:16px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card,#1e1e2e);">
+  <h3 id="policy-editor-title">New Approval Policy</h3>
+  <form id="policy-form" autocomplete="off">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+      <div>
+        <label for="pf-name">Name</label>
+        <input type="text" id="pf-name" required placeholder="e.g. auto-approve-low" style="width:100%;">
+      </div>
+      <div>
+        <label for="pf-gate-type" data-tooltip="When the gate triggers: before dispatch, before completion, or on budget">Gate Type</label>
+        <select id="pf-gate-type" style="width:100%;">
+          <option value="pre_dispatch">pre_dispatch</option>
+          <option value="pre_completion">pre_completion</option>
+          <option value="budget">budget</option>
+          <option value="custom">custom</option>
+        </select>
+      </div>
+      <div style="grid-column:1/-1;">
+        <label for="pf-description">Description (optional)</label>
+        <input type="text" id="pf-description" placeholder="What this policy does" style="width:100%;">
+      </div>
+      <div>
+        <label>Severity Levels</label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <label><input type="checkbox" name="pf-severity" value="low"> low</label>
+          <label><input type="checkbox" name="pf-severity" value="medium"> medium</label>
+          <label><input type="checkbox" name="pf-severity" value="high"> high</label>
+          <label><input type="checkbox" name="pf-severity" value="critical"> critical</label>
+        </div>
+      </div>
+      <div>
+        <label for="pf-agent-ids">Agent IDs (comma-separated, or * for all)</label>
+        <input type="text" id="pf-agent-ids" placeholder="* or claude, qwen3" style="width:100%;">
+      </div>
+      <div>
+        <label for="pf-tool-names">Tool Names (comma-separated, optional)</label>
+        <input type="text" id="pf-tool-names" placeholder="e.g. store_memory, log_work" style="width:100%;">
+      </div>
+      <div>
+        <label style="display:flex;align-items:center;gap:8px;">
+          <input type="checkbox" id="pf-auto-approve"> Auto-approve matching gates
+        </label>
+      </div>
+      <div>
+        <label for="pf-threshold" data-tooltip="Minimum confidence for auto-approval. Gates below this need manual review">Confidence Threshold (0.0 - 1.0)</label>
+        <input type="number" id="pf-threshold" min="0" max="1" step="0.1" value="0.8" style="width:100%;">
+      </div>
+      <div>
+        <label for="pf-expiry">Expiry (minutes)</label>
+        <input type="number" id="pf-expiry" min="1" value="60" style="width:100%;">
+      </div>
+    </div>
+    <div style="margin-top:16px;display:flex;gap:8px;">
+      <button type="submit" class="btn btn-approve">Save Policy</button>
+      <button type="button" class="btn" id="btn-cancel-policy">Cancel</button>
+    </div>
+  </form>
+</div>
+
+<div class="table-wrap" id="approval-policies" aria-live="polite">
+  <!-- Populated by JS -->
+</div>
+{{ end }}
+
+{{ define "scripts" }}
+<script src="/js/approvals.js"></script>
+{{ end }}

@@ -1,0 +1,320 @@
+# Broodlink — Multi-agent AI orchestration (Production)
+# Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Production compose: 3-node NATS cluster, Postgres primary + replica,
+# TLS volumes, health checks. Use with:
+#   podman-compose -f podman-compose.prod.yaml up -d
+
+version: "3"
+
+services:
+  # ── Infrastructure ──────────────────────────────────────────────
+
+  dolt:
+    image: docker.io/dolthub/dolt-sql-server:latest
+    ports:
+      - "3307:3306"
+    volumes:
+      - dolt-data:/var/lib/dolt
+    environment:
+      DOLT_ROOT_DIR: /var/lib/dolt
+    command:
+      [
+        "dolt",
+        "sql-server",
+        "--host=0.0.0.0",
+        "--port=3306",
+        "--user=root",
+        "--password=${BROODLINK_DOLT_PASSWORD:?Set BROODLINK_DOLT_PASSWORD}",
+      ]
+    healthcheck:
+      test: ["CMD", "dolt", "sql", "-q", "SELECT 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  postgres-primary:
+    image: docker.io/library/postgres:16-alpine
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-primary-data:/var/lib/postgresql/data
+      - ./tls/certs:/etc/broodlink/tls:ro
+    environment:
+      POSTGRES_DB: broodlink_hot
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${BROODLINK_POSTGRES_PASSWORD:?Set BROODLINK_POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "max_wal_senders=3"
+      - "-c"
+      - "hot_standby=on"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  postgres-replica:
+    image: docker.io/library/postgres:16-alpine
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg-replica-data:/var/lib/postgresql/data
+      - ./tls/certs:/etc/broodlink/tls:ro
+    environment:
+      PGUSER: postgres
+      PGPASSWORD: ${BROODLINK_POSTGRES_PASSWORD:?Set BROODLINK_POSTGRES_PASSWORD}
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    entrypoint: |
+      bash -c '
+      if [ ! -s /var/lib/postgresql/data/PG_VERSION ]; then
+        echo "Initializing replica from primary..."
+        until pg_basebackup -h postgres-primary -D /var/lib/postgresql/data -U postgres -Fp -Xs -P -R; do
+          echo "Waiting for primary..."
+          sleep 5
+        done
+      fi
+      exec postgres -c hot_standby=on
+      '
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # 3-node NATS cluster
+  nats-1:
+    image: docker.io/library/nats:2-alpine
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - nats-1-data:/data
+      - ./tls/certs:/etc/broodlink/tls:ro
+    command:
+      - "--jetstream"
+      - "--store_dir=/data"
+      - "--cluster_name=broodlink"
+      - "--cluster=nats://0.0.0.0:6222"
+      - "--routes=nats://nats-2:6222,nats://nats-3:6222"
+      - "--name=nats-1"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  nats-2:
+    image: docker.io/library/nats:2-alpine
+    ports:
+      - "4223:4222"
+    volumes:
+      - nats-2-data:/data
+    command:
+      - "--jetstream"
+      - "--store_dir=/data"
+      - "--cluster_name=broodlink"
+      - "--cluster=nats://0.0.0.0:6222"
+      - "--routes=nats://nats-1:6222,nats://nats-3:6222"
+      - "--name=nats-2"
+    restart: unless-stopped
+
+  nats-3:
+    image: docker.io/library/nats:2-alpine
+    ports:
+      - "4224:4222"
+    volumes:
+      - nats-3-data:/data
+    command:
+      - "--jetstream"
+      - "--store_dir=/data"
+      - "--cluster_name=broodlink"
+      - "--cluster=nats://0.0.0.0:6222"
+      - "--routes=nats://nats-1:6222,nats://nats-2:6222"
+      - "--name=nats-3"
+    restart: unless-stopped
+
+  qdrant:
+    image: docker.io/qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:6333/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  ollama:
+    image: docker.io/ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # ── Observability ───────────────────────────────────────────────
+
+  jaeger:
+    image: docker.io/jaegertracing/all-in-one:1.62
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    restart: unless-stopped
+
+  # ── Broodlink Services ─────────────────────────────────────────
+
+  beads-bridge:
+    build:
+      context: .
+      dockerfile: rust/beads-bridge/Containerfile
+    ports:
+      - "3310:3310"
+    depends_on:
+      dolt:
+        condition: service_healthy
+      postgres-primary:
+        condition: service_healthy
+      nats-1:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    volumes:
+      - ./tls/certs:/etc/broodlink/tls:ro
+    env_file: .secrets/env
+    environment:
+      BROODLINK_CONFIG: /etc/broodlink/config.toml
+    restart: unless-stopped
+
+  coordinator:
+    build:
+      context: .
+      dockerfile: rust/coordinator/Containerfile
+    depends_on:
+      dolt:
+        condition: service_healthy
+      postgres-primary:
+        condition: service_healthy
+      nats-1:
+        condition: service_healthy
+    env_file: .secrets/env
+    environment:
+      BROODLINK_CONFIG: /etc/broodlink/config.toml
+    restart: unless-stopped
+
+  heartbeat:
+    build:
+      context: .
+      dockerfile: rust/heartbeat/Containerfile
+    depends_on:
+      dolt:
+        condition: service_healthy
+      postgres-primary:
+        condition: service_healthy
+      nats-1:
+        condition: service_healthy
+    env_file: .secrets/env
+    environment:
+      BROODLINK_CONFIG: /etc/broodlink/config.toml
+    restart: unless-stopped
+
+  embedding-worker:
+    build:
+      context: .
+      dockerfile: rust/embedding-worker/Containerfile
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+      nats-1:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    env_file: .secrets/env
+    environment:
+      BROODLINK_CONFIG: /etc/broodlink/config.toml
+    restart: unless-stopped
+
+  status-api:
+    build:
+      context: .
+      dockerfile: rust/status-api/Containerfile
+    ports:
+      - "3312:3312"
+    depends_on:
+      dolt:
+        condition: service_healthy
+      postgres-primary:
+        condition: service_healthy
+      nats-1:
+        condition: service_healthy
+    volumes:
+      - ./tls/certs:/etc/broodlink/tls:ro
+    env_file: .secrets/env
+    environment:
+      BROODLINK_CONFIG: /etc/broodlink/config.toml
+    restart: unless-stopped
+
+  a2a-gateway:
+    build:
+      context: .
+      dockerfile: rust/a2a-gateway/Containerfile
+    ports:
+      - "3313:3313"
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+      beads-bridge:
+        condition: service_started
+    volumes:
+      - ./tls/certs:/etc/broodlink/tls:ro
+    env_file: .secrets/env
+    environment:
+      BROODLINK_CONFIG: /etc/broodlink/config.toml
+    restart: unless-stopped
+
+  mcp-server:
+    build:
+      context: .
+      dockerfile: rust/mcp-server/Containerfile
+    ports:
+      - "3311:3311"
+    depends_on:
+      beads-bridge:
+        condition: service_started
+    volumes:
+      - ./tls/certs:/etc/broodlink/tls:ro
+    env_file: .secrets/env
+    environment:
+      BROODLINK_CONFIG: /etc/broodlink/config.toml
+    restart: unless-stopped
+
+volumes:
+  dolt-data:
+  pg-primary-data:
+  pg-replica-data:
+  nats-1-data:
+  nats-2-data:
+  nats-3-data:
+  qdrant-data:
+  ollama-data:

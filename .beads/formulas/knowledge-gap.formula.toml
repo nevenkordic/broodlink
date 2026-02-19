@@ -1,0 +1,34 @@
+# Broodlink — Multi-agent AI orchestration
+# Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[formula]
+name = "knowledge-gap"
+version = "1.0.0"
+description = "Identify and fill knowledge gaps in the agent memory store"
+
+[[steps]]
+name = "audit_memory"
+agent_role = "analyst"
+tools = ["semantic_search", "recall_memory"]
+prompt = "Audit the current memory store. Identify topics with sparse coverage, outdated entries, or missing cross-references."
+output = "gaps"
+
+[[steps]]
+name = "prioritize"
+agent_role = "architect"
+tools = ["log_decision"]
+prompt = "Prioritize the identified knowledge gaps by impact. Log decisions about which gaps to fill first."
+input = "gaps"
+output = "priorities"
+
+[[steps]]
+name = "fill_gaps"
+agent_role = "researcher"
+tools = ["store_memory", "semantic_search"]
+prompt = "Research and fill the top {{max_gaps}} priority knowledge gaps. Store new memories for each."
+input = "priorities"
+output = "filled"
+
+[formula.parameters]
+max_gaps = { type = "integer", required = false, description = "Maximum number of gaps to fill", default = 5 }

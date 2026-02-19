@@ -1,0 +1,5 @@
+<div class="card agent-card" role="article" aria-label="Agent {{ .Get "name" }}">
+  <div class="agent-name">{{ .Get "name" }}</div>
+  <div class="agent-role">{{ .Get "role" }}</div>
+  {{ if .Get "status" }}<span class="status-dot status-{{ .Get "status" }}" role="img" aria-label="{{ .Get "status" }}"></span>{{ end }}
+</div>

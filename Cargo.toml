@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/broodlink-secrets",
+  "crates/broodlink-config",
+  "crates/broodlink-telemetry",
+  "crates/broodlink-runtime",
+  "rust/beads-bridge",
+  "rust/coordinator",
+  "rust/heartbeat",
+  "rust/embedding-worker",
+  "rust/status-api",
+  "rust/mcp-server",
+  "rust/a2a-gateway",
+]
+
+[workspace.package]
+version     = "0.3.0"
+edition     = "2021"
+authors     = ["Neven Kordic <neven@broodlink.ai>"]
+license     = "AGPL-3.0-or-later"
+repository  = "https://github.com/nevenkordic/broodlink"
+
+[workspace.dependencies]
+tokio            = { version = "1", features = ["full"] }
+serde            = { version = "1", features = ["derive"] }
+serde_json       = "1"
+thiserror        = "1"
+anyhow           = "1"
+tracing          = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+config           = "0.14"
+uuid             = { version = "1", features = ["v4"] }
+sqlx             = { version = "0.8", features = ["mysql", "postgres", "runtime-tokio-rustls", "chrono", "json", "uuid"], default-features = false }
+async-nats       = "0.35"
+reqwest          = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+axum             = { version = "0.7", features = ["json"] }
+tower            = "0.4"
+tower-http       = { version = "0.5", features = ["cors", "trace"] }
+chrono           = { version = "0.4", features = ["serde"] }
+rustls           = "0.22"
+tokio-rustls     = "0.25"
+jsonwebtoken     = "9"
+async-trait      = "0.1"
+tempfile          = "3"
+# v0.2.0: OpenTelemetry + TLS
+opentelemetry       = { version = "0.27", features = ["trace"] }
+opentelemetry_sdk   = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp  = { version = "0.27", features = ["tonic"] }
+tracing-opentelemetry = "0.28"
+axum-server         = { version = "0.7", features = ["tls-rustls"] }
+futures             = "0.3"
+tokio-stream        = "0.1"
+toml                = "0.8"

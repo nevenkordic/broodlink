@@ -1,0 +1,21 @@
+# Broodlink — Multi-agent AI orchestration
+# Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+FROM docker.io/library/rust:1.82-slim-bookworm AS builder
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY rust/ rust/
+COPY config.toml ./
+
+RUN cargo build --release -p heartbeat && \
+    cp target/release/heartbeat /build/service
+
+FROM docker.io/library/debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/service /usr/local/bin/service
+COPY --from=builder /build/config.toml /etc/broodlink/config.toml
+ENV BROODLINK_CONFIG=/etc/broodlink/config.toml
+CMD ["/usr/local/bin/service"]

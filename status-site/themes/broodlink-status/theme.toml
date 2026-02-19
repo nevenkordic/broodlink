@@ -1,0 +1,8 @@
+name = "broodlink-status"
+license = "AGPL-3.0-or-later"
+description = "Broodlink operations dashboard theme"
+min_version = "0.120.0"
+
+[author]
+  name = "Neven Kordic"
+  homepage = "https://broodlink.ai"

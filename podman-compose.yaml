@@ -1,0 +1,150 @@
+# Broodlink — Multi-agent AI orchestration
+# Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+version: "3"
+
+services:
+  # ── Infrastructure ──────────────────────────────────────────────
+
+  dolt:
+    image: docker.io/dolthub/dolt-sql-server:latest
+    ports:
+      - "3307:3306"
+    volumes:
+      - dolt-data:/var/lib/dolt
+    environment:
+      DOLT_ROOT_DIR: /var/lib/dolt
+    command:
+      [
+        "dolt",
+        "sql-server",
+        "--host=0.0.0.0",
+        "--port=3306",
+        "--user=root",
+        "--password=changeme",
+      ]
+    restart: unless-stopped
+
+  postgres:
+    image: docker.io/library/postgres:16-alpine
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: broodlink_hot
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: changeme
+    restart: unless-stopped
+
+  nats:
+    image: docker.io/library/nats:2-alpine
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - nats-data:/data
+    command: ["--jetstream", "--store_dir=/data"]
+    restart: unless-stopped
+
+  qdrant:
+    image: docker.io/qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    restart: unless-stopped
+
+  ollama:
+    image: docker.io/ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: unless-stopped
+
+  # ── Observability (optional) ───────────────────────────────────
+
+  jaeger:
+    image: docker.io/jaegertracing/all-in-one:1.62
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    profiles:
+      - telemetry
+    restart: unless-stopped
+
+  # ── Broodlink Services ──────────────────────────────────────────
+
+  beads-bridge:
+    build:
+      context: .
+      dockerfile: rust/beads-bridge/Containerfile
+    ports:
+      - "3310:3310"
+    depends_on:
+      - dolt
+      - postgres
+      - nats
+      - qdrant
+      - ollama
+    env_file: .secrets/env
+    restart: unless-stopped
+
+  coordinator:
+    build:
+      context: .
+      dockerfile: rust/coordinator/Containerfile
+    depends_on:
+      - dolt
+      - postgres
+      - nats
+    env_file: .secrets/env
+    restart: unless-stopped
+
+  heartbeat:
+    build:
+      context: .
+      dockerfile: rust/heartbeat/Containerfile
+    depends_on:
+      - dolt
+      - postgres
+      - nats
+    env_file: .secrets/env
+    restart: unless-stopped
+
+  embedding-worker:
+    build:
+      context: .
+      dockerfile: rust/embedding-worker/Containerfile
+    depends_on:
+      - postgres
+      - nats
+      - qdrant
+      - ollama
+    env_file: .secrets/env
+    restart: unless-stopped
+
+  status-api:
+    build:
+      context: .
+      dockerfile: rust/status-api/Containerfile
+    ports:
+      - "3312:3312"
+    depends_on:
+      - dolt
+      - postgres
+      - nats
+      - qdrant
+    env_file: .secrets/env
+    restart: unless-stopped
+
+volumes:
+  dolt-data:
+  pg-data:
+  nats-data:
+  qdrant-data:
+  ollama-data:

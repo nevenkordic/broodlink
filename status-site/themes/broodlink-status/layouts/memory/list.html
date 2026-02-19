@@ -1,0 +1,21 @@
+{{ define "main" }}
+<h2>Memory Store</h2>
+<p class="page-desc">Shared knowledge base across all agents. Memories persist between sessions and are searchable by vector similarity.</p>
+<section aria-labelledby="memory-stats-heading">
+  <h3 id="memory-stats-heading">Statistics</h3>
+  <div class="card-grid" id="memory-stats" aria-live="polite">
+    <!-- Populated by JS -->
+  </div>
+</section>
+<section aria-labelledby="memory-topics-heading">
+  <h3 id="memory-topics-heading">Top Topics</h3>
+  <div id="topics-chart" role="img" aria-label="Topic distribution chart">
+    <!-- Populated by JS -->
+  </div>
+</section>
+{{ end }}
+
+{{ define "scripts" }}
+<script src="/js/charts.js"></script>
+<script src="/js/memory.js"></script>
+{{ end }}

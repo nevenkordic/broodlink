@@ -1,0 +1,33 @@
+{{ define "main" }}
+<h2>Beads Issues</h2>
+<p class="page-desc">Issue tracker for coordinating work across agents. Issues can be grouped into convoys and driven by workflow formulas.</p>
+<div class="filter-bar">
+  <label for="beads-status-filter">Status</label>
+  <select id="beads-status-filter">
+    <option value="">All</option>
+    <option value="open">Open</option>
+    <option value="in_progress">In Progress</option>
+    <option value="closed">Closed</option>
+  </select>
+</div>
+<table>
+  <caption>Issue tracker</caption>
+  <thead>
+    <tr>
+      <th scope="col" data-tooltip="Unique issue identifier">Bead ID</th>
+      <th scope="col">Title</th>
+      <th scope="col">Status</th>
+      <th scope="col">Assignee</th>
+      <th scope="col" data-tooltip="Group of related issues, like an epic or sprint">Convoy</th>
+      <th scope="col">Updated</th>
+    </tr>
+  </thead>
+  <tbody id="beads-tbody" aria-live="polite">
+    <!-- Populated by JS -->
+  </tbody>
+</table>
+{{ end }}
+
+{{ define "scripts" }}
+<script src="/js/beads.js"></script>
+{{ end }}

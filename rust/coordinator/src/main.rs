@@ -1,0 +1,2130 @@
+/*
+ * Broodlink - Multi-agent AI orchestration system
+ * Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
+ *
+ * This program is free software: you can redistribute it
+ * and/or modify it under the terms of the GNU Affero
+ * General Public License as published by the Free Software
+ * Foundation, either version 3 of the License, or (at your
+ * option) any later version.
+ *
+ * This program is distributed in the hope that it will be
+ * useful, but WITHOUT ANY WARRANTY; without even the
+ * implied warranty of MERCHANTABILITY or FITNESS FOR A
+ * PARTICULAR PURPOSE. See the GNU Affero General Public
+ * License for more details.
+ *
+ * You should have received a copy of the GNU Affero General
+ * Public License along with this program. If not, see
+ * <https://www.gnu.org/licenses/>.
+ */
+
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
+#![warn(clippy::pedantic)]
+#![allow(clippy::module_name_repetitions)]
+
+use std::collections::HashMap;
+use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use broodlink_config::Config;
+use broodlink_secrets::SecretsProvider;
+use futures::StreamExt;
+use serde::{Deserialize, Serialize};
+use sqlx::mysql::MySqlPoolOptions;
+use sqlx::postgres::PgPoolOptions;
+use sqlx::{MySqlPool, PgPool, Row};
+use tokio::sync::watch;
+use tracing::{error, info, warn};
+use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const SERVICE_NAME: &str = "coordinator";
+const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
+const MAX_CLAIM_RETRIES: u32 = 5;
+const BACKOFF_BASE_MS: u64 = 1000;
+
+// ---------------------------------------------------------------------------
+// Error type
+// ---------------------------------------------------------------------------
+
+#[derive(thiserror::Error, Debug)]
+pub enum BroodlinkError {
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("nats error: {0}")]
+    Nats(String),
+    #[error("config error: {0}")]
+    Config(String),
+    #[error("secrets error: {0}")]
+    Secrets(#[from] broodlink_secrets::SecretsError),
+    #[error("no eligible agents for task {task_id}: role={role}")]
+    NoEligibleAgent { task_id: String, role: String },
+    #[error("claim contention exhausted for task {0} after {1} retries")]
+    ClaimExhausted(String, u32),
+    #[error("deserialization error: {0}")]
+    Deserialize(String),
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+impl From<async_nats::ConnectError> for BroodlinkError {
+    fn from(e: async_nats::ConnectError) -> Self {
+        Self::Nats(e.to_string())
+    }
+}
+
+impl From<async_nats::PublishError> for BroodlinkError {
+    fn from(e: async_nats::PublishError) -> Self {
+        Self::Nats(e.to_string())
+    }
+}
+
+impl From<async_nats::SubscribeError> for BroodlinkError {
+    fn from(e: async_nats::SubscribeError) -> Self {
+        Self::Nats(e.to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NATS message payloads
+// ---------------------------------------------------------------------------
+
+/// Payload received on the `task_available` subject.
+#[derive(Deserialize, Debug)]
+struct TaskAvailablePayload {
+    task_id: String,
+    #[serde(default)]
+    task_type: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    cost_tier: Option<String>,
+}
+
+/// Payload dispatched to an agent on the `agent.<id>.task` subject.
+#[derive(Serialize)]
+struct TaskDispatchPayload {
+    task_id: String,
+    title: String,
+    description: Option<String>,
+    priority: i32,
+    formula_name: Option<String>,
+    convoy_id: Option<String>,
+    assigned_by: String,
+}
+
+/// Payload received on the `workflow_start` subject.
+#[derive(Deserialize, Debug)]
+struct WorkflowStartPayload {
+    workflow_id: String,
+    convoy_id: String,
+    formula_name: String,
+    #[serde(default)]
+    params: serde_json::Value,
+    #[allow(dead_code)]
+    started_by: String,
+}
+
+/// Payload received on the `task_completed` subject.
+#[derive(Deserialize, Debug)]
+struct TaskCompletedPayload {
+    task_id: String,
+    #[allow(dead_code)]
+    agent_id: String,
+    #[serde(default)]
+    result_data: Option<serde_json::Value>,
+}
+
+/// Payload received on the `task_failed` subject.
+#[derive(Deserialize, Debug)]
+struct TaskFailedPayload {
+    task_id: String,
+    #[allow(dead_code)]
+    agent_id: String,
+}
+
+/// Metrics payload published to `broodlink.metrics.coordinator`.
+#[derive(Serialize)]
+struct MetricsPayload {
+    service: String,
+    tasks_claimed: u64,
+    tasks_dead_lettered: u64,
+    claim_retries_total: u64,
+    uptime_seconds: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Application state
+// ---------------------------------------------------------------------------
+
+struct AppState {
+    dolt: MySqlPool,
+    pg: PgPool,
+    nats: async_nats::Client,
+    config: Arc<Config>,
+    start_time: std::time::Instant,
+    // Atomic counters for metrics
+    tasks_claimed: AtomicU64,
+    tasks_dead_lettered: AtomicU64,
+    claim_retries_total: AtomicU64,
+}
+
+// ---------------------------------------------------------------------------
+// Agent selection from Dolt agent_profiles
+// ---------------------------------------------------------------------------
+
+/// An eligible agent row from agent_profiles (Dolt).
+#[derive(Debug, Clone)]
+struct EligibleAgent {
+    agent_id: String,
+    cost_tier: String,
+    capabilities: Option<serde_json::Value>,
+    max_concurrent: i32,
+    last_seen: Option<String>,
+}
+
+/// Per-agent metrics from the Postgres `agent_metrics` table.
+#[derive(Debug, Default)]
+struct AgentMetrics {
+    success_rate: f64,
+    current_load: i32,
+}
+
+/// Scored agent candidate ready for selection.
+#[derive(Debug)]
+struct ScoredAgent {
+    agent: EligibleAgent,
+    score: f64,
+    breakdown: ScoreBreakdown,
+}
+
+/// Breakdown of how the score was computed.
+#[derive(Debug, Clone, Serialize)]
+struct ScoreBreakdown {
+    capability: f64,
+    success_rate: f64,
+    availability: f64,
+    cost: f64,
+    recency: f64,
+}
+
+/// Payload published when a routing decision is made.
+#[derive(Serialize)]
+struct RoutingDecisionPayload {
+    task_id: String,
+    agent_id: String,
+    score: f64,
+    breakdown: ScoreBreakdown,
+    candidates_evaluated: usize,
+    attempt: u32,
+}
+
+/// Query Dolt `agent_profiles` for active agents matching the requested role.
+async fn find_eligible_agents(
+    dolt: &MySqlPool,
+    role: &str,
+    cost_tier: Option<&str>,
+) -> Result<Vec<EligibleAgent>, BroodlinkError> {
+    let rows = if let Some(tier) = cost_tier {
+        sqlx::query(
+            "SELECT agent_id, cost_tier, capabilities, max_concurrent,
+                    CAST(last_seen AS CHAR) AS last_seen_str
+             FROM agent_profiles
+             WHERE role = ? AND cost_tier = ? AND active = true",
+        )
+        .bind(role)
+        .bind(tier)
+        .fetch_all(dolt)
+        .await?
+    } else {
+        sqlx::query(
+            "SELECT agent_id, cost_tier, capabilities, max_concurrent,
+                    CAST(last_seen AS CHAR) AS last_seen_str
+             FROM agent_profiles
+             WHERE role = ? AND active = true",
+        )
+        .bind(role)
+        .fetch_all(dolt)
+        .await?
+    };
+
+    let agents = rows
+        .iter()
+        .map(|row| {
+            let agent_id: String = row.get("agent_id");
+            let cost_tier: String = row.get("cost_tier");
+            let capabilities: Option<serde_json::Value> = row.get("capabilities");
+            let max_concurrent: i32 = row.get("max_concurrent");
+            let last_seen: Option<String> = row.get("last_seen_str");
+            EligibleAgent {
+                agent_id,
+                cost_tier,
+                capabilities,
+                max_concurrent,
+                last_seen,
+            }
+        })
+        .collect();
+
+    Ok(agents)
+}
+
+/// Fetch metrics for a batch of agent IDs from Postgres `agent_metrics`.
+async fn fetch_agent_metrics(
+    pg: &PgPool,
+    agent_ids: &[String],
+) -> Result<HashMap<String, AgentMetrics>, BroodlinkError> {
+    if agent_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    // Build a parameterized query for the list of agent_ids
+    let placeholders: Vec<String> = (1..=agent_ids.len()).map(|i| format!("${i}")).collect();
+    let query_str = format!(
+        "SELECT agent_id, success_rate, current_load
+         FROM agent_metrics WHERE agent_id IN ({})",
+        placeholders.join(", ")
+    );
+
+    let mut query = sqlx::query(&query_str);
+    for id in agent_ids {
+        query = query.bind(id);
+    }
+
+    let rows = query.fetch_all(pg).await?;
+
+    let mut metrics = HashMap::new();
+    for row in &rows {
+        let agent_id: String = row.get("agent_id");
+        let success_rate: f32 = row.get("success_rate");
+        let current_load: i32 = row.get("current_load");
+        metrics.insert(
+            agent_id,
+            AgentMetrics {
+                success_rate: f64::from(success_rate),
+                current_load,
+            },
+        );
+    }
+
+    Ok(metrics)
+}
+
+/// Map cost_tier string to efficiency score: low=1.0, medium=0.6, high=0.3.
+fn cost_tier_score(tier: &str) -> f64 {
+    match tier {
+        "low" => 1.0,
+        "medium" => 0.6,
+        "high" => 0.3,
+        _ => 0.3,
+    }
+}
+
+/// Compute the recency bonus based on last_seen timestamp.
+/// 1.0 if < 60s ago, 0.0 if > 30min, linear interpolation between.
+fn recency_score(last_seen: Option<&str>) -> f64 {
+    let Some(ts_str) = last_seen else {
+        return 0.0;
+    };
+
+    let Ok(last) = chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S") else {
+        return 0.0;
+    };
+
+    let now = chrono::Utc::now().naive_utc();
+    let elapsed_secs = (now - last).num_seconds().max(0) as f64;
+
+    if elapsed_secs < 60.0 {
+        1.0
+    } else if elapsed_secs > 1800.0 {
+        0.0
+    } else {
+        // Linear decay from 1.0 at 60s to 0.0 at 1800s
+        1.0 - (elapsed_secs - 60.0) / (1800.0 - 60.0)
+    }
+}
+
+/// Compute agent score using the weighted multi-factor algorithm.
+fn compute_score(
+    agent: &EligibleAgent,
+    metrics: Option<&AgentMetrics>,
+    formula_name: Option<&str>,
+    weights: &broodlink_config::RoutingWeights,
+    new_agent_bonus: f64,
+) -> (f64, ScoreBreakdown) {
+    // Capability match: when a formula is specified, agents declaring that
+    // capability in their JSON get 1.0; otherwise 0.5. When no formula is
+    // specified we give 1.0 (role match is all that matters).
+    let capability = match formula_name {
+        Some(formula) => match &agent.capabilities {
+            Some(caps) if caps.get(formula).is_some() => 1.0,
+            _ => 0.5,
+        },
+        None => 1.0,
+    };
+
+    // Success rate from metrics, default to new_agent_bonus if no metrics
+    let success_rate = metrics.map_or(new_agent_bonus, |m| m.success_rate);
+
+    // Availability: 1.0 - (current_load / max_concurrent), clamped to [0.0, 1.0]
+    let availability = if let Some(m) = metrics {
+        let max = if agent.max_concurrent > 0 {
+            agent.max_concurrent
+        } else {
+            5
+        };
+        (1.0 - f64::from(m.current_load) / f64::from(max)).clamp(0.0, 1.0)
+    } else {
+        1.0 // No metrics = assume available
+    };
+
+    let cost = cost_tier_score(&agent.cost_tier);
+    let recency = recency_score(agent.last_seen.as_deref());
+
+    let score = capability * weights.capability
+        + success_rate * weights.success_rate
+        + availability * weights.availability
+        + cost * weights.cost
+        + recency * weights.recency;
+
+    let breakdown = ScoreBreakdown {
+        capability,
+        success_rate,
+        availability,
+        cost,
+        recency,
+    };
+
+    (score, breakdown)
+}
+
+/// Score and sort agents by the multi-factor routing algorithm.
+fn rank_agents(
+    agents: Vec<EligibleAgent>,
+    metrics: &HashMap<String, AgentMetrics>,
+    formula_name: Option<&str>,
+    weights: &broodlink_config::RoutingWeights,
+    new_agent_bonus: f64,
+) -> Vec<ScoredAgent> {
+    let mut scored: Vec<ScoredAgent> = agents
+        .into_iter()
+        .map(|agent| {
+            let m = metrics.get(&agent.agent_id);
+            let (score, breakdown) = compute_score(&agent, m, formula_name, weights, new_agent_bonus);
+            ScoredAgent {
+                agent,
+                score,
+                breakdown,
+            }
+        })
+        .collect();
+
+    // Sort descending by score
+    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    scored
+}
+
+// ---------------------------------------------------------------------------
+// Task row from Postgres
+// ---------------------------------------------------------------------------
+
+struct TaskRow {
+    id: String,
+    title: String,
+    description: Option<String>,
+    priority: i32,
+    formula_name: Option<String>,
+    convoy_id: Option<String>,
+}
+
+async fn fetch_task(pg: &PgPool, task_id: &str) -> Result<Option<TaskRow>, BroodlinkError> {
+    let row = sqlx::query(
+        "SELECT id, title, description, priority, formula_name, convoy_id
+         FROM task_queue WHERE id = $1 AND status = 'pending'",
+    )
+    .bind(task_id)
+    .fetch_optional(pg)
+    .await?;
+
+    Ok(row.map(|r| {
+        let priority: Option<i32> = r.get("priority");
+        TaskRow {
+            id: r.get("id"),
+            title: r.get("title"),
+            description: r.get("description"),
+            priority: priority.unwrap_or(0),
+            formula_name: r.get("formula_name"),
+            convoy_id: r.get("convoy_id"),
+        }
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Atomic claim with exponential backoff
+// ---------------------------------------------------------------------------
+
+/// Attempt to atomically claim a task in Postgres.
+/// Returns `true` if the claim succeeded (rows_affected == 1).
+async fn try_claim_task(
+    pg: &PgPool,
+    task_id: &str,
+    agent_id: &str,
+) -> Result<bool, BroodlinkError> {
+    let result = sqlx::query(
+        "UPDATE task_queue
+         SET status = 'claimed', assigned_agent = $1, claimed_at = NOW(), updated_at = NOW()
+         WHERE id = $2 AND status = 'pending'",
+    )
+    .bind(agent_id)
+    .bind(task_id)
+    .execute(pg)
+    .await?;
+
+    Ok(result.rows_affected() == 1)
+}
+
+// ---------------------------------------------------------------------------
+// Audit log (Postgres)
+// ---------------------------------------------------------------------------
+
+async fn write_audit_log(
+    pg: &PgPool,
+    trace_id: &str,
+    agent_id: &str,
+    operation: &str,
+    result_status: &str,
+    result_summary: Option<&str>,
+    duration_ms: Option<i32>,
+) -> Result<(), BroodlinkError> {
+    sqlx::query(
+        "INSERT INTO audit_log (trace_id, agent_id, service, operation, result_status, result_summary, duration_ms, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())",
+    )
+    .bind(trace_id)
+    .bind(agent_id)
+    .bind(SERVICE_NAME)
+    .bind(operation)
+    .bind(result_status)
+    .bind(result_summary)
+    .bind(duration_ms)
+    .execute(pg)
+    .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Dead-letter publishing
+// ---------------------------------------------------------------------------
+
+async fn publish_dead_letter(
+    state: &AppState,
+    task_id: &str,
+    reason: &str,
+) -> Result<(), BroodlinkError> {
+    let subject = format!(
+        "{}.{}.coordinator.dead_letter",
+        state.config.nats.subject_prefix, state.config.broodlink.env,
+    );
+    let payload = serde_json::json!({
+        "task_id": task_id,
+        "reason": reason,
+        "service": SERVICE_NAME,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+
+    if let Ok(bytes) = serde_json::to_vec(&payload) {
+        state.nats.publish(subject, bytes.into()).await?;
+    }
+
+    state.tasks_dead_lettered.fetch_add(1, Ordering::Relaxed);
+
+    // Also mark the task as 'failed' in Postgres so it is not picked up again
+    let _ = sqlx::query(
+        "UPDATE task_queue SET status = 'failed', updated_at = NOW()
+         WHERE id = $1 AND status = 'pending'",
+    )
+    .bind(task_id)
+    .execute(&state.pg)
+    .await;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Formula parsing
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Debug, Clone)]
+struct FormulaFile {
+    #[allow(dead_code)]
+    formula: FormulaMetadata,
+    #[serde(default)]
+    steps: Vec<FormulaStep>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct FormulaMetadata {
+    #[allow(dead_code)]
+    name: String,
+    #[allow(dead_code)]
+    version: Option<String>,
+    #[allow(dead_code)]
+    description: Option<String>,
+    #[allow(dead_code)]
+    parameters: Option<toml::Value>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct FormulaStep {
+    name: String,
+    agent_role: String,
+    #[allow(dead_code)]
+    tools: Option<Vec<String>>,
+    prompt: String,
+    #[serde(default)]
+    input: Option<FormulaInput>,
+    output: String,
+}
+
+/// A step's input can be a single key or multiple keys.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(untagged)]
+enum FormulaInput {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+fn load_formula(config: &Config, formula_name: &str) -> Result<FormulaFile, BroodlinkError> {
+    let path = std::path::Path::new(&config.beads.workspace)
+        .join(&config.beads.formulas_dir)
+        .join(format!("{formula_name}.formula.toml"));
+
+    let content = std::fs::read_to_string(&path).map_err(|e| {
+        BroodlinkError::Internal(format!("failed to read formula {formula_name}: {e}"))
+    })?;
+
+    let formula: FormulaFile = toml::from_str(&content).map_err(|e| {
+        BroodlinkError::Internal(format!("failed to parse formula {formula_name}: {e}"))
+    })?;
+
+    if formula.steps.is_empty() {
+        return Err(BroodlinkError::Internal(format!(
+            "formula {formula_name} has no steps"
+        )));
+    }
+
+    Ok(formula)
+}
+
+/// Replace `{{key}}` placeholders in a prompt template with values from a params map.
+fn render_prompt(template: &str, params: &serde_json::Value) -> String {
+    let mut result = template.to_string();
+    if let Some(obj) = params.as_object() {
+        for (key, value) in obj {
+            let placeholder = format!("{{{{{key}}}}}");
+            let replacement = match value.as_str() {
+                Some(s) => s.to_string(),
+                None => value.to_string(),
+            };
+            result = result.replace(&placeholder, &replacement);
+        }
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Workflow handlers
+// ---------------------------------------------------------------------------
+
+async fn handle_workflow_start(
+    state: &Arc<AppState>,
+    payload: &WorkflowStartPayload,
+) -> Result<(), BroodlinkError> {
+    info!(
+        workflow_id = %payload.workflow_id,
+        formula = %payload.formula_name,
+        "starting workflow"
+    );
+
+    let formula = load_formula(&state.config, &payload.formula_name)?;
+    let total_steps = formula.steps.len() as i32;
+
+    // Update workflow_runs with total_steps and set status to running
+    sqlx::query(
+        "UPDATE workflow_runs SET total_steps = $1, status = 'running', updated_at = NOW()
+         WHERE id = $2",
+    )
+    .bind(total_steps)
+    .bind(&payload.workflow_id)
+    .execute(&state.pg)
+    .await?;
+
+    // Create the first step task
+    create_step_task(
+        state,
+        &payload.workflow_id,
+        &payload.convoy_id,
+        &payload.formula_name,
+        &formula,
+        0,
+        &payload.params,
+        &serde_json::json!({}),
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn create_step_task(
+    state: &Arc<AppState>,
+    workflow_id: &str,
+    convoy_id: &str,
+    formula_name: &str,
+    formula: &FormulaFile,
+    step_index: usize,
+    params: &serde_json::Value,
+    step_results: &serde_json::Value,
+) -> Result<String, BroodlinkError> {
+    let step = &formula.steps[step_index];
+    let total = formula.steps.len();
+
+    // Render prompt with formula params
+    let mut rendered = render_prompt(&step.prompt, params);
+
+    // Append previous step outputs as context
+    if let Some(ref input) = step.input {
+        let keys = match input {
+            FormulaInput::Single(k) => vec![k.clone()],
+            FormulaInput::Multiple(ks) => ks.clone(),
+        };
+        for key in &keys {
+            if let Some(val) = step_results.get(key) {
+                rendered.push_str(&format!("\n\n--- Previous output ({key}) ---\n{val}"));
+            }
+        }
+    }
+
+    let task_id = Uuid::new_v4().to_string();
+    let trace_id = Uuid::new_v4().to_string();
+    let title = format!(
+        "[{}/{}] {} — {}",
+        step_index + 1,
+        total,
+        formula_name,
+        step.name,
+    );
+
+    sqlx::query(
+        "INSERT INTO task_queue (id, trace_id, title, description, status, priority, formula_name, convoy_id, workflow_run_id, step_index, step_name, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'pending', 5, $5, $6, $7, $8, $9, NOW(), NOW())",
+    )
+    .bind(&task_id)
+    .bind(&trace_id)
+    .bind(&title)
+    .bind(&rendered)
+    .bind(formula_name)
+    .bind(convoy_id)
+    .bind(workflow_id)
+    .bind(step_index as i32)
+    .bind(&step.name)
+    .execute(&state.pg)
+    .await?;
+
+    // Update workflow_runs to track current task
+    sqlx::query(
+        "UPDATE workflow_runs SET current_task_id = $1, current_step = $2, updated_at = NOW()
+         WHERE id = $3",
+    )
+    .bind(&task_id)
+    .bind(step_index as i32)
+    .bind(workflow_id)
+    .execute(&state.pg)
+    .await?;
+
+    // Publish task_available to trigger routing
+    let subject = format!(
+        "{}.{}.coordinator.task_available",
+        state.config.nats.subject_prefix, state.config.broodlink.env,
+    );
+    let nats_payload = serde_json::json!({
+        "task_id": task_id,
+        "role": step.agent_role,
+    });
+    if let Ok(bytes) = serde_json::to_vec(&nats_payload) {
+        if let Err(e) = state.nats.publish(subject, bytes.into()).await {
+            warn!(error = %e, "failed to publish task_available for workflow step");
+        }
+    }
+
+    info!(
+        workflow_id = %workflow_id,
+        task_id = %task_id,
+        step = step_index,
+        step_name = %step.name,
+        role = %step.agent_role,
+        "created workflow step task"
+    );
+
+    Ok(task_id)
+}
+
+async fn handle_task_completed(
+    state: &Arc<AppState>,
+    payload: &TaskCompletedPayload,
+) -> Result<(), BroodlinkError> {
+    // Check if this task belongs to a workflow
+    let row = sqlx::query(
+        "SELECT workflow_run_id, step_index, step_name
+         FROM task_queue WHERE id = $1",
+    )
+    .bind(&payload.task_id)
+    .fetch_optional(&state.pg)
+    .await?;
+
+    let row = match row {
+        Some(r) => r,
+        None => return Ok(()), // task not found, ignore
+    };
+
+    let workflow_run_id: Option<String> = row.get("workflow_run_id");
+    let workflow_run_id = match workflow_run_id {
+        Some(id) => id,
+        None => return Ok(()), // not a workflow task, ignore
+    };
+
+    let step_index: Option<i32> = row.get("step_index");
+    let step_index = step_index.unwrap_or(0) as usize;
+
+    info!(
+        task_id = %payload.task_id,
+        workflow_id = %workflow_run_id,
+        step = step_index,
+        "workflow step completed"
+    );
+
+    // Fetch workflow_runs row
+    let wf_row = sqlx::query(
+        "SELECT formula_name, params, step_results, total_steps, convoy_id
+         FROM workflow_runs WHERE id = $1",
+    )
+    .bind(&workflow_run_id)
+    .fetch_optional(&state.pg)
+    .await?;
+
+    let wf_row = match wf_row {
+        Some(r) => r,
+        None => {
+            warn!(workflow_id = %workflow_run_id, "workflow_runs row not found");
+            return Ok(());
+        }
+    };
+
+    let formula_name: String = wf_row.get("formula_name");
+    let params: serde_json::Value = wf_row.get("params");
+    let mut step_results: serde_json::Value = wf_row.get("step_results");
+    let total_steps: i32 = wf_row.get("total_steps");
+    let convoy_id: String = wf_row.get("convoy_id");
+
+    // Load formula to get step's output name
+    let formula = load_formula(&state.config, &formula_name)?;
+    let step_def = &formula.steps[step_index];
+
+    // Accumulate result into step_results
+    if let Some(ref result_data) = payload.result_data {
+        if let Some(obj) = step_results.as_object_mut() {
+            obj.insert(step_def.output.clone(), result_data.clone());
+        }
+    }
+
+    let next_step = step_index + 1;
+
+    if next_step < total_steps as usize {
+        // Update step_results and create next step
+        sqlx::query(
+            "UPDATE workflow_runs SET step_results = $1, updated_at = NOW()
+             WHERE id = $2",
+        )
+        .bind(&step_results)
+        .bind(&workflow_run_id)
+        .execute(&state.pg)
+        .await?;
+
+        create_step_task(
+            state,
+            &workflow_run_id,
+            &convoy_id,
+            &formula_name,
+            &formula,
+            next_step,
+            &params,
+            &step_results,
+        )
+        .await?;
+    } else {
+        // All steps done — mark workflow as completed
+        sqlx::query(
+            "UPDATE workflow_runs SET status = 'completed', step_results = $1, completed_at = NOW(), updated_at = NOW()
+             WHERE id = $2",
+        )
+        .bind(&step_results)
+        .bind(&workflow_run_id)
+        .execute(&state.pg)
+        .await?;
+
+        // Publish workflow_completed event
+        let subject = format!(
+            "{}.{}.coordinator.workflow_completed",
+            state.config.nats.subject_prefix, state.config.broodlink.env,
+        );
+        let nats_payload = serde_json::json!({
+            "workflow_id": workflow_run_id,
+            "formula_name": formula_name,
+            "step_results": step_results,
+        });
+        if let Ok(bytes) = serde_json::to_vec(&nats_payload) {
+            if let Err(e) = state.nats.publish(subject, bytes.into()).await {
+                warn!(error = %e, "failed to publish workflow_completed");
+            }
+        }
+
+        info!(
+            workflow_id = %workflow_run_id,
+            formula = %formula_name,
+            "workflow completed"
+        );
+    }
+
+    Ok(())
+}
+
+async fn handle_task_failed(
+    state: &Arc<AppState>,
+    payload: &TaskFailedPayload,
+) -> Result<(), BroodlinkError> {
+    // Check if this task belongs to a workflow
+    let row = sqlx::query(
+        "SELECT workflow_run_id FROM task_queue WHERE id = $1",
+    )
+    .bind(&payload.task_id)
+    .fetch_optional(&state.pg)
+    .await?;
+
+    let workflow_run_id: Option<String> = row
+        .and_then(|r| r.get("workflow_run_id"));
+
+    let workflow_run_id = match workflow_run_id {
+        Some(id) => id,
+        None => return Ok(()), // not a workflow task, ignore
+    };
+
+    warn!(
+        task_id = %payload.task_id,
+        workflow_id = %workflow_run_id,
+        "workflow step failed, marking workflow as failed"
+    );
+
+    sqlx::query(
+        "UPDATE workflow_runs SET status = 'failed', updated_at = NOW()
+         WHERE id = $1",
+    )
+    .bind(&workflow_run_id)
+    .execute(&state.pg)
+    .await?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Workflow NATS subscription loops
+// ---------------------------------------------------------------------------
+
+async fn run_workflow_start_subscription(
+    state: Arc<AppState>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), BroodlinkError> {
+    let subject = format!(
+        "{}.{}.coordinator.workflow_start",
+        state.config.nats.subject_prefix, state.config.broodlink.env,
+    );
+
+    info!(subject = %subject, "subscribing to workflow_start");
+
+    let mut subscriber = state.nats.subscribe(subject.clone()).await?;
+
+    loop {
+        tokio::select! {
+            msg = subscriber.next() => {
+                match msg {
+                    Some(nats_msg) => {
+                        let payload_result: Result<WorkflowStartPayload, _> =
+                            serde_json::from_slice(&nats_msg.payload);
+
+                        match payload_result {
+                            Ok(payload) => {
+                                let state_clone = Arc::clone(&state);
+                                tokio::spawn(async move {
+                                    if let Err(e) = handle_workflow_start(&state_clone, &payload).await {
+                                        warn!(
+                                            error = %e,
+                                            workflow_id = %payload.workflow_id,
+                                            "workflow start failed"
+                                        );
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "failed to deserialize workflow_start payload");
+                            }
+                        }
+                    }
+                    None => {
+                        warn!("workflow_start subscription stream ended");
+                        break;
+                    }
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                info!("shutdown signal, stopping workflow_start subscription");
+                break;
+            }
+        }
+    }
+
+    if let Err(e) = subscriber.unsubscribe().await {
+        warn!(error = %e, "failed to unsubscribe from workflow_start");
+    }
+
+    Ok(())
+}
+
+async fn run_task_completed_subscription(
+    state: Arc<AppState>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), BroodlinkError> {
+    let subject = format!(
+        "{}.{}.coordinator.task_completed",
+        state.config.nats.subject_prefix, state.config.broodlink.env,
+    );
+
+    info!(subject = %subject, "subscribing to task_completed");
+
+    let mut subscriber = state.nats.subscribe(subject.clone()).await?;
+
+    loop {
+        tokio::select! {
+            msg = subscriber.next() => {
+                match msg {
+                    Some(nats_msg) => {
+                        let payload_result: Result<TaskCompletedPayload, _> =
+                            serde_json::from_slice(&nats_msg.payload);
+
+                        match payload_result {
+                            Ok(payload) => {
+                                let state_clone = Arc::clone(&state);
+                                tokio::spawn(async move {
+                                    if let Err(e) = handle_task_completed(&state_clone, &payload).await {
+                                        warn!(
+                                            error = %e,
+                                            task_id = %payload.task_id,
+                                            "task_completed handling failed"
+                                        );
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "failed to deserialize task_completed payload");
+                            }
+                        }
+                    }
+                    None => {
+                        warn!("task_completed subscription stream ended");
+                        break;
+                    }
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                info!("shutdown signal, stopping task_completed subscription");
+                break;
+            }
+        }
+    }
+
+    if let Err(e) = subscriber.unsubscribe().await {
+        warn!(error = %e, "failed to unsubscribe from task_completed");
+    }
+
+    Ok(())
+}
+
+async fn run_task_failed_subscription(
+    state: Arc<AppState>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), BroodlinkError> {
+    let subject = format!(
+        "{}.{}.coordinator.task_failed",
+        state.config.nats.subject_prefix, state.config.broodlink.env,
+    );
+
+    info!(subject = %subject, "subscribing to task_failed");
+
+    let mut subscriber = state.nats.subscribe(subject.clone()).await?;
+
+    loop {
+        tokio::select! {
+            msg = subscriber.next() => {
+                match msg {
+                    Some(nats_msg) => {
+                        let payload_result: Result<TaskFailedPayload, _> =
+                            serde_json::from_slice(&nats_msg.payload);
+
+                        match payload_result {
+                            Ok(payload) => {
+                                let state_clone = Arc::clone(&state);
+                                tokio::spawn(async move {
+                                    if let Err(e) = handle_task_failed(&state_clone, &payload).await {
+                                        warn!(
+                                            error = %e,
+                                            task_id = %payload.task_id,
+                                            "task_failed handling failed"
+                                        );
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "failed to deserialize task_failed payload");
+                            }
+                        }
+                    }
+                    None => {
+                        warn!("task_failed subscription stream ended");
+                        break;
+                    }
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                info!("shutdown signal, stopping task_failed subscription");
+                break;
+            }
+        }
+    }
+
+    if let Err(e) = subscriber.unsubscribe().await {
+        warn!(error = %e, "failed to unsubscribe from task_failed");
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Metrics publishing
+// ---------------------------------------------------------------------------
+
+async fn publish_metrics(state: &AppState) -> Result<(), BroodlinkError> {
+    let payload = MetricsPayload {
+        service: SERVICE_NAME.to_string(),
+        tasks_claimed: state.tasks_claimed.load(Ordering::Relaxed),
+        tasks_dead_lettered: state.tasks_dead_lettered.load(Ordering::Relaxed),
+        claim_retries_total: state.claim_retries_total.load(Ordering::Relaxed),
+        uptime_seconds: state.start_time.elapsed().as_secs(),
+    };
+
+    if let Ok(bytes) = serde_json::to_vec(&payload) {
+        let subject = "broodlink.metrics.coordinator".to_string();
+        state.nats.publish(subject, bytes.into()).await?;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Core task routing logic
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_lines)]
+async fn handle_task_available(
+    state: &Arc<AppState>,
+    payload: &TaskAvailablePayload,
+) -> Result<(), BroodlinkError> {
+    let trace_id = Uuid::new_v4().to_string();
+    let started = std::time::Instant::now();
+
+    info!(
+        trace_id = %trace_id,
+        task_id = %payload.task_id,
+        task_type = ?payload.task_type,
+        role = ?payload.role,
+        "received task_available"
+    );
+
+    // 1. Fetch the task from Postgres to verify it exists and is pending
+    let task = match fetch_task(&state.pg, &payload.task_id).await? {
+        Some(t) => t,
+        None => {
+            info!(
+                task_id = %payload.task_id,
+                "task not found or already claimed, skipping"
+            );
+            return Ok(());
+        }
+    };
+
+    // 2. Determine the required role.  The NATS payload may specify it,
+    //    otherwise fall back to "worker" as the default role.
+    let role = payload.role.as_deref().unwrap_or("worker");
+    let cost_tier = payload.cost_tier.as_deref();
+    let formula_name = task.formula_name.as_deref();
+    let routing_config = &state.config.routing;
+
+    // 3. Outer retry loop: re-query agents on full exhaustion
+    let mut claimed = false;
+    let mut claiming_agent = String::new();
+    let mut claiming_tier = String::new();
+    let mut winning_score = 0.0_f64;
+    let mut winning_breakdown: Option<ScoreBreakdown> = None;
+    let mut candidates_evaluated = 0_usize;
+    let mut outer_attempt = 0_u32;
+
+    for backoff_round in 0..MAX_CLAIM_RETRIES {
+        outer_attempt = backoff_round;
+
+        // 3a. Query Dolt agent_profiles for eligible agents
+        let agents = find_eligible_agents(&state.dolt, role, cost_tier).await?;
+
+        if agents.is_empty() {
+            warn!(
+                task_id = %payload.task_id,
+                role = %role,
+                cost_tier = ?cost_tier,
+                "no eligible agents found"
+            );
+
+            let reason = format!("no eligible agents for role={role}, cost_tier={cost_tier:?}");
+            publish_dead_letter(state, &payload.task_id, &reason).await?;
+
+            let duration_ms = i32::try_from(started.elapsed().as_millis()).unwrap_or(i32::MAX);
+            if let Err(e) = write_audit_log(
+                &state.pg,
+                &trace_id,
+                "coordinator",
+                "route_task",
+                "error",
+                Some(&reason),
+                Some(duration_ms),
+            )
+            .await
+            {
+                warn!(error = %e, "failed to write audit log");
+            }
+
+            return Err(BroodlinkError::NoEligibleAgent {
+                task_id: payload.task_id.clone(),
+                role: role.to_string(),
+            });
+        }
+
+        // 3b. Fetch metrics from Postgres and score all candidates
+        let agent_ids: Vec<String> = agents.iter().map(|a| a.agent_id.clone()).collect();
+        let metrics = fetch_agent_metrics(&state.pg, &agent_ids).await.unwrap_or_default();
+
+        let scored = rank_agents(
+            agents,
+            &metrics,
+            formula_name,
+            &routing_config.weights,
+            routing_config.new_agent_bonus,
+        );
+        candidates_evaluated = scored.len();
+
+        // 3c. Try each candidate once (highest score first)
+        for candidate in &scored {
+            info!(
+                task_id = %payload.task_id,
+                agent_id = %candidate.agent.agent_id,
+                score = candidate.score,
+                round = backoff_round,
+                "attempting claim on scored candidate"
+            );
+
+            match try_claim_task(&state.pg, &payload.task_id, &candidate.agent.agent_id).await {
+                Ok(true) => {
+                    claimed = true;
+                    claiming_agent.clone_from(&candidate.agent.agent_id);
+                    claiming_tier.clone_from(&candidate.agent.cost_tier);
+                    winning_score = candidate.score;
+                    winning_breakdown = Some(candidate.breakdown.clone());
+                    break;
+                }
+                Ok(false) => {
+                    state.claim_retries_total.fetch_add(1, Ordering::Relaxed);
+                    info!(
+                        task_id = %payload.task_id,
+                        agent_id = %candidate.agent.agent_id,
+                        "claim contention, trying next candidate"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        task_id = %payload.task_id,
+                        agent_id = %candidate.agent.agent_id,
+                        error = %e,
+                        "database error during claim"
+                    );
+                    return Err(e);
+                }
+            }
+        }
+
+        if claimed {
+            break;
+        }
+
+        // 3d. ALL candidates failed in this round — exponential backoff then re-query
+        let backoff_ms = BACKOFF_BASE_MS * 2u64.pow(backoff_round);
+        info!(
+            task_id = %payload.task_id,
+            round = backoff_round,
+            backoff_ms = backoff_ms,
+            candidates = candidates_evaluated,
+            "all candidates exhausted, backing off before re-query"
+        );
+        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+    }
+
+    let duration_ms = i32::try_from(started.elapsed().as_millis()).unwrap_or(i32::MAX);
+
+    if !claimed {
+        let reason = format!(
+            "claim contention exhausted for all candidates after {} rounds",
+            MAX_CLAIM_RETRIES,
+        );
+        warn!(
+            task_id = %payload.task_id,
+            reason = %reason,
+            "dead-lettering task"
+        );
+
+        publish_dead_letter(state, &payload.task_id, &reason).await?;
+
+        if let Err(e) = write_audit_log(
+            &state.pg,
+            &trace_id,
+            "coordinator",
+            "route_task",
+            "error",
+            Some(&reason),
+            Some(duration_ms),
+        )
+        .await
+        {
+            warn!(error = %e, "failed to write audit log");
+        }
+
+        return Err(BroodlinkError::ClaimExhausted(
+            payload.task_id.clone(),
+            MAX_CLAIM_RETRIES,
+        ));
+    }
+
+    // 4. Claimed successfully — publish routing decision to NATS
+    let routing_decision = RoutingDecisionPayload {
+        task_id: payload.task_id.clone(),
+        agent_id: claiming_agent.clone(),
+        score: winning_score,
+        breakdown: winning_breakdown.unwrap_or(ScoreBreakdown {
+            capability: 0.0,
+            success_rate: 0.0,
+            availability: 0.0,
+            cost: 0.0,
+            recency: 0.0,
+        }),
+        candidates_evaluated,
+        attempt: outer_attempt + 1,
+    };
+
+    let routing_subject = format!(
+        "{}.{}.coordinator.routing_decision",
+        state.config.nats.subject_prefix, state.config.broodlink.env,
+    );
+    if let Ok(bytes) = serde_json::to_vec(&routing_decision) {
+        if let Err(e) = state.nats.publish(routing_subject.clone(), bytes.into()).await {
+            warn!(error = %e, subject = %routing_subject, "failed to publish routing decision");
+        }
+    }
+
+    // 5. Dispatch to the agent's NATS subject
+    info!(
+        task_id = %payload.task_id,
+        agent_id = %claiming_agent,
+        cost_tier = %claiming_tier,
+        score = winning_score,
+        duration_ms = %duration_ms,
+        "task claimed and dispatching"
+    );
+
+    state.tasks_claimed.fetch_add(1, Ordering::Relaxed);
+
+    let dispatch_subject = format!(
+        "{}.{}.agent.{}.task",
+        state.config.nats.subject_prefix,
+        state.config.broodlink.env,
+        claiming_agent,
+    );
+
+    let dispatch_payload = TaskDispatchPayload {
+        task_id: task.id.clone(),
+        title: task.title,
+        description: task.description,
+        priority: task.priority,
+        formula_name: task.formula_name,
+        convoy_id: task.convoy_id,
+        assigned_by: SERVICE_NAME.to_string(),
+    };
+
+    if let Ok(bytes) = serde_json::to_vec(&dispatch_payload) {
+        if let Err(e) = state.nats.publish(dispatch_subject.clone(), bytes.into()).await {
+            warn!(
+                error = %e,
+                subject = %dispatch_subject,
+                "failed to publish task dispatch"
+            );
+        }
+    }
+
+    // 6. Write audit log
+    let summary = format!(
+        "task {} claimed by {} (score={winning_score:.3}, cost_tier={claiming_tier})",
+        payload.task_id, claiming_agent,
+    );
+    if let Err(e) = write_audit_log(
+        &state.pg,
+        &trace_id,
+        &claiming_agent,
+        "route_task",
+        "ok",
+        Some(&summary),
+        Some(duration_ms),
+    )
+    .await
+    {
+        warn!(error = %e, "failed to write audit log");
+    }
+
+    // 7. Publish metrics (best-effort)
+    if let Err(e) = publish_metrics(state).await {
+        warn!(error = %e, "failed to publish metrics");
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// NATS subscription loop
+// ---------------------------------------------------------------------------
+
+async fn run_subscription(
+    state: Arc<AppState>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), BroodlinkError> {
+    let subject = format!(
+        "{}.{}.coordinator.task_available",
+        state.config.nats.subject_prefix, state.config.broodlink.env,
+    );
+
+    info!(subject = %subject, "subscribing to task_available");
+
+    let mut subscriber = state.nats.subscribe(subject.clone()).await?;
+
+    loop {
+        tokio::select! {
+            msg = subscriber.next() => {
+                match msg {
+                    Some(nats_msg) => {
+                        let payload_result: Result<TaskAvailablePayload, _> =
+                            serde_json::from_slice(&nats_msg.payload);
+
+                        match payload_result {
+                            Ok(payload) => {
+                                let state_clone = Arc::clone(&state);
+                                // Spawn each task handling in its own task to avoid
+                                // blocking the subscription loop
+                                tokio::spawn(async move {
+                                    if let Err(e) = handle_task_available(&state_clone, &payload).await {
+                                        warn!(
+                                            error = %e,
+                                            task_id = %payload.task_id,
+                                            "task routing failed"
+                                        );
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    payload_bytes = nats_msg.payload.len(),
+                                    "failed to deserialize task_available payload"
+                                );
+                            }
+                        }
+                    }
+                    None => {
+                        warn!("NATS subscription stream ended");
+                        break;
+                    }
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                info!("shutdown signal received, stopping subscription");
+                break;
+            }
+        }
+    }
+
+    // Unsubscribe gracefully
+    if let Err(e) = subscriber.unsubscribe().await {
+        warn!(error = %e, "failed to unsubscribe from NATS");
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Periodic metrics publisher
+// ---------------------------------------------------------------------------
+
+async fn metrics_loop(state: Arc<AppState>, mut shutdown_rx: watch::Receiver<bool>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(60));
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                if let Err(e) = publish_metrics(&state).await {
+                    warn!(error = %e, "periodic metrics publish failed");
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                info!("shutdown signal, stopping metrics loop");
+                break;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Initialization
+// ---------------------------------------------------------------------------
+
+async fn init_state() -> Result<AppState, BroodlinkError> {
+    let config = Config::load().map_err(|e| BroodlinkError::Config(e.to_string()))?;
+    let config = Arc::new(config);
+
+    // Secrets provider
+    let secrets: Arc<dyn SecretsProvider> = {
+        let sc = &config.secrets;
+        let provider = broodlink_secrets::create_provider(
+            &sc.provider,
+            sc.sops_file.as_deref(),
+            sc.age_identity.as_deref(),
+            sc.infisical_url.as_deref(),
+            None, // infisical token resolved from env at provider level
+        )?;
+        Arc::from(provider)
+    };
+
+    // Resolve database passwords from secrets
+    let dolt_password = secrets.get(&config.dolt.password_key).await?;
+    let pg_password = secrets.get(&config.postgres.password_key).await?;
+
+    // Dolt (MySQL) pool — read-only for agent_profiles lookup
+    let dolt_url = format!(
+        "mysql://{}:{}@{}:{}/{}",
+        config.dolt.user, dolt_password, config.dolt.host, config.dolt.port, config.dolt.database,
+    );
+    let dolt = MySqlPoolOptions::new()
+        .min_connections(1)
+        .max_connections(config.dolt.max_connections)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(&dolt_url)
+        .await?;
+    info!("dolt pool connected (read-only for agent_profiles)");
+
+    // Postgres pool — for task_queue + audit_log
+    let pg_url = format!(
+        "postgres://{}:{}@{}:{}/{}",
+        config.postgres.user,
+        pg_password,
+        config.postgres.host,
+        config.postgres.port,
+        config.postgres.database,
+    );
+    let pg = PgPoolOptions::new()
+        .min_connections(config.postgres.min_connections)
+        .max_connections(config.postgres.max_connections)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(&pg_url)
+        .await?;
+    info!("postgres pool connected");
+
+    // NATS client (cluster-aware via broodlink-runtime)
+    let nats = broodlink_runtime::connect_nats(&config.nats).await?;
+
+    Ok(AppState {
+        dolt,
+        pg,
+        nats,
+        config,
+        start_time: std::time::Instant::now(),
+        tasks_claimed: AtomicU64::new(0),
+        tasks_dead_lettered: AtomicU64::new(0),
+        claim_retries_total: AtomicU64::new(0),
+    })
+}
+
+async fn shutdown_signal() {
+    broodlink_runtime::shutdown_signal().await;
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+#[tokio::main]
+async fn main() {
+    let boot_config = Config::load().unwrap_or_else(|e| {
+        eprintln!("fatal: failed to load config: {e}");
+        process::exit(1);
+    });
+
+    let _telemetry_guard = broodlink_telemetry::init_telemetry(SERVICE_NAME, &boot_config.telemetry)
+        .unwrap_or_else(|e| {
+            eprintln!("fatal: telemetry init failed: {e}");
+            process::exit(1);
+        });
+
+    info!(
+        service = SERVICE_NAME,
+        version = SERVICE_VERSION,
+        "starting coordinator (NATS-only task router)"
+    );
+
+    let state = match init_state().await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            error!(error = %e, "fatal: failed to initialise coordinator");
+            process::exit(1);
+        }
+    };
+
+    // Shutdown coordination via watch channel
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // Spawn the NATS subscription loop
+    let sub_state = Arc::clone(&state);
+    let sub_shutdown = shutdown_rx.clone();
+    let sub_handle = tokio::spawn(async move {
+        if let Err(e) = run_subscription(sub_state, sub_shutdown).await {
+            error!(error = %e, "subscription loop failed");
+        }
+    });
+
+    // Spawn workflow subscription loops
+    let wf_start_state = Arc::clone(&state);
+    let wf_start_shutdown = shutdown_rx.clone();
+    let wf_start_handle = tokio::spawn(async move {
+        if let Err(e) = run_workflow_start_subscription(wf_start_state, wf_start_shutdown).await {
+            error!(error = %e, "workflow_start subscription failed");
+        }
+    });
+
+    let task_completed_state = Arc::clone(&state);
+    let task_completed_shutdown = shutdown_rx.clone();
+    let task_completed_handle = tokio::spawn(async move {
+        if let Err(e) = run_task_completed_subscription(task_completed_state, task_completed_shutdown).await {
+            error!(error = %e, "task_completed subscription failed");
+        }
+    });
+
+    let task_failed_state = Arc::clone(&state);
+    let task_failed_shutdown = shutdown_rx.clone();
+    let task_failed_handle = tokio::spawn(async move {
+        if let Err(e) = run_task_failed_subscription(task_failed_state, task_failed_shutdown).await {
+            error!(error = %e, "task_failed subscription failed");
+        }
+    });
+
+    // Spawn the periodic metrics publisher
+    let metrics_state = Arc::clone(&state);
+    let metrics_shutdown = shutdown_rx.clone();
+    let metrics_handle = tokio::spawn(async move {
+        metrics_loop(metrics_state, metrics_shutdown).await;
+    });
+
+    // Wait for shutdown signal
+    shutdown_signal().await;
+
+    info!("initiating graceful shutdown");
+
+    // Signal all spawned tasks to stop
+    let _ = shutdown_tx.send(true);
+
+    // Wait for tasks to complete with a timeout
+    let shutdown_timeout = Duration::from_secs(10);
+    let _ = tokio::time::timeout(shutdown_timeout, async {
+        let _ = sub_handle.await;
+        let _ = wf_start_handle.await;
+        let _ = task_completed_handle.await;
+        let _ = task_failed_handle.await;
+        let _ = metrics_handle.await;
+    })
+    .await;
+
+    // Close database pools
+    state.pg.close().await;
+    state.dolt.close().await;
+
+    // Final metrics publish (best-effort)
+    if let Err(e) = publish_metrics(&state).await {
+        warn!(error = %e, "final metrics publish failed");
+    }
+
+    info!(
+        tasks_claimed = state.tasks_claimed.load(Ordering::Relaxed),
+        tasks_dead_lettered = state.tasks_dead_lettered.load(Ordering::Relaxed),
+        uptime_seconds = state.start_time.elapsed().as_secs(),
+        "coordinator shutdown complete"
+    );
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// Helper that mirrors the MySQL `FIELD(cost_tier, 'low', 'medium', 'high')`
+    /// ordering used in `find_eligible_agents`.  Returns a sort key for a cost tier
+    /// string, where lower values are preferred (cheaper agents first).
+    fn cost_tier_sort_key(tier: &str) -> u32 {
+        match tier {
+            "low" => 0,
+            "medium" => 1,
+            "high" => 2,
+            _ => u32::MAX,
+        }
+    }
+
+    fn make_agent(id: &str, tier: &str) -> EligibleAgent {
+        EligibleAgent {
+            agent_id: id.to_string(),
+            cost_tier: tier.to_string(),
+            capabilities: None,
+            max_concurrent: 5,
+            last_seen: None,
+        }
+    }
+
+    fn default_weights() -> broodlink_config::RoutingWeights {
+        broodlink_config::RoutingWeights {
+            capability: 0.35,
+            success_rate: 0.25,
+            availability: 0.20,
+            cost: 0.15,
+            recency: 0.05,
+        }
+    }
+
+    #[test]
+    fn test_cost_tier_ordering() {
+        let mut agents = vec![
+            make_agent("agent-high", "high"),
+            make_agent("agent-low", "low"),
+            make_agent("agent-medium", "medium"),
+        ];
+
+        agents.sort_by_key(|a| cost_tier_sort_key(&a.cost_tier));
+
+        assert_eq!(agents[0].cost_tier, "low", "low should sort first");
+        assert_eq!(agents[1].cost_tier, "medium", "medium should sort second");
+        assert_eq!(agents[2].cost_tier, "high", "high should sort last");
+    }
+
+    #[test]
+    fn test_backoff_calculation() {
+        // The coordinator uses exponential backoff: BACKOFF_BASE_MS * 2^attempt
+        // Attempt 0 => 1000ms, Attempt 1 => 2000ms, Attempt 2 => 4000ms, etc.
+        for attempt in 0..MAX_CLAIM_RETRIES {
+            let backoff_ms = BACKOFF_BASE_MS * 2u64.pow(attempt);
+            let expected = match attempt {
+                0 => 1000,
+                1 => 2000,
+                2 => 4000,
+                3 => 8000,
+                4 => 16000,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                backoff_ms, expected,
+                "backoff for attempt {attempt} should be {expected}ms"
+            );
+        }
+    }
+
+    #[test]
+    fn test_task_available_payload_deserialization() {
+        let json_str = r#"{"task_id":"task-1","role":"worker","cost_tier":"low"}"#;
+        let payload: TaskAvailablePayload = serde_json::from_str(json_str).unwrap();
+
+        assert_eq!(payload.task_id, "task-1");
+        assert_eq!(payload.role.as_deref(), Some("worker"));
+        assert_eq!(payload.cost_tier.as_deref(), Some("low"));
+        assert!(payload.task_type.is_none());
+    }
+
+    #[test]
+    fn test_task_available_payload_minimal() {
+        // Only task_id is required; role, cost_tier, task_type default to None
+        let json_str = r#"{"task_id":"task-2"}"#;
+        let payload: TaskAvailablePayload = serde_json::from_str(json_str).unwrap();
+
+        assert_eq!(payload.task_id, "task-2");
+        assert!(payload.role.is_none());
+        assert!(payload.cost_tier.is_none());
+        assert!(payload.task_type.is_none());
+    }
+
+    #[test]
+    fn test_task_available_payload_ignores_unknown_fields() {
+        let json_str = r#"{"task_id":"task-3","unknown_field":"ignored","role":"worker"}"#;
+        let result: Result<TaskAvailablePayload, _> = serde_json::from_str(json_str);
+        // serde default behavior: unknown fields are ignored (no deny_unknown_fields)
+        assert!(result.is_ok(), "unknown fields should be silently ignored");
+        let payload = result.unwrap();
+        assert_eq!(payload.task_id, "task-3");
+        assert_eq!(payload.role.as_deref(), Some("worker"));
+    }
+
+    #[test]
+    fn test_task_dispatch_payload_serialization() {
+        let payload = TaskDispatchPayload {
+            task_id: "task-42".to_string(),
+            title: "Test task".to_string(),
+            description: None,
+            priority: 5,
+            formula_name: None,
+            convoy_id: None,
+            assigned_by: "coordinator".to_string(),
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["task_id"], "task-42");
+        assert_eq!(json["title"], "Test task");
+        assert_eq!(json["priority"], 5);
+        assert_eq!(json["assigned_by"], "coordinator");
+        assert!(json["description"].is_null(), "None fields should serialize as null");
+    }
+
+    // ----- Scoring algorithm tests -----
+
+    #[test]
+    fn test_cost_tier_score_values() {
+        assert!((cost_tier_score("low") - 1.0).abs() < f64::EPSILON);
+        assert!((cost_tier_score("medium") - 0.6).abs() < f64::EPSILON);
+        assert!((cost_tier_score("high") - 0.3).abs() < f64::EPSILON);
+        assert!((cost_tier_score("unknown") - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_recency_score_none_returns_zero() {
+        assert!((recency_score(None) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_recency_score_recent_returns_one() {
+        let now = chrono::Utc::now().naive_utc();
+        let ts = now.format("%Y-%m-%d %H:%M:%S").to_string();
+        let score = recency_score(Some(&ts));
+        assert!(score > 0.95, "just-now timestamp should score ~1.0, got {score}");
+    }
+
+    #[test]
+    fn test_recency_score_old_returns_zero() {
+        let old = chrono::Utc::now().naive_utc() - chrono::Duration::hours(1);
+        let ts = old.format("%Y-%m-%d %H:%M:%S").to_string();
+        let score = recency_score(Some(&ts));
+        assert!(score < f64::EPSILON, "1-hour-old timestamp should score 0.0, got {score}");
+    }
+
+    #[test]
+    fn test_recency_score_midpoint() {
+        // ~15 minutes ago should give ~0.5
+        let mid = chrono::Utc::now().naive_utc() - chrono::Duration::minutes(15);
+        let ts = mid.format("%Y-%m-%d %H:%M:%S").to_string();
+        let score = recency_score(Some(&ts));
+        assert!(score > 0.2 && score < 0.8, "15-min-old should be mid-range, got {score}");
+    }
+
+    #[test]
+    fn test_recency_score_invalid_format() {
+        assert!((recency_score(Some("not-a-date")) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_compute_score_no_metrics_uses_bonus() {
+        let agent = make_agent("a1", "low");
+        let weights = default_weights();
+        let (score, breakdown) = compute_score(&agent, None, None, &weights, 0.8);
+
+        // success_rate should use new_agent_bonus = 0.8
+        assert!((breakdown.success_rate - 0.8).abs() < f64::EPSILON);
+        // availability should be 1.0 (no metrics = assume available)
+        assert!((breakdown.availability - 1.0).abs() < f64::EPSILON);
+        // cost should be 1.0 (low tier)
+        assert!((breakdown.cost - 1.0).abs() < f64::EPSILON);
+        assert!(score > 0.0, "score should be positive");
+    }
+
+    #[test]
+    fn test_compute_score_with_metrics() {
+        let agent = make_agent("a1", "medium");
+        let metrics = AgentMetrics {
+            success_rate: 0.9,
+            current_load: 2,
+        };
+        let weights = default_weights();
+        let (score, breakdown) = compute_score(&agent, Some(&metrics), None, &weights, 1.0);
+
+        assert!((breakdown.success_rate - 0.9).abs() < f64::EPSILON);
+        // availability: 1.0 - (2/5) = 0.6
+        assert!((breakdown.availability - 0.6).abs() < f64::EPSILON);
+        assert!((breakdown.cost - 0.6).abs() < f64::EPSILON);
+        assert!(score > 0.0);
+    }
+
+    #[test]
+    fn test_compute_score_overloaded_agent_low_availability() {
+        let mut agent = make_agent("a1", "low");
+        agent.max_concurrent = 3;
+        let metrics = AgentMetrics {
+            success_rate: 0.95,
+            current_load: 3,
+        };
+        let weights = default_weights();
+        let (_, breakdown) = compute_score(&agent, Some(&metrics), None, &weights, 1.0);
+
+        // availability: 1.0 - (3/3) = 0.0
+        assert!(breakdown.availability < f64::EPSILON, "fully loaded agent should have 0 availability");
+    }
+
+    #[test]
+    fn test_rank_agents_sorts_descending() {
+        let agents = vec![
+            make_agent("low-success", "high"),
+            make_agent("high-success", "low"),
+        ];
+        let mut metrics = HashMap::new();
+        metrics.insert(
+            "low-success".to_string(),
+            AgentMetrics { success_rate: 0.3, current_load: 0 },
+        );
+        metrics.insert(
+            "high-success".to_string(),
+            AgentMetrics { success_rate: 0.95, current_load: 0 },
+        );
+
+        let weights = default_weights();
+        let ranked = rank_agents(agents, &metrics, None, &weights, 1.0);
+
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].agent.agent_id, "high-success", "higher score first");
+        assert!(ranked[0].score >= ranked[1].score, "should be sorted descending");
+    }
+
+    #[test]
+    fn test_rank_agents_capability_bonus() {
+        let mut agent_with_cap = make_agent("a-cap", "low");
+        agent_with_cap.capabilities = Some(serde_json::json!({"review_code": true}));
+        let agent_no_cap = make_agent("a-nocap", "low");
+
+        let agents = vec![agent_no_cap, agent_with_cap];
+        let metrics = HashMap::new(); // no metrics = new_agent_bonus
+
+        let weights = default_weights();
+        let ranked = rank_agents(agents, &metrics, Some("review_code"), &weights, 1.0);
+
+        // Agent with matching capability should rank higher
+        assert_eq!(ranked[0].agent.agent_id, "a-cap");
+        assert!((ranked[0].breakdown.capability - 1.0).abs() < f64::EPSILON);
+        // Agent without capability gets 0.5 when formula specified
+        assert!((ranked[1].breakdown.capability - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_routing_decision_payload_serialization() {
+        let payload = RoutingDecisionPayload {
+            task_id: "task-1".to_string(),
+            agent_id: "agent-1".to_string(),
+            score: 0.85,
+            breakdown: ScoreBreakdown {
+                capability: 1.0,
+                success_rate: 0.9,
+                availability: 0.8,
+                cost: 0.6,
+                recency: 0.5,
+            },
+            candidates_evaluated: 3,
+            attempt: 1,
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["task_id"], "task-1");
+        assert_eq!(json["agent_id"], "agent-1");
+        assert_eq!(json["candidates_evaluated"], 3);
+        assert!(json["breakdown"]["capability"].is_number());
+    }
+
+    // ----- Workflow orchestration tests -----
+
+    #[test]
+    fn test_render_prompt_replaces_placeholders() {
+        let template = "Research {{topic}} and report on {{format}}";
+        let params = serde_json::json!({"topic": "quantum computing", "format": "PDF"});
+        let result = render_prompt(template, &params);
+        assert_eq!(result, "Research quantum computing and report on PDF");
+    }
+
+    #[test]
+    fn test_render_prompt_no_params() {
+        let template = "Do something with no placeholders";
+        let params = serde_json::json!({});
+        let result = render_prompt(template, &params);
+        assert_eq!(result, "Do something with no placeholders");
+    }
+
+    #[test]
+    fn test_render_prompt_missing_key() {
+        let template = "Research {{topic}} with {{missing}}";
+        let params = serde_json::json!({"topic": "AI"});
+        let result = render_prompt(template, &params);
+        assert_eq!(result, "Research AI with {{missing}}");
+    }
+
+    #[test]
+    fn test_render_prompt_numeric_value() {
+        let template = "Process {{count}} items";
+        let params = serde_json::json!({"count": 42});
+        let result = render_prompt(template, &params);
+        assert_eq!(result, "Process 42 items");
+    }
+
+    #[test]
+    fn test_workflow_start_payload_deserialization() {
+        let json_str = r#"{"workflow_id":"wf-1","convoy_id":"c-1","formula_name":"research","params":{"topic":"AI"},"started_by":"claude"}"#;
+        let payload: WorkflowStartPayload = serde_json::from_str(json_str).unwrap();
+        assert_eq!(payload.workflow_id, "wf-1");
+        assert_eq!(payload.formula_name, "research");
+        assert_eq!(payload.params["topic"], "AI");
+        assert_eq!(payload.started_by, "claude");
+    }
+
+    #[test]
+    fn test_task_completed_payload_deserialization() {
+        let json_str = r#"{"task_id":"t-1","agent_id":"claude","result_data":{"sources":["a","b"]}}"#;
+        let payload: TaskCompletedPayload = serde_json::from_str(json_str).unwrap();
+        assert_eq!(payload.task_id, "t-1");
+        assert_eq!(payload.agent_id, "claude");
+        assert!(payload.result_data.is_some());
+    }
+
+    #[test]
+    fn test_task_completed_payload_no_result() {
+        let json_str = r#"{"task_id":"t-2","agent_id":"qwen3"}"#;
+        let payload: TaskCompletedPayload = serde_json::from_str(json_str).unwrap();
+        assert_eq!(payload.task_id, "t-2");
+        assert!(payload.result_data.is_none());
+    }
+
+    #[test]
+    fn test_task_failed_payload_deserialization() {
+        let json_str = r#"{"task_id":"t-3","agent_id":"claude"}"#;
+        let payload: TaskFailedPayload = serde_json::from_str(json_str).unwrap();
+        assert_eq!(payload.task_id, "t-3");
+        assert_eq!(payload.agent_id, "claude");
+    }
+
+    #[test]
+    fn test_load_formula_research() {
+        // Parse the formula TOML directly from the workspace
+        let content = std::fs::read_to_string("../../.beads/formulas/research.formula.toml").unwrap();
+        let formula: FormulaFile = toml::from_str(&content).unwrap();
+        assert_eq!(formula.formula.name, "research");
+        assert_eq!(formula.steps.len(), 3);
+        assert_eq!(formula.steps[0].name, "gather_sources");
+        assert_eq!(formula.steps[0].agent_role, "researcher");
+        assert_eq!(formula.steps[0].output, "sources");
+        assert!(formula.steps[0].input.is_none());
+        assert!(formula.steps[1].input.is_some());
+    }
+
+    #[test]
+    fn test_load_formula_build_feature() {
+        let content = std::fs::read_to_string("../../.beads/formulas/build-feature.formula.toml").unwrap();
+        let formula: FormulaFile = toml::from_str(&content).unwrap();
+        assert_eq!(formula.formula.name, "build-feature");
+        assert_eq!(formula.steps.len(), 4);
+        assert_eq!(formula.steps[0].name, "plan");
+        assert_eq!(formula.steps[3].name, "document");
+    }
+
+    #[test]
+    fn test_load_formula_not_found_file() {
+        let result = std::fs::read_to_string("../../.beads/formulas/nonexistent.formula.toml");
+        assert!(result.is_err(), "nonexistent formula file should not exist");
+    }
+
+    #[test]
+    fn test_formula_input_single_deserialization() {
+        let toml_str = r#"
+[formula]
+name = "test"
+
+[[steps]]
+name = "s1"
+agent_role = "worker"
+prompt = "do it"
+input = "previous"
+output = "result"
+"#;
+        let formula: FormulaFile = toml::from_str(toml_str).unwrap();
+        match &formula.steps[0].input {
+            Some(FormulaInput::Single(s)) => assert_eq!(s, "previous"),
+            other => panic!("expected Single input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_formula_input_multiple_deserialization() {
+        let toml_str = r#"
+[formula]
+name = "test"
+
+[[steps]]
+name = "s1"
+agent_role = "worker"
+prompt = "do it"
+input = ["a", "b"]
+output = "result"
+"#;
+        let formula: FormulaFile = toml::from_str(toml_str).unwrap();
+        match &formula.steps[0].input {
+            Some(FormulaInput::Multiple(v)) => assert_eq!(v, &["a", "b"]),
+            other => panic!("expected Multiple input, got {other:?}"),
+        }
+    }
+}
