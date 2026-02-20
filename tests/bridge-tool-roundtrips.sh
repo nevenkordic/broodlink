@@ -319,6 +319,29 @@ echo ""
 pause
 
 # -----------------------------------------------------------------------
+# Hybrid Search (v0.4.0)
+# -----------------------------------------------------------------------
+echo "--- Hybrid Search ---"
+
+call_tool "hybrid_search" \
+  '{"query": "broodlink regression test", "limit": 5}' \
+  "hybrid_search: basic query" \
+  "results"
+
+call_tool "hybrid_search" \
+  '{"query": "broodlink regression test", "limit": 5, "decay": false}' \
+  "hybrid_search: decay disabled" \
+  "results"
+
+call_tool "hybrid_search" \
+  '{"query": "broodlink regression test", "limit": 5, "semantic_weight": 0.8, "keyword_weight": 0.2}' \
+  "hybrid_search: custom weights" \
+  "results"
+
+echo ""
+pause
+
+# -----------------------------------------------------------------------
 # Beads tools
 # -----------------------------------------------------------------------
 echo "--- Beads Tools ---"

@@ -498,6 +498,32 @@ else
     fail "semantic_search (response: $(echo "$SEMANTIC" | head -c 200))"
 fi
 
+# Hybrid search (v0.4.0)
+HYBRID=$(call_tool "hybrid_search" "{\"query\":\"AI agent orchestration\",\"limit\":5}")
+if echo "$HYBRID" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d.get('success',False)" 2>/dev/null; then
+    pass "hybrid_search succeeds"
+    METHOD=$(echo "$HYBRID" | python3 -c "import sys,json; d=json.load(sys.stdin)['data']; print(d.get('method','unknown'))" 2>/dev/null || echo "unknown")
+    pass "hybrid_search method: $METHOD"
+else
+    fail "hybrid_search (response: $(echo "$HYBRID" | head -c 200))"
+fi
+
+# Hybrid search with decay disabled
+HYBRID_NODECAY=$(call_tool "hybrid_search" "{\"query\":\"AI agent orchestration\",\"limit\":3,\"decay\":false}")
+if echo "$HYBRID_NODECAY" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d.get('success',False)" 2>/dev/null; then
+    pass "hybrid_search: decay=false succeeds"
+else
+    fail "hybrid_search: decay=false (response: $(echo "$HYBRID_NODECAY" | head -c 200))"
+fi
+
+# Hybrid search with custom weights
+HYBRID_WEIGHTS=$(call_tool "hybrid_search" "{\"query\":\"AI agent orchestration\",\"limit\":3,\"semantic_weight\":0.9,\"keyword_weight\":0.1}")
+if echo "$HYBRID_WEIGHTS" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d.get('success',False)" 2>/dev/null; then
+    pass "hybrid_search: custom weights succeeds"
+else
+    fail "hybrid_search: custom weights (response: $(echo "$HYBRID_WEIGHTS" | head -c 200))"
+fi
+
 # Cleanup test memory
 call_tool "delete_memory" "{\"topic\":\"e2e-embed-$EMBED_TS\"}" > /dev/null 2>&1
 
