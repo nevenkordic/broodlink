@@ -94,7 +94,7 @@ check_page "/" "Sidebar nav links" \
   'href="/guardrails/"'
 
 check_page "/" "Version badge" \
-  "v0.3.0"
+  "v0.5.0"
 
 check_page "/" "Logo" \
   "broodlink-logo.svg"
@@ -148,6 +148,20 @@ check_page "/a2a/" "A2A page" \
   "A2A Gateway" \
   "a2a.js"
 
+# -----------------------------------------------------------------------
+# v0.5.0 Knowledge Graph page
+# -----------------------------------------------------------------------
+echo "--- v0.5.0 Pages ---"
+
+check_page "/knowledge-graph/" "Knowledge Graph page" \
+  "Knowledge Graph" \
+  "knowledge-graph.js" \
+  "charts.js" \
+  "kg-total-entities" \
+  "kg-types-chart" \
+  "kg-connected-tbody" \
+  "kg-edges-tbody"
+
 echo ""
 
 # -----------------------------------------------------------------------
@@ -157,6 +171,9 @@ echo "--- v0.3.0 Navigation ---"
 
 check_page "/" "A2A nav link" \
   'href="/a2a/"'
+
+check_page "/" "Knowledge Graph nav link" \
+  'href="/knowledge-graph/"'
 
 echo ""
 

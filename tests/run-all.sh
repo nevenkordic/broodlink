@@ -99,6 +99,12 @@ if [ -f "status-site/tests/js-regression.sh" ]; then
     "bash status-site/tests/js-regression.sh"
 fi
 
+# DOM cross-check tests (JS getElementById ↔ HTML id alignment)
+if [ -f "status-site/tests/dom-crosscheck.sh" ]; then
+  run_suite "DOM ID cross-check tests" \
+    "bash status-site/tests/dom-crosscheck.sh"
+fi
+
 # Agent regression tests
 if [ -f "tests/agent-regression.sh" ]; then
   run_suite "Agent regression tests" \
@@ -127,6 +133,13 @@ fi
 if [ -f "tests/a2a-protocol.sh" ]; then
   run_suite "A2A protocol tests" \
     "bash tests/a2a-protocol.sh"
+fi
+
+# v0.5.0 Knowledge Graph tests
+if [ -f "tests/knowledge-graph.sh" ]; then
+  sleep 10  # let rate-limit bucket refill before KG tests
+  run_suite "Knowledge Graph tests" \
+    "bash tests/knowledge-graph.sh"
 fi
 
 # v0.3.0 deployment tests

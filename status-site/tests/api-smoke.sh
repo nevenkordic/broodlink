@@ -95,6 +95,71 @@ check_endpoint "/api/v1/streams"           "Streams"                "streams"
 check_endpoint "/api/v1/a2a/tasks"           "A2A tasks"
 check_endpoint "/api/v1/a2a/card"            "A2A AgentCard"
 
+# v0.5.0 knowledge graph endpoints
+check_endpoint "/api/v1/kg/stats"            "KG stats"               "total_entities"
+check_endpoint "/api/v1/kg/entities"         "KG entities"            "entities"
+check_endpoint "/api/v1/kg/edges"            "KG edges"               "edges"
+
+echo ""
+echo "=== API Response Structure Tests ==="
+
+# Tasks must return counts_by_status with pending count
+check_endpoint "/api/v1/tasks"        "Tasks: counts_by_status"  "counts_by_status"
+
+# Verify counts_by_status.pending is a number (not missing)
+tasks_response=$(curl -sf -H "X-Broodlink-Api-Key: $API_KEY" "$API_URL/api/v1/tasks" 2>&1) || true
+has_pending=$(echo "$tasks_response" | python3 -c "
+import sys, json
+d = json.load(sys.stdin).get('data', {})
+cbs = d.get('counts_by_status', {})
+print('yes' if isinstance(cbs.get('pending'), int) else 'no')
+" 2>/dev/null)
+if [ "$has_pending" = "yes" ]; then
+  pass "Tasks: counts_by_status.pending is integer"
+else
+  fail "Tasks: counts_by_status.pending missing or not integer"
+fi
+
+# Tasks recent items must have assigned_agent field
+has_assigned=$(echo "$tasks_response" | python3 -c "
+import sys, json
+d = json.load(sys.stdin).get('data', {})
+recent = d.get('recent', [])
+if not recent:
+    print('yes')  # empty list is ok
+else:
+    print('yes' if 'assigned_agent' in recent[0] else 'no')
+" 2>/dev/null)
+if [ "$has_assigned" = "yes" ]; then
+  pass "Tasks: recent items include assigned_agent field"
+else
+  fail "Tasks: recent items missing assigned_agent (dashboard needs this)"
+fi
+
+# Memory stats must return agents_count and topics_count
+check_endpoint "/api/v1/memory/stats" "Memory: agents_count"     "agents_count"
+check_endpoint "/api/v1/memory/stats" "Memory: topics_count"     "topics_count"
+
+# Memory stats top_topics must have content_length (not raw content)
+mem_response=$(curl -sf -H "X-Broodlink-Api-Key: $API_KEY" "$API_URL/api/v1/memory/stats" 2>&1) || true
+has_content_length=$(echo "$mem_response" | python3 -c "
+import sys, json
+d = json.load(sys.stdin).get('data', {})
+topics = d.get('top_topics', [])
+if not topics:
+    print('yes')  # empty is ok
+else:
+    t = topics[0]
+    has_len = 'content_length' in t
+    no_content = 'content' not in t
+    print('yes' if has_len and no_content else 'no')
+" 2>/dev/null)
+if [ "$has_content_length" = "yes" ]; then
+  pass "Memory: top_topics use content_length (not raw content)"
+else
+  fail "Memory: top_topics should have content_length and NOT send raw content blob"
+fi
+
 echo ""
 echo "=== Beads-Bridge Smoke Test ==="
 bridge_status=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:3310/health" 2>/dev/null) || true

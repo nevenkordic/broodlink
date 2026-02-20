@@ -19,7 +19,7 @@ fail() { FAIL=$((FAIL + 1)); printf "  FAIL: %s\n" "$1"; }
 echo "=== JS Namespace Regression Tests ==="
 
 # Every JS module that references window.Broodlink must NOT reference window.BL
-for f in agents.js audit.js commits.js decisions.js memory.js dashboard.js beads.js; do
+for f in agents.js audit.js commits.js decisions.js memory.js dashboard.js beads.js knowledge-graph.js; do
   file="$JS_DIR/$f"
   if [ ! -f "$file" ]; then
     fail "$f: file not found"
@@ -111,6 +111,47 @@ if grep -q 'fetchApi' "$JS_DIR/beads.js" 2>/dev/null; then
   pass "beads.js: uses fetchApi"
 else
   fail "beads.js: missing fetchApi (should use BL.fetchApi)"
+fi
+
+echo ""
+echo "=== Dashboard Field Regression Tests ==="
+
+# dashboard.js must use counts_by_status for pending metric (not filter recent array)
+if grep -q 'counts_by_status' "$JS_DIR/dashboard.js" 2>/dev/null; then
+  pass "dashboard.js: uses counts_by_status for pending metric"
+else
+  fail "dashboard.js: missing counts_by_status (must use server-provided count, not filter recent)"
+fi
+
+# dashboard.js must use assigned_agent for task table agent column
+if grep -q 'assigned_agent' "$JS_DIR/dashboard.js" 2>/dev/null; then
+  pass "dashboard.js: uses assigned_agent field"
+else
+  fail "dashboard.js: missing assigned_agent (API returns assigned_agent, not agent_id)"
+fi
+
+# dashboard.js must use REFRESH_INTERVAL
+if grep -q 'REFRESH_INTERVAL' "$JS_DIR/dashboard.js" 2>/dev/null; then
+  pass "dashboard.js: uses REFRESH_INTERVAL"
+else
+  fail "dashboard.js: missing REFRESH_INTERVAL constant reference"
+fi
+
+echo ""
+echo "=== Memory Field Regression Tests ==="
+
+# memory.js must use content_length (not raw content string length)
+if grep -q 'content_length' "$JS_DIR/memory.js" 2>/dev/null; then
+  pass "memory.js: uses content_length field from API"
+else
+  fail "memory.js: missing content_length (should use API-provided content_length, not content.length)"
+fi
+
+# memory.js chart must specify unit label
+if grep -q "unit.*chars\|unit:.*'chars'" "$JS_DIR/memory.js" 2>/dev/null; then
+  pass "memory.js: chart specifies unit label"
+else
+  fail "memory.js: chart missing unit label (bars show raw numbers without context)"
 fi
 
 echo ""
