@@ -397,6 +397,13 @@ async fn run_cycle(state: &AppState) -> Result<(), BroodlinkError> {
     let _ = metrics_updated; // used for logging only
 
     // -----------------------------------------------------------------------
+    // 5e. Sync memory_search_index from Dolt-direct writes (Postgres)
+    // -----------------------------------------------------------------------
+    if let Err(e) = sync_memory_search_index(&state.dolt, &state.pg).await {
+        warn!(error = %e, "memory search index sync failed");
+    }
+
+    // -----------------------------------------------------------------------
     // 6. Publish broodlink.<env>.health (NATS)
     // -----------------------------------------------------------------------
     let dolt_ok = sqlx::query("SELECT 1").execute(&state.dolt).await.is_ok();
@@ -906,6 +913,78 @@ async fn write_residency_log(
     .bind(&services)
     .execute(pg)
     .await?;
+
+    Ok(())
+}
+
+/// Sync Dolt agent_memory → Postgres memory_search_index for direct-write catch-up.
+async fn sync_memory_search_index(
+    dolt: &MySqlPool,
+    pg: &PgPool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Find the latest updated_at in Postgres search index
+    let latest: Option<String> = sqlx::query_as::<_, (Option<String>,)>(
+        "SELECT MAX(updated_at::text) FROM memory_search_index",
+    )
+    .fetch_one(pg)
+    .await
+    .ok()
+    .and_then(|r| r.0);
+
+    let since = latest.unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
+
+    // Fetch recent Dolt memories newer than our latest sync point
+    let rows = sqlx::query_as::<_, (i64, String, String, String, Option<serde_json::Value>, String, String)>(
+        "SELECT id, agent_name, topic, content, tags, CAST(created_at AS CHAR), CAST(updated_at AS CHAR)
+         FROM agent_memory
+         WHERE updated_at > ?
+         ORDER BY updated_at ASC
+         LIMIT 100",
+    )
+    .bind(&since)
+    .fetch_all(dolt)
+    .await?;
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    info!(count = rows.len(), "syncing memory_search_index from Dolt");
+
+    for (memory_id, agent_id, topic, content, tags, created_at, updated_at) in &rows {
+        // Convert JSON array tags to comma-separated string for Postgres
+        let tags_str: Option<String> = tags.as_ref().and_then(|v| {
+            v.as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+        });
+
+        if let Err(e) = sqlx::query(
+            "INSERT INTO memory_search_index (memory_id, agent_id, topic, content, tags, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6::timestamptz, $7::timestamptz)
+             ON CONFLICT (agent_id, topic) DO UPDATE SET
+                 content = EXCLUDED.content,
+                 tags = EXCLUDED.tags,
+                 memory_id = EXCLUDED.memory_id,
+                 created_at = EXCLUDED.created_at,
+                 updated_at = EXCLUDED.updated_at",
+        )
+        .bind(memory_id)
+        .bind(agent_id)
+        .bind(topic)
+        .bind(content)
+        .bind(&tags_str)
+        .bind(created_at)
+        .bind(updated_at)
+        .execute(pg)
+        .await
+        {
+            warn!(error = %e, topic = %topic, "sync: failed to upsert memory_search_index");
+        }
+    }
 
     Ok(())
 }

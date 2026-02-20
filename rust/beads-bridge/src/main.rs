@@ -264,6 +264,7 @@ pub struct AppState {
     pub rate_override_buckets: RwLock<HashMap<String, TokenBucket>>,
     pub qdrant_breaker: CircuitBreaker,
     pub ollama_breaker: CircuitBreaker,
+    pub reranker_breaker: CircuitBreaker,
     pub start_time: Instant,
     pub jwt_decoding_key: jsonwebtoken::DecodingKey,
     pub jwt_validation: jsonwebtoken::Validation,
@@ -450,6 +451,37 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
         CIRCUIT_FAILURE_THRESHOLD,
         CIRCUIT_HALF_OPEN_SECS,
     );
+    let reranker_breaker = CircuitBreaker::new(
+        "reranker",
+        CIRCUIT_FAILURE_THRESHOLD,
+        CIRCUIT_HALF_OPEN_SECS,
+    );
+
+    // Pre-pull reranker model (best-effort, non-blocking)
+    if config.memory_search.reranker_enabled {
+        let reranker_model = config.memory_search.reranker_model.clone();
+        let ollama_url = config.ollama.url.clone();
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            match client
+                .post(format!("{ollama_url}/api/pull"))
+                .json(&serde_json::json!({ "name": reranker_model, "stream": false }))
+                .timeout(Duration::from_secs(120))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    info!(model = %reranker_model, "reranker model ready");
+                }
+                Ok(resp) => {
+                    warn!(model = %reranker_model, status = %resp.status(), "reranker model pull failed — reranking may not work");
+                }
+                Err(e) => {
+                    warn!(model = %reranker_model, error = %e, "reranker model pull failed — reranking may not work");
+                }
+            }
+        });
+    }
 
     Ok(AppState {
         dolt,
@@ -462,6 +494,7 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
         rate_override_buckets: RwLock::new(HashMap::new()),
         qdrant_breaker,
         ollama_breaker,
+        reranker_breaker,
         start_time: Instant::now(),
         jwt_decoding_key,
         jwt_validation,
@@ -509,6 +542,10 @@ fn p_bool(desc: &str) -> serde_json::Value {
     serde_json::json!({"type": "boolean", "description": desc})
 }
 
+fn p_number(desc: &str) -> serde_json::Value {
+    serde_json::json!({"type": "number", "description": desc})
+}
+
 static TOOL_REGISTRY: std::sync::LazyLock<Vec<serde_json::Value>> =
     std::sync::LazyLock::new(|| {
         vec![
@@ -527,6 +564,15 @@ static TOOL_REGISTRY: std::sync::LazyLock<Vec<serde_json::Value>> =
             tool_def("semantic_search", "Search memory using semantic vector similarity via Qdrant.", serde_json::json!({
                 "query": p_str("Natural language search query"),
                 "limit": p_int("Number of results (default 5)"),
+            }), &["query"]),
+            tool_def("hybrid_search", "Search memory using hybrid BM25 + semantic vector fusion with temporal decay and optional reranking.", serde_json::json!({
+                "query": p_str("Natural language search query"),
+                "limit": p_int("Max results to return (default 10)"),
+                "agent_id": p_str("Optional filter by agent"),
+                "semantic_weight": p_number("Weight for semantic vector scores (default 0.6)"),
+                "keyword_weight": p_number("Weight for BM25 keyword scores (default 0.4)"),
+                "decay": p_bool("Enable temporal decay (default true)"),
+                "rerank": p_bool("Enable reranking via dedicated model (default false)"),
             }), &["query"]),
 
             // --- Work ---
@@ -971,8 +1017,9 @@ async fn tool_dispatch(
         // --- Memory (Dolt) ---
         "store_memory" => tool_store_memory(&state, agent_id, params).await,
         "recall_memory" => tool_recall_memory(&state, agent_id, params).await,
-        "delete_memory" => tool_delete_memory(&state, params).await,
+        "delete_memory" => tool_delete_memory(&state, agent_id, params).await,
         "semantic_search" => tool_semantic_search(&state, agent_id, params).await,
+        "hybrid_search" => tool_hybrid_search(&state, agent_id, params).await,
 
         // --- Work (Postgres) ---
         "log_work" => tool_log_work(&state, agent_id, params).await,
@@ -1233,6 +1280,26 @@ fn param_i64_opt(params: &serde_json::Value, field: &str) -> Option<i64> {
     params.get(field).and_then(serde_json::Value::as_i64)
 }
 
+fn param_f64_opt(params: &serde_json::Value, field: &str) -> Option<f64> {
+    let val = params.get(field)?;
+    if let Some(n) = val.as_f64() {
+        return Some(n);
+    }
+    val.as_str().and_then(|s| s.parse::<f64>().ok())
+}
+
+fn param_bool_opt(params: &serde_json::Value, field: &str) -> Option<bool> {
+    let val = params.get(field)?;
+    if let Some(b) = val.as_bool() {
+        return Some(b);
+    }
+    match val.as_str() {
+        Some("true" | "1") => Some(true),
+        Some("false" | "0") => Some(false),
+        _ => None,
+    }
+}
+
 // ===========================================================================
 // Tool implementations
 // ===========================================================================
@@ -1267,6 +1334,17 @@ async fn tool_store_memory(
     .execute(&state.dolt)
     .await?;
 
+    // Fetch memory_id for the Postgres search index (LAST_INSERT_ID returns 0 on UPDATE)
+    let memory_id: i64 = sqlx::query_as::<_, (i64,)>(
+        "SELECT id FROM agent_memory WHERE topic = ? AND agent_name = ?",
+    )
+    .bind(topic)
+    .bind(agent_id)
+    .fetch_one(&state.dolt)
+    .await
+    .map(|r| r.0)
+    .unwrap_or(0);
+
     // Outbox write for embedding pipeline
     let outbox_payload = serde_json::json!({
         "topic": topic,
@@ -1274,6 +1352,27 @@ async fn tool_store_memory(
         "agent_name": agent_id,
     });
     write_outbox(&state.pg, "embed", &outbox_payload).await?;
+
+    // UPSERT into Postgres full-text search index (non-fatal)
+    if let Err(e) = sqlx::query(
+        "INSERT INTO memory_search_index (memory_id, agent_id, topic, content, tags, updated_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())
+         ON CONFLICT (agent_id, topic) DO UPDATE SET
+             content = EXCLUDED.content,
+             tags = EXCLUDED.tags,
+             memory_id = EXCLUDED.memory_id,
+             updated_at = NOW()",
+    )
+    .bind(memory_id)
+    .bind(agent_id)
+    .bind(topic)
+    .bind(content)
+    .bind(tags_str)
+    .execute(&state.pg)
+    .await
+    {
+        warn!(error = %e, topic = %topic, "failed to upsert memory_search_index (non-fatal)");
+    }
 
     info!(topic = %topic, agent = %agent_id, "memory stored + outbox queued");
 
@@ -1329,6 +1428,7 @@ async fn tool_recall_memory(
 
 async fn tool_delete_memory(
     state: &AppState,
+    agent_id: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
     let topic = param_str(params, "topic")?;
@@ -1337,6 +1437,18 @@ async fn tool_delete_memory(
         .bind(topic)
         .execute(&state.dolt)
         .await?;
+
+    // Also delete from Postgres full-text search index (non-fatal)
+    if let Err(e) = sqlx::query(
+        "DELETE FROM memory_search_index WHERE agent_id = $1 AND topic = $2",
+    )
+    .bind(agent_id)
+    .bind(topic)
+    .execute(&state.pg)
+    .await
+    {
+        warn!(error = %e, topic = %topic, "failed to delete from memory_search_index (non-fatal)");
+    }
 
     Ok(serde_json::json!({
         "topic": topic,
@@ -1434,6 +1546,489 @@ async fn tool_semantic_search(
     Ok(serde_json::json!({
         "query": query,
         "results": qdrant_json.get("result"),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Hybrid search helpers
+// ---------------------------------------------------------------------------
+
+/// Get embedding vector from Ollama. Uses the default embedding model.
+async fn get_ollama_embedding(state: &AppState, text: &str) -> Result<Vec<f64>, BroodlinkError> {
+    state.ollama_breaker.check().map_err(BroodlinkError::CircuitOpen)?;
+
+    let url = format!("{}/api/embeddings", state.config.ollama.url);
+    let body = serde_json::json!({
+        "model": state.config.ollama.embedding_model,
+        "prompt": text,
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .timeout(Duration::from_secs(state.config.ollama.timeout_seconds))
+        .send()
+        .await
+        .map_err(|e| {
+            state.ollama_breaker.record_failure();
+            BroodlinkError::Internal(format!("ollama request failed: {e}"))
+        })?;
+
+    if !resp.status().is_success() {
+        state.ollama_breaker.record_failure();
+        return Err(BroodlinkError::Internal(format!(
+            "ollama returned status {}",
+            resp.status()
+        )));
+    }
+    state.ollama_breaker.record_success();
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| BroodlinkError::Internal(format!("ollama parse: {e}")))?;
+
+    let arr = json
+        .get("embedding")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| BroodlinkError::Internal("no embedding array in ollama response".to_string()))?;
+
+    Ok(arr.iter().filter_map(|v| v.as_f64()).collect())
+}
+
+/// Run vector similarity search against Qdrant, returning (topic, agent_id, score, created_at).
+async fn semantic_search_raw(
+    state: &AppState,
+    query_embedding: &[f64],
+    limit: i64,
+) -> Result<Vec<(String, String, f64, String)>, BroodlinkError> {
+    state.qdrant_breaker.check().map_err(BroodlinkError::CircuitOpen)?;
+
+    let qdrant_url = format!(
+        "{}/collections/{}/points/search",
+        state.config.qdrant.url, state.config.qdrant.collection,
+    );
+    let qdrant_body = serde_json::json!({
+        "vector": { "name": "default", "vector": query_embedding },
+        "limit": limit,
+        "with_payload": true,
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&qdrant_url)
+        .json(&qdrant_body)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| {
+            state.qdrant_breaker.record_failure();
+            BroodlinkError::Internal(format!("qdrant request failed: {e}"))
+        })?;
+
+    if !resp.status().is_success() {
+        state.qdrant_breaker.record_failure();
+        return Err(BroodlinkError::Internal(format!(
+            "qdrant returned status {}",
+            resp.status()
+        )));
+    }
+    state.qdrant_breaker.record_success();
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| BroodlinkError::Internal(format!("qdrant parse: {e}")))?;
+
+    let mut results = Vec::new();
+    if let Some(points) = json.get("result").and_then(|r| r.as_array()) {
+        for point in points {
+            let score = point.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
+            let payload = point.get("payload").cloned().unwrap_or(serde_json::json!({}));
+            let topic = payload
+                .get("topic")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+            let agent_id = payload
+                .get("agent_id")
+                .and_then(|a| a.as_str())
+                .unwrap_or("")
+                .to_string();
+            let created_at = payload
+                .get("created_at")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            if !topic.is_empty() {
+                results.push((topic, agent_id, score, created_at));
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Run BM25 full-text search on Postgres memory_search_index.
+/// Returns (memory_id, agent_id, topic, content, tags, bm25_score, created_at_text, updated_at_text).
+async fn bm25_search(
+    pg: &PgPool,
+    query: &str,
+    agent_filter: Option<&str>,
+    limit: i64,
+) -> Result<Vec<(i64, String, String, String, Option<String>, f64, String, String)>, BroodlinkError>
+{
+    let rows = sqlx::query_as::<_, (i64, String, String, String, Option<String>, f64, String, String)>(
+        r#"SELECT memory_id, agent_id, topic, content, tags,
+                  ts_rank_cd(tsv, plainto_tsquery('english', $1), 32)::float8 AS bm25_score,
+                  created_at::text, updated_at::text
+           FROM memory_search_index
+           WHERE tsv @@ plainto_tsquery('english', $1)
+             AND ($2::text IS NULL OR agent_id = $2)
+           ORDER BY bm25_score DESC
+           LIMIT $3"#,
+    )
+    .bind(query)
+    .bind(agent_filter)
+    .bind(limit)
+    .fetch_all(pg)
+    .await?;
+
+    Ok(rows)
+}
+
+/// Min-max normalise a slice of scores to [0, 1].
+fn min_max_normalize(scores: &[f64]) -> Vec<f64> {
+    if scores.is_empty() {
+        return vec![];
+    }
+    let min = scores.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let range = max - min;
+    if range < f64::EPSILON {
+        return vec![1.0; scores.len()];
+    }
+    scores.iter().map(|s| (s - min) / range).collect()
+}
+
+/// Exponential temporal decay: e^(-lambda * age_days).
+fn temporal_decay(updated_at: &str, lambda: f64) -> f64 {
+    if lambda < f64::EPSILON {
+        return 1.0; // decay disabled
+    }
+
+    let now = chrono::Utc::now();
+    // Try parsing Postgres text formats
+    let parsed = chrono::DateTime::parse_from_rfc3339(updated_at)
+        .or_else(|_| chrono::DateTime::parse_from_str(updated_at, "%Y-%m-%d %H:%M:%S%.f%:z"))
+        .or_else(|_| chrono::DateTime::parse_from_str(updated_at, "%Y-%m-%d %H:%M:%S%.f+00"))
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+
+    let age_days = match parsed {
+        Ok(dt) => now.signed_duration_since(dt).num_seconds() as f64 / 86400.0,
+        Err(_) => 0.0, // unparseable → no decay
+    };
+
+    (-lambda * age_days.max(0.0)).exp()
+}
+
+/// Truncate content to max_len chars, appending "…" if truncated.
+fn truncate_content(content: &str, max_len: usize) -> String {
+    if max_len == 0 || content.len() <= max_len {
+        return content.to_string();
+    }
+    let mut truncated = content.chars().take(max_len).collect::<String>();
+    truncated.push('\u{2026}'); // …
+    truncated
+}
+
+/// Cosine similarity between two vectors.
+fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let norm_b: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if norm_a < f64::EPSILON || norm_b < f64::EPSILON {
+        return 0.0;
+    }
+    dot / (norm_a * norm_b)
+}
+
+// ---------------------------------------------------------------------------
+// Hybrid search tool
+// ---------------------------------------------------------------------------
+
+/// Candidate record for hybrid search fusion.
+struct HybridCandidate {
+    memory_id: i64,
+    topic: String,
+    content: String,
+    agent_id: String,
+    tags: Option<String>,
+    created_at: String,
+    updated_at: String,
+    bm25_score: f64,
+    vector_score: f64,
+    fused_score: f64,
+}
+
+async fn tool_hybrid_search(
+    state: &AppState,
+    _caller_agent_id: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let query = param_str(params, "query")?;
+    let limit = param_i64_opt(params, "limit").unwrap_or(10);
+    let agent_filter = param_str_opt(params, "agent_id");
+    let semantic_weight = param_f64_opt(params, "semantic_weight").unwrap_or(0.6);
+    let keyword_weight = param_f64_opt(params, "keyword_weight").unwrap_or(0.4);
+    let decay_enabled = param_bool_opt(params, "decay").unwrap_or(true);
+    let rerank = param_bool_opt(params, "rerank").unwrap_or(false);
+
+    let lambda = state.config.memory_search.decay_lambda;
+    let max_content_len = state.config.memory_search.max_content_length;
+    let fetch_limit = limit * 2; // over-fetch for fusion
+
+    // --- Run BM25 + semantic search in parallel ---
+    let qdrant_available = state.qdrant_breaker.check().is_ok()
+        && state.ollama_breaker.check().is_ok();
+
+    let bm25_fut = bm25_search(&state.pg, query, agent_filter, fetch_limit);
+
+    let semantic_fut = async {
+        if !qdrant_available {
+            return Ok(vec![]);
+        }
+        let embedding = get_ollama_embedding(state, query).await?;
+        semantic_search_raw(state, &embedding, fetch_limit).await
+    };
+
+    let (bm25_result, semantic_result) = tokio::join!(bm25_fut, semantic_fut);
+
+    let bm25_rows = bm25_result.unwrap_or_else(|e| {
+        warn!(error = %e, "BM25 search failed, using empty results");
+        vec![]
+    });
+    let semantic_rows = semantic_result.unwrap_or_else(|e| {
+        warn!(error = %e, "semantic search failed, using empty results");
+        vec![]
+    });
+
+    let bm25_empty = bm25_rows.is_empty();
+    let semantic_empty = semantic_rows.is_empty();
+
+    // --- Build candidate map keyed by (agent_id, topic) ---
+    let mut candidates: HashMap<(String, String), HybridCandidate> = HashMap::new();
+
+    // Normalise BM25 scores
+    let bm25_raw: Vec<f64> = bm25_rows.iter().map(|r| r.5).collect();
+    let bm25_norm = min_max_normalize(&bm25_raw);
+
+    for (i, (memory_id, aid, topic, content, tags, _raw, created_at, updated_at)) in
+        bm25_rows.into_iter().enumerate()
+    {
+        let key = (aid.clone(), topic.clone());
+        let norm_score = bm25_norm[i];
+        let entry = candidates.entry(key).or_insert(HybridCandidate {
+            memory_id,
+            topic,
+            content,
+            agent_id: aid,
+            tags,
+            created_at,
+            updated_at,
+            bm25_score: 0.0,
+            vector_score: 0.0,
+            fused_score: 0.0,
+        });
+        entry.bm25_score = norm_score;
+        entry.fused_score += norm_score * keyword_weight;
+    }
+
+    // Normalise semantic scores (Qdrant cosine similarity is already ~[0,1] but normalise anyway)
+    let sem_raw: Vec<f64> = semantic_rows.iter().map(|r| r.2).collect();
+    let sem_norm = min_max_normalize(&sem_raw);
+
+    for (i, (topic, aid, _raw_score, created_at)) in semantic_rows.into_iter().enumerate() {
+        let key = (aid.clone(), topic.clone());
+        let norm_score = sem_norm[i];
+
+        let entry = candidates.entry(key).or_insert_with(|| {
+            // Content not in BM25 results — look it up later
+            HybridCandidate {
+                memory_id: 0,
+                topic: topic.clone(),
+                content: String::new(),
+                agent_id: aid.clone(),
+                tags: None,
+                created_at: created_at.clone(),
+                updated_at: created_at, // use created_at as fallback
+                bm25_score: 0.0,
+                vector_score: 0.0,
+                fused_score: 0.0,
+            }
+        });
+        entry.vector_score = norm_score;
+        entry.fused_score += norm_score * semantic_weight;
+    }
+
+    // --- Fill missing content from Postgres search index (for semantic-only results) ---
+    for candidate in candidates.values_mut() {
+        if candidate.content.is_empty() {
+            if let Ok(Some(row)) = sqlx::query_as::<_, (i64, String, Option<String>, String, String)>(
+                "SELECT memory_id, content, tags, created_at::text, updated_at::text
+                 FROM memory_search_index WHERE agent_id = $1 AND topic = $2",
+            )
+            .bind(&candidate.agent_id)
+            .bind(&candidate.topic)
+            .fetch_optional(&state.pg)
+            .await
+            {
+                candidate.memory_id = row.0;
+                candidate.content = row.1;
+                candidate.tags = row.2;
+                candidate.created_at = row.3;
+                candidate.updated_at = row.4;
+            } else if let Ok(Some(row)) = sqlx::query_as::<_, (i64, String, Option<serde_json::Value>, String, String)>(
+                "SELECT id, content, tags, CAST(created_at AS CHAR), CAST(updated_at AS CHAR)
+                 FROM agent_memory WHERE agent_name = ? AND topic = ?",
+            )
+            .bind(&candidate.agent_id)
+            .bind(&candidate.topic)
+            .fetch_optional(&state.dolt)
+            .await
+            {
+                candidate.memory_id = row.0;
+                candidate.content = row.1;
+                candidate.tags = row.2.and_then(|v| v.as_str().map(String::from));
+                candidate.created_at = row.3;
+                candidate.updated_at = row.4;
+            }
+        }
+    }
+
+    // --- Apply temporal decay ---
+    if decay_enabled {
+        for candidate in candidates.values_mut() {
+            let decay = temporal_decay(&candidate.updated_at, lambda);
+            candidate.fused_score *= decay;
+        }
+    }
+
+    // --- Sort by fused_score descending ---
+    let mut ranked: Vec<HybridCandidate> = candidates.into_values().collect();
+    ranked.sort_by(|a, b| {
+        b.fused_score
+            .partial_cmp(&a.fused_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // --- Determine method ---
+    let mut method = if bm25_empty && semantic_empty {
+        "none"
+    } else if bm25_empty {
+        "semantic_fallback"
+    } else if semantic_empty {
+        "bm25_fallback"
+    } else {
+        "hybrid"
+    };
+
+    // --- Optional reranking ---
+    if rerank
+        && state.config.memory_search.reranker_enabled
+        && state.reranker_breaker.check().is_ok()
+        && ranked.len() > 1
+    {
+        let client = reqwest::Client::new();
+        let reranker_model = &state.config.memory_search.reranker_model;
+        let ollama_url = format!("{}/api/embeddings", state.config.ollama.url);
+        let mut rerank_failed = false;
+
+        for candidate in &mut ranked {
+            let input = format!(
+                "query: {} document: {}: {}",
+                query, candidate.topic, candidate.content
+            );
+            let body = serde_json::json!({
+                "model": reranker_model,
+                "prompt": input,
+            });
+
+            match client
+                .post(&ollama_url)
+                .json(&body)
+                .timeout(Duration::from_secs(state.config.ollama.timeout_seconds))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    state.reranker_breaker.record_success();
+                    if let Ok(json) = resp.json::<serde_json::Value>().await {
+                        if let Some(emb) = json.get("embedding").and_then(|v| v.as_array()) {
+                            // Use the magnitude of the embedding as a relevance proxy
+                            let score: f64 = emb
+                                .iter()
+                                .filter_map(|v| v.as_f64())
+                                .map(|v| v * v)
+                                .sum::<f64>()
+                                .sqrt();
+                            candidate.fused_score = score;
+                        }
+                    }
+                }
+                Ok(_) | Err(_) => {
+                    state.reranker_breaker.record_failure();
+                    rerank_failed = true;
+                    break;
+                }
+            }
+        }
+
+        if !rerank_failed {
+            ranked.sort_by(|a, b| {
+                b.fused_score
+                    .partial_cmp(&a.fused_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            method = "hybrid_reranked";
+        }
+    }
+
+    // --- Truncate to limit ---
+    ranked.truncate(limit as usize);
+
+    // --- Format response ---
+    let results: Vec<serde_json::Value> = ranked
+        .iter()
+        .map(|c| {
+            let content = truncate_content(&c.content, max_content_len);
+            serde_json::json!({
+                "memory_id": c.memory_id,
+                "agent_id": c.agent_id,
+                "topic": c.topic,
+                "content": content,
+                "tags": c.tags,
+                "score": (c.fused_score * 1000.0).round() / 1000.0,
+                "bm25_score": (c.bm25_score * 1000.0).round() / 1000.0,
+                "vector_score": (c.vector_score * 1000.0).round() / 1000.0,
+                "created_at": c.created_at,
+                "updated_at": c.updated_at,
+            })
+        })
+        .collect();
+
+    let total = results.len();
+
+    Ok(serde_json::json!({
+        "results": results,
+        "query": query,
+        "total": total,
+        "method": method,
     }))
 }
 
@@ -4517,7 +5112,7 @@ mod tests {
     #[test]
     fn test_tool_registry_count() {
         // Must match the number of match arms in tool_dispatch (excluding the _ fallback)
-        assert_eq!(TOOL_REGISTRY.len(), 61, "tool registry should have 61 tools");
+        assert_eq!(TOOL_REGISTRY.len(), 62, "tool registry should have 62 tools");
     }
 
     #[test]
@@ -4538,7 +5133,7 @@ mod tests {
             .map(|t| t["function"]["name"].as_str().unwrap_or(""))
             .collect();
         for expected in &[
-            "store_memory", "recall_memory", "semantic_search",
+            "store_memory", "recall_memory", "semantic_search", "hybrid_search",
             "log_work", "list_projects", "send_message",
             "log_decision", "claim_task", "agent_upsert",
             "health_check", "ping",
@@ -4718,5 +5313,157 @@ mod tests {
         assert!(policy_matches(&cond, "low", "claude", Some("log_work")));
         assert!(!policy_matches(&cond, "low", "claude", Some("deploy")));
         assert!(!policy_matches(&cond, "low", "claude", None));
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.4.0: param_f64_opt / param_bool_opt tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_param_f64_opt_from_number() {
+        let params = json!({"w": 0.7});
+        let val = param_f64_opt(&params, "w").unwrap();
+        assert!((val - 0.7).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_param_f64_opt_from_string() {
+        let params = json!({"w": "0.7"});
+        let val = param_f64_opt(&params, "w").unwrap();
+        assert!((val - 0.7).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_param_f64_opt_absent() {
+        let params = json!({});
+        assert_eq!(param_f64_opt(&params, "w"), None);
+    }
+
+    #[test]
+    fn test_param_bool_opt_from_bool() {
+        let params = json!({"flag": true});
+        assert_eq!(param_bool_opt(&params, "flag"), Some(true));
+    }
+
+    #[test]
+    fn test_param_bool_opt_from_string() {
+        let params = json!({"flag": "false"});
+        assert_eq!(param_bool_opt(&params, "flag"), Some(false));
+    }
+
+    #[test]
+    fn test_param_bool_opt_absent() {
+        let params = json!({});
+        assert_eq!(param_bool_opt(&params, "flag"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.4.0: min_max_normalize tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_min_max_normalize_basic() {
+        let scores = vec![1.0, 2.0, 3.0];
+        let norm = min_max_normalize(&scores);
+        assert!((norm[0] - 0.0).abs() < f64::EPSILON);
+        assert!((norm[1] - 0.5).abs() < f64::EPSILON);
+        assert!((norm[2] - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_min_max_normalize_single() {
+        let norm = min_max_normalize(&[5.0]);
+        assert_eq!(norm.len(), 1);
+        assert!((norm[0] - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_min_max_normalize_equal() {
+        let norm = min_max_normalize(&[3.0, 3.0, 3.0]);
+        assert!(norm.iter().all(|&s| (s - 1.0).abs() < f64::EPSILON));
+    }
+
+    #[test]
+    fn test_min_max_normalize_empty() {
+        let norm = min_max_normalize(&[]);
+        assert!(norm.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.4.0: temporal_decay tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_temporal_decay_zero_age() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let decay = temporal_decay(&now, 0.01);
+        assert!((decay - 1.0).abs() < 0.02, "decay at zero age should be ~1.0, got {decay}");
+    }
+
+    #[test]
+    fn test_temporal_decay_30_days() {
+        let thirty_days_ago = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        let decay = temporal_decay(&thirty_days_ago, 0.01);
+        let expected = (-0.01_f64 * 30.0).exp(); // ~0.7408
+        assert!(
+            (decay - expected).abs() < 0.02,
+            "decay at 30 days should be ~{expected}, got {decay}"
+        );
+    }
+
+    #[test]
+    fn test_temporal_decay_lambda_zero() {
+        let old = (chrono::Utc::now() - chrono::Duration::days(365)).to_rfc3339();
+        let decay = temporal_decay(&old, 0.0);
+        assert!((decay - 1.0).abs() < f64::EPSILON, "lambda=0 should disable decay");
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.4.0: truncate_content tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_truncate_content_under_limit() {
+        let result = truncate_content("short text", 100);
+        assert_eq!(result, "short text");
+    }
+
+    #[test]
+    fn test_truncate_content_over_limit() {
+        let result = truncate_content("hello world", 5);
+        assert_eq!(result, "hello\u{2026}");
+    }
+
+    #[test]
+    fn test_truncate_content_zero_limit() {
+        let result = truncate_content("no truncation", 0);
+        assert_eq!(result, "no truncation");
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.4.0: cosine_similarity tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cosine_similarity_identical() {
+        let a = vec![1.0, 0.0, 1.0];
+        let sim = cosine_similarity(&a, &a);
+        assert!((sim - 1.0).abs() < 1e-10, "identical vectors should have similarity 1.0");
+    }
+
+    #[test]
+    fn test_cosine_similarity_orthogonal() {
+        let a = vec![1.0, 0.0];
+        let b = vec![0.0, 1.0];
+        let sim = cosine_similarity(&a, &b);
+        assert!(sim.abs() < 1e-10, "orthogonal vectors should have similarity 0.0");
+    }
+
+    #[test]
+    fn test_cosine_similarity_opposite() {
+        let a = vec![1.0, 0.0];
+        let b = vec![-1.0, 0.0];
+        let sim = cosine_similarity(&a, &b);
+        assert!((sim - (-1.0)).abs() < 1e-10, "opposite vectors should have similarity -1.0");
     }
 }

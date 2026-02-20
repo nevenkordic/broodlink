@@ -52,7 +52,8 @@ for migration in \
   008_guardrails \
   009_a2a_gateway \
   010_task_result \
-  011_workflow_orchestration; do
+  011_workflow_orchestration \
+  012_memory_fulltext; do
   echo "  Applying ${migration}..."
   PGPASSWORD=$PGPASSWORD psql \
     -h 127.0.0.1 -U broodlink_agent \

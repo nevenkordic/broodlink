@@ -58,6 +58,9 @@ pub struct Config {
     pub tls: TlsConfig,
     #[serde(default)]
     pub postgres_read_replicas: ReadReplicaConfig,
+    // --- v0.4.0 additions ---
+    #[serde(default)]
+    pub memory_search: MemorySearchConfig,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -450,6 +453,47 @@ pub struct ReadReplicaConfig {
     pub urls: Vec<String>,
 }
 
+// --- v0.4.0: Hybrid memory search ---
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct MemorySearchConfig {
+    #[serde(default = "default_decay_lambda")]
+    pub decay_lambda: f64,
+    #[serde(default = "default_reranker_model")]
+    pub reranker_model: String,
+    #[serde(default = "default_reranker_enabled")]
+    pub reranker_enabled: bool,
+    #[serde(default = "default_max_content_length")]
+    pub max_content_length: usize,
+}
+
+impl Default for MemorySearchConfig {
+    fn default() -> Self {
+        Self {
+            decay_lambda: default_decay_lambda(),
+            reranker_model: default_reranker_model(),
+            reranker_enabled: default_reranker_enabled(),
+            max_content_length: default_max_content_length(),
+        }
+    }
+}
+
+fn default_decay_lambda() -> f64 {
+    0.01
+}
+
+fn default_reranker_model() -> String {
+    "snowflake-arctic-embed2:137m".to_string()
+}
+
+fn default_reranker_enabled() -> bool {
+    true
+}
+
+fn default_max_content_length() -> usize {
+    2000
+}
+
 impl Config {
     /// Load configuration from file path specified by `BROODLINK_CONFIG` env var,
     /// with environment variable overrides.
@@ -661,6 +705,12 @@ api_key_name = "STATUS_API_KEY"
 
         // NATS cluster URLs default
         assert!(cfg.nats.cluster_urls.is_empty());
+
+        // v0.4.0: MemorySearch defaults
+        assert!((cfg.memory_search.decay_lambda - 0.01).abs() < f64::EPSILON);
+        assert_eq!(cfg.memory_search.reranker_model, "snowflake-arctic-embed2:137m");
+        assert!(cfg.memory_search.reranker_enabled);
+        assert_eq!(cfg.memory_search.max_content_length, 2000);
 
         std::env::remove_var("BROODLINK_CONFIG");
     }
