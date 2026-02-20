@@ -272,14 +272,16 @@
     var pSummary  = fetchApi('/api/v1/summary').catch(onError('summary'));
     var pHealth   = fetchApi('/api/v1/health').catch(onError('health'));
     var pActivity = fetchApi('/api/v1/activity').catch(onError('activity'));
+    var pMemory   = fetchApi('/api/v1/memory/stats').catch(onError('memory'));
 
-    Promise.all([pAgents, pTasks, pSummary, pHealth, pActivity])
+    Promise.all([pAgents, pTasks, pSummary, pHealth, pActivity, pMemory])
       .then(function (results) {
         var agents   = results[0];
         var tasks    = results[1];
         var summary  = results[2];
         var health   = results[3];
         var activity = results[4];
+        var memory   = results[5];
 
         // -- Metrics ---
         if (agents !== null) {
@@ -304,7 +306,11 @@
             s = summary.summaries[0];
           }
           setMetric(elMetricDecisions, s.decisions_made != null ? s.decisions_made : (s.decisions_today != null ? s.decisions_today : '—'));
-          setMetric(elMetricMemories, s.memories_stored != null ? s.memories_stored : (s.memory_entries != null ? s.memory_entries : '—'));
+        }
+
+        if (memory !== null) {
+          // API returns {total_count, top_topics, ...}
+          setMetric(elMetricMemories, memory.total_count != null ? memory.total_count : '—');
         }
 
         if (health !== null) {

@@ -29,9 +29,11 @@ bin/
 .DS_Store
 Thumbs.db
 
-# Editor
+# Editor / tools
 .idea/
 .vscode/
+.claude/
+.cursor/
 *.swp
 
 # Node (vendored JS only, no npm)

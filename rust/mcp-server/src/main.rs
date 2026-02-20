@@ -70,7 +70,7 @@ async fn main() {
         .unwrap_or_else(|| {
             let agent = &config.mcp_server.agent_id;
             format!(
-                "{}/.broodlink/jwt-{agent}.pem",
+                "{}/.broodlink/jwt-{agent}.token",
                 std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
             )
         });
@@ -78,8 +78,8 @@ async fn main() {
     let jwt_token = match std::fs::read_to_string(&jwt_path) {
         Ok(t) => t.trim().to_string(),
         Err(e) => {
-            error!(path = %jwt_path, error = %e, "failed to read JWT token");
-            process::exit(1);
+            warn!(path = %jwt_path, error = %e, "failed to read JWT token — bridge calls will fail");
+            String::new()
         }
     };
 

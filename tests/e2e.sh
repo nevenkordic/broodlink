@@ -504,6 +504,38 @@ if echo "$HYBRID" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 
     pass "hybrid_search succeeds"
     METHOD=$(echo "$HYBRID" | python3 -c "import sys,json; d=json.load(sys.stdin)['data']; print(d.get('method','unknown'))" 2>/dev/null || echo "unknown")
     pass "hybrid_search method: $METHOD"
+    # Verify BM25 is actually working (not just falling back to semantic)
+    if echo "$HYBRID" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)['data']
+assert d['method'] in ('hybrid', 'hybrid_reranked'), 'expected hybrid, got ' + d['method']
+" 2>/dev/null; then
+        pass "hybrid_search uses BM25+vector fusion (not fallback)"
+    else
+        fail "hybrid_search fell back to $METHOD — BM25 may not be working"
+    fi
+    # Verify results have non-zero BM25 scores
+    if echo "$HYBRID" | python3 -c "
+import sys, json
+results = json.load(sys.stdin)['data']['results']
+has_bm25 = any(r.get('bm25_score', 0) > 0 for r in results)
+assert has_bm25, 'no results with bm25_score > 0'
+" 2>/dev/null; then
+        pass "hybrid_search: BM25 scores populated"
+    else
+        fail "hybrid_search: all BM25 scores are 0 — search index may be empty"
+    fi
+    # Verify memory_search_index is synced (content present, not empty)
+    if echo "$HYBRID" | python3 -c "
+import sys, json
+results = json.load(sys.stdin)['data']['results']
+has_content = any(len(r.get('content', '')) > 0 for r in results)
+assert has_content, 'no results with content'
+" 2>/dev/null; then
+        pass "hybrid_search: content populated from search index"
+    else
+        fail "hybrid_search: results have empty content — Postgres sync may be broken"
+    fi
 else
     fail "hybrid_search (response: $(echo "$HYBRID" | head -c 200))"
 fi
@@ -524,8 +556,128 @@ else
     fail "hybrid_search: custom weights (response: $(echo "$HYBRID_WEIGHTS" | head -c 200))"
 fi
 
+# Verify store_memory → hybrid_search round-trip (catches missing search index table)
+RT_TS=$(date -u +%s)
+call_tool "store_memory" "{\"topic\":\"e2e-bm25-rt-$RT_TS\",\"content\":\"Unique canary token zxcvb98765 for BM25 round-trip verification\",\"tags\":\"e2e,bm25\"}" > /dev/null 2>&1
+sleep 1
+BM25_RT=$(call_tool "hybrid_search" "{\"query\":\"zxcvb98765 canary token\",\"limit\":3}")
+if echo "$BM25_RT" | python3 -c "
+import sys, json
+results = json.load(sys.stdin)['data']['results']
+found = any('zxcvb98765' in r.get('content', '') for r in results)
+assert found, 'BM25 round-trip: canary not found in search index'
+" 2>/dev/null; then
+    pass "store_memory → hybrid_search BM25 round-trip"
+else
+    fail "store_memory → hybrid_search BM25 round-trip (search index sync broken)"
+fi
+# Verify delete cleans search index
+call_tool "delete_memory" "{\"topic\":\"e2e-bm25-rt-$RT_TS\"}" > /dev/null 2>&1
+sleep 1
+BM25_DEL=$(call_tool "hybrid_search" "{\"query\":\"zxcvb98765 canary token\",\"limit\":3}")
+if echo "$BM25_DEL" | python3 -c "
+import sys, json
+results = json.load(sys.stdin)['data']['results']
+found = any('zxcvb98765' in r.get('content', '') for r in results)
+assert not found, 'deleted memory still in search index'
+" 2>/dev/null; then
+    pass "delete_memory cleans search index"
+else
+    fail "delete_memory did not clean search index"
+fi
+
 # Cleanup test memory
 call_tool "delete_memory" "{\"topic\":\"e2e-embed-$EMBED_TS\"}" > /dev/null 2>&1
+
+echo ""
+
+# -----------------------------------------------
+# 11. Dashboard Metrics (summary API)
+# -----------------------------------------------
+echo "--- 11. Dashboard Metrics ---"
+
+SUMMARY=$(sa_get "summary")
+if echo "$SUMMARY" | python3 -c "
+import sys, json
+raw = json.load(sys.stdin)
+d = raw.get('data', raw)
+s = d.get('summaries', [{}])[0] if d.get('summaries') else d
+assert s.get('decisions_made') is not None or s.get('decisions_today') is not None, 'no decisions field'
+" 2>/dev/null; then
+    pass "summary: decisions_made field present"
+else
+    fail "summary: decisions_made field missing"
+fi
+
+MEMSTATS=$(sa_get "memory/stats")
+if echo "$MEMSTATS" | python3 -c "
+import sys, json
+raw = json.load(sys.stdin)
+d = raw.get('data', raw)
+assert d.get('total_count') is not None, 'no total_count field'
+assert d['total_count'] >= 0, 'total_count is negative'
+" 2>/dev/null; then
+    pass "memory/stats: total_count field present (Memory Entries metric)"
+else
+    fail "memory/stats: total_count field missing"
+fi
+
+echo ""
+
+# -----------------------------------------------
+# 12. All Services Health
+# -----------------------------------------------
+echo "--- 12. All Services Health ---"
+
+# mcp-server
+MCP_HEALTH=$(curl -sf http://localhost:3311/health 2>/dev/null || echo "")
+if echo "$MCP_HEALTH" | grep -q '"status":"ok"' 2>/dev/null; then
+    pass "mcp-server /health returns ok"
+else
+    fail "mcp-server /health (not reachable or unhealthy)"
+fi
+
+# a2a-gateway
+A2A_HEALTH=$(curl -sf http://localhost:3313/health 2>/dev/null || echo "")
+if echo "$A2A_HEALTH" | grep -q '"status":"ok"' 2>/dev/null; then
+    pass "a2a-gateway /health returns ok"
+else
+    fail "a2a-gateway /health (not reachable or unhealthy)"
+fi
+
+# a2a-gateway AgentCard
+A2A_CARD=$(curl -sf http://localhost:3313/.well-known/agent.json 2>/dev/null || echo "")
+if echo "$A2A_CARD" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d.get('name')" 2>/dev/null; then
+    pass "a2a-gateway AgentCard returns valid data"
+else
+    fail "a2a-gateway AgentCard missing or invalid"
+fi
+
+# Hugo dashboard
+HUGO_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" http://localhost:1313/ 2>/dev/null || echo "000")
+if [ "$HUGO_STATUS" = "200" ]; then
+    pass "Hugo dashboard (port 1313) is up"
+else
+    fail "Hugo dashboard not reachable (HTTP $HUGO_STATUS)"
+fi
+
+echo ""
+
+# -----------------------------------------------
+# 13. Dashboard Page Completeness
+# -----------------------------------------------
+echo "--- 13. Dashboard Page Completeness ---"
+
+for page in "" "agents/" "decisions/" "memory/" "commits/" "audit/" "beads/" "approvals/" "guardrails/" "delegations/" "a2a/"; do
+    PAGE_NAME="${page:-index}"
+    PAGE_NAME="${PAGE_NAME%/}"
+    HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" "http://localhost:1313/${page}" 2>/dev/null || echo "000")
+    if [ "$HTTP_CODE" = "200" ]; then
+        pass "dashboard page /${PAGE_NAME} loads (200)"
+    else
+        fail "dashboard page /${PAGE_NAME} returned HTTP ${HTTP_CODE}"
+    fi
+done
 
 echo ""
 

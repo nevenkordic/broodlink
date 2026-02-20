@@ -50,6 +50,30 @@ if [[ -f "$BROOD_DIR/.secrets/env" ]]; then
   set +a
 fi
 
+# Auto-generate JWTs for service agents if missing
+BROODLINK_DIR="${HOME}/.broodlink"
+PRIVATE_KEY="${BROODLINK_DIR}/jwt-private.pem"
+
+if [[ -f "$PRIVATE_KEY" ]]; then
+  b64url() { openssl base64 -e -A | tr '/+' '_-' | tr -d '='; }
+
+  for svc_agent in mcp-server a2a-gateway; do
+    TOKEN_FILE="${BROODLINK_DIR}/jwt-${svc_agent}.token"
+    if [[ ! -f "$TOKEN_FILE" ]]; then
+      NOW=$(date +%s)
+      EXP=$((NOW + 31536000))
+      HDR=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
+      PLD=$(printf '{"sub":"%s","agent_id":"%s","iat":%d,"exp":%d}' \
+        "$svc_agent" "$svc_agent" "$NOW" "$EXP" | b64url)
+      SIG=$(printf '%s.%s' "$HDR" "$PLD" \
+        | openssl dgst -sha256 -sign "$PRIVATE_KEY" -binary | b64url)
+      echo "${HDR}.${PLD}.${SIG}" > "$TOKEN_FILE"
+      chmod 600 "$TOKEN_FILE"
+      echo "  Generated JWT for ${svc_agent} at ${TOKEN_FILE}"
+    fi
+  done
+fi
+
 echo "Starting Broodlink services..."
 for svc in "${SERVICES[@]}"; do
   BROODLINK_CONFIG="$CONFIG_PATH" \
