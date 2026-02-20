@@ -1,6 +1,13 @@
 {{ define "main" }}
 <h2>Memory Store</h2>
 <p class="page-desc">Shared knowledge base across all agents. Memories persist between sessions and are searchable by vector similarity.</p>
+<section aria-labelledby="memory-overview-heading">
+  <h3 id="memory-overview-heading">Overview</h3>
+  <div class="card-grid" aria-live="polite">
+    <div class="card"><div class="card-value" id="memory-total">&mdash;</div><div class="card-label">Total Entries</div></div>
+    <div class="card"><div class="card-value" id="memory-updated">&mdash;</div><div class="card-label">Last Updated</div></div>
+  </div>
+</section>
 <section aria-labelledby="memory-stats-heading">
   <h3 id="memory-stats-heading">Statistics</h3>
   <div class="card-grid" id="memory-stats" aria-live="polite">
@@ -9,7 +16,7 @@
 </section>
 <section aria-labelledby="memory-topics-heading">
   <h3 id="memory-topics-heading">Top Topics</h3>
-  <div id="topics-chart" role="img" aria-label="Topic distribution chart">
+  <div id="memory-topics" role="img" aria-label="Topic distribution chart">
     <!-- Populated by JS -->
   </div>
 </section>

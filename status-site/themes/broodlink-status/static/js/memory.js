@@ -109,9 +109,9 @@
     }
 
     // Normalise to { label, value } pairs.
-    // If entries have a count field use it; otherwise use content length as a proxy.
+    // Prefer content_length from API; fall back to content string length.
     var data = topics.map(function (t) {
-      var v = t.count || t.value || (t.content ? t.content.length : 1);
+      var v = t.content_length || t.count || t.value || (t.content ? t.content.length : 1);
       return {
         label: t.topic || t.name || t.label || 'unknown',
         value: v
@@ -121,9 +121,10 @@
     var Charts = window.BroodlinkCharts;
     if (Charts && Charts.renderBarChart) {
       Charts.renderBarChart(container, data, {
-        title: 'Top Topics',
+        title: 'Top Topics by Size',
         barColor: 'var(--blue)',
-        maxBars: 15
+        maxBars: 15,
+        unit: 'chars'
       });
     } else {
       // Fallback: simple list if charts.js has not loaded

@@ -2,8 +2,9 @@
 <h2>Decision Log</h2>
 <p class="page-desc">Logged decisions with reasoning — an audit trail of what each agent decided and why.</p>
 <div class="filter-bar">
-  <label for="decision-search" class="visually-hidden">Search decisions</label>
-  <input type="search" id="decision-search" placeholder="Filter decisions…" aria-controls="decisions-list">
+  <label for="decisions-search" class="visually-hidden">Search decisions</label>
+  <input type="search" id="decisions-search" placeholder="Filter decisions…" aria-controls="decisions-list">
+  <span id="decisions-count" style="font-size:0.875rem;color:var(--text-secondary);margin-left:0.5rem;" aria-live="polite"></span>
 </div>
 <div class="card-grid" id="decisions-list" aria-live="polite">
   <!-- Populated by JS -->

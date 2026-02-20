@@ -224,7 +224,7 @@
           '<td class="mono">' + escapeHtml(String(t.id || '—')) + '</td>' +
           '<td>' + escapeHtml(t.title || t.task_type || t.type || '—') + streamBar + '</td>' +
           '<td>' + statusDot(t.status) + ' ' + escapeHtml(t.status || '—') + '</td>' +
-          '<td>' + escapeHtml(t.agent_id || t.agent_name || '—') + '</td>' +
+          '<td>' + escapeHtml(t.assigned_agent || t.agent_id || t.agent_name || '—') + '</td>' +
           '<td class="mono">' + escapeHtml(formatRelativeTime(t.created_at)) + '</td>' +
         '</tr>';
     }
@@ -292,10 +292,11 @@
 
         if (tasks !== null) {
           var taskList = Array.isArray(tasks) ? tasks : (tasks.recent || tasks.tasks || []);
-          var pending = taskList.filter(function (t) {
-            return t.status === 'pending' || t.status === 'queued';
-          });
-          setMetric(elMetricTasks, pending.length);
+          // Use server-provided count when available (recent list may not include all pending)
+          var pendingCount = (tasks.counts_by_status && tasks.counts_by_status.pending != null)
+            ? tasks.counts_by_status.pending
+            : taskList.filter(function (t) { return t.status === 'pending' || t.status === 'queued'; }).length;
+          setMetric(elMetricTasks, pendingCount);
           renderTasks(taskList);
         }
 
