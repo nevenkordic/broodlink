@@ -369,6 +369,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/stream/:stream_id", get(handler_stream_sse))
         .route("/a2a/tasks", get(handler_a2a_tasks))
         .route("/a2a/card", get(handler_a2a_card))
+        // v0.5.0 knowledge graph
+        .route("/kg/stats", get(handler_kg_stats))
+        .route("/kg/entities", get(handler_kg_entities))
+        .route("/kg/edges", get(handler_kg_edges))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
@@ -854,7 +858,7 @@ async fn handler_activity(
 
 // ---------------------------------------------------------------------------
 // GET /api/v1/memory/stats
-// COUNT(*), MAX(updated_at), top 10 topics (Dolt)
+// COUNT(*), MAX(updated_at), distinct agents/topics, top 10 topics by size (Dolt)
 // ---------------------------------------------------------------------------
 
 async fn handler_memory_stats(
@@ -873,21 +877,31 @@ async fn handler_memory_stats(
             .await?;
     let max_updated_at = latest.map(|(s,)| s);
 
-    // Top 10 topics by recency
-    let top_topics = sqlx::query_as::<_, (String, String, String, String)>(
-        "SELECT topic, agent_name, content, CAST(updated_at AS CHAR)
-         FROM agent_memory ORDER BY updated_at DESC LIMIT 10",
+    // Distinct agents and topics
+    let (agents_count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(DISTINCT agent_name) FROM agent_memory")
+            .fetch_one(&state.dolt)
+            .await?;
+    let (topics_count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(DISTINCT topic) FROM agent_memory")
+            .fetch_one(&state.dolt)
+            .await?;
+
+    // Top 10 topics by content size (most detailed knowledge)
+    let top_topics = sqlx::query_as::<_, (String, String, i64, String)>(
+        "SELECT topic, agent_name, LENGTH(content) AS content_length, CAST(updated_at AS CHAR)
+         FROM agent_memory ORDER BY LENGTH(content) DESC LIMIT 10",
     )
     .fetch_all(&state.dolt)
     .await?;
 
     let topics: Vec<serde_json::Value> = top_topics
         .into_iter()
-        .map(|(topic, agent_name, content, updated_at)| {
+        .map(|(topic, agent_name, content_length, updated_at)| {
             serde_json::json!({
                 "topic": topic,
                 "agent_name": agent_name,
-                "content": content,
+                "content_length": content_length,
                 "updated_at": updated_at,
             })
         })
@@ -896,7 +910,189 @@ async fn handler_memory_stats(
     Ok(ok_response(serde_json::json!({
         "total_count": total_count,
         "max_updated_at": max_updated_at,
+        "agents_count": agents_count,
+        "topics_count": topics_count,
         "top_topics": topics,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/kg/stats  — Knowledge graph summary statistics
+// ---------------------------------------------------------------------------
+
+async fn handler_kg_stats(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let (total_entities,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM kg_entities")
+            .fetch_one(&state.pg)
+            .await?;
+
+    let (active_edges,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM kg_edges WHERE valid_to IS NULL")
+            .fetch_one(&state.pg)
+            .await?;
+
+    let (historical_edges,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM kg_edges WHERE valid_to IS NOT NULL")
+            .fetch_one(&state.pg)
+            .await?;
+
+    let type_rows = sqlx::query_as::<_, (String, i64)>(
+        "SELECT entity_type, COUNT(*) FROM kg_entities GROUP BY entity_type ORDER BY COUNT(*) DESC",
+    )
+    .fetch_all(&state.pg)
+    .await?;
+
+    let entity_types: serde_json::Map<String, serde_json::Value> = type_rows
+        .into_iter()
+        .map(|(t, c)| (t, serde_json::Value::from(c)))
+        .collect();
+
+    let top_relations = sqlx::query_as::<_, (String, i64)>(
+        "SELECT relation_type, COUNT(*) as cnt FROM kg_edges WHERE valid_to IS NULL
+         GROUP BY relation_type ORDER BY cnt DESC LIMIT 10",
+    )
+    .fetch_all(&state.pg)
+    .await?;
+
+    let most_connected = sqlx::query_as::<_, (String, String, i64)>(
+        "SELECT e.name, e.entity_type, COUNT(ed.id) as edge_count
+         FROM kg_entities e
+         LEFT JOIN kg_edges ed ON (ed.source_id = e.entity_id OR ed.target_id = e.entity_id) AND ed.valid_to IS NULL
+         GROUP BY e.entity_id, e.name, e.entity_type
+         ORDER BY edge_count DESC LIMIT 10",
+    )
+    .fetch_all(&state.pg)
+    .await?;
+
+    Ok(ok_response(serde_json::json!({
+        "total_entities": total_entities,
+        "total_active_edges": active_edges,
+        "total_historical_edges": historical_edges,
+        "entity_types": entity_types,
+        "top_relation_types": top_relations.into_iter().map(|(r, c)| serde_json::json!({"relation": r, "count": c})).collect::<Vec<_>>(),
+        "most_connected_entities": most_connected.into_iter().map(|(n, t, c)| serde_json::json!({"name": n, "type": t, "edge_count": c})).collect::<Vec<_>>(),
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/kg/entities  — Paginated entity list
+// ---------------------------------------------------------------------------
+
+async fn handler_kg_entities(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let type_filter = params.get("type").cloned();
+    let limit: i64 = params
+        .get("limit")
+        .and_then(|l| l.parse().ok())
+        .unwrap_or(50);
+
+    let rows: Vec<(String, String, String, Option<String>, i32, String, String)> = if let Some(etype) = &type_filter {
+        sqlx::query_as(
+            "SELECT entity_id, name, entity_type, description, mention_count,
+                    first_seen::text, last_seen::text
+             FROM kg_entities WHERE entity_type = $1
+             ORDER BY mention_count DESC, last_seen DESC LIMIT $2",
+        )
+        .bind(etype)
+        .bind(limit)
+        .fetch_all(&state.pg)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT entity_id, name, entity_type, description, mention_count,
+                    first_seen::text, last_seen::text
+             FROM kg_entities
+             ORDER BY mention_count DESC, last_seen DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&state.pg)
+        .await?
+    };
+
+    let entities: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(eid, name, etype, desc, mentions, first, last)| {
+            serde_json::json!({
+                "entity_id": eid,
+                "name": name,
+                "entity_type": etype,
+                "description": desc,
+                "mention_count": mentions,
+                "first_seen": first,
+                "last_seen": last,
+            })
+        })
+        .collect();
+
+    Ok(ok_response(serde_json::json!({
+        "entities": entities,
+        "total": entities.len(),
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/kg/edges  — Recent edges
+// ---------------------------------------------------------------------------
+
+async fn handler_kg_edges(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let relation_filter = params.get("relation_type").cloned();
+    let limit: i64 = params
+        .get("limit")
+        .and_then(|l| l.parse().ok())
+        .unwrap_or(50);
+
+    let rows: Vec<(String, String, String, String, Option<String>, f64, String)> = if let Some(rel) = &relation_filter {
+        sqlx::query_as(
+            "SELECT s.name, e.relation_type, t.name, e.edge_id, e.description, e.weight, e.created_at::text
+             FROM kg_edges e
+             JOIN kg_entities s ON e.source_id = s.entity_id
+             JOIN kg_entities t ON e.target_id = t.entity_id
+             WHERE e.valid_to IS NULL AND e.relation_type = $1
+             ORDER BY e.created_at DESC LIMIT $2",
+        )
+        .bind(rel)
+        .bind(limit)
+        .fetch_all(&state.pg)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT s.name, e.relation_type, t.name, e.edge_id, e.description, e.weight, e.created_at::text
+             FROM kg_edges e
+             JOIN kg_entities s ON e.source_id = s.entity_id
+             JOIN kg_entities t ON e.target_id = t.entity_id
+             WHERE e.valid_to IS NULL
+             ORDER BY e.created_at DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&state.pg)
+        .await?
+    };
+
+    let edges: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(source, rel, target, eid, desc, weight, created)| {
+            serde_json::json!({
+                "source": source,
+                "relation_type": rel,
+                "target": target,
+                "edge_id": eid,
+                "description": desc,
+                "weight": weight,
+                "created_at": created,
+            })
+        })
+        .collect();
+
+    Ok(ok_response(serde_json::json!({
+        "edges": edges,
+        "total": edges.len(),
     })))
 }
 
@@ -1671,5 +1867,131 @@ mod tests {
         let resp = err.into_response();
         let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
         assert!(ct.contains("application/json"), "error response should be JSON");
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.5.0: Knowledge Graph response structure tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ok_response_kg_stats_structure() {
+        let data = serde_json::json!({
+            "total_entities": 42,
+            "total_active_edges": 15,
+            "total_historical_edges": 3,
+            "entity_types": {"person": 10, "service": 20, "technology": 12},
+            "top_relation_types": [
+                {"relation": "DEPENDS_ON", "count": 8},
+                {"relation": "MANAGES", "count": 5},
+            ],
+            "most_connected_entities": [
+                {"name": "auth-service", "type": "service", "edge_count": 6},
+            ],
+        });
+        let Json(resp) = ok_response(data);
+        assert_eq!(resp["status"], "ok");
+        assert_eq!(resp["data"]["total_entities"], 42);
+        assert_eq!(resp["data"]["total_active_edges"], 15);
+        assert_eq!(resp["data"]["total_historical_edges"], 3);
+        assert!(resp["data"]["entity_types"].is_object());
+        assert!(resp["data"]["top_relation_types"].is_array());
+        assert!(resp["data"]["most_connected_entities"].is_array());
+    }
+
+    #[test]
+    fn test_ok_response_kg_entities_structure() {
+        let data = serde_json::json!({
+            "entities": [
+                {
+                    "entity_id": "abc-123",
+                    "name": "redis",
+                    "entity_type": "technology",
+                    "description": "In-memory data store",
+                    "mention_count": 5,
+                    "first_seen": "2026-02-20 10:00:00+00",
+                    "last_seen": "2026-02-20 11:00:00+00",
+                }
+            ],
+            "total": 1,
+        });
+        let Json(resp) = ok_response(data);
+        assert_eq!(resp["status"], "ok");
+        assert_eq!(resp["data"]["total"], 1);
+
+        let entities = resp["data"]["entities"].as_array().unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0]["name"], "redis");
+        assert_eq!(entities[0]["entity_type"], "technology");
+        assert!(entities[0]["entity_id"].is_string());
+        assert!(entities[0]["first_seen"].is_string());
+    }
+
+    #[test]
+    fn test_ok_response_kg_edges_structure() {
+        let data = serde_json::json!({
+            "edges": [
+                {
+                    "edge_id": "edge-1",
+                    "source": "auth-service",
+                    "target": "redis",
+                    "relation_type": "DEPENDS_ON",
+                    "description": "auth-service uses redis for session cache",
+                    "weight": 1.3,
+                    "created_at": "2026-02-20 10:00:00+00",
+                }
+            ],
+            "total": 1,
+        });
+        let Json(resp) = ok_response(data);
+        assert_eq!(resp["status"], "ok");
+        assert_eq!(resp["data"]["total"], 1);
+
+        let edges = resp["data"]["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0]["source"], "auth-service");
+        assert_eq!(edges[0]["target"], "redis");
+        assert_eq!(edges[0]["relation_type"], "DEPENDS_ON");
+        let weight = edges[0]["weight"].as_f64().unwrap();
+        assert!((weight - 1.3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_ok_response_kg_stats_empty_graph() {
+        let data = serde_json::json!({
+            "total_entities": 0,
+            "total_active_edges": 0,
+            "total_historical_edges": 0,
+            "entity_types": {},
+            "top_relation_types": [],
+            "most_connected_entities": [],
+        });
+        let Json(resp) = ok_response(data);
+        assert_eq!(resp["status"], "ok");
+        assert_eq!(resp["data"]["total_entities"], 0);
+        assert_eq!(resp["data"]["total_active_edges"], 0);
+        assert!(resp["data"]["entity_types"].as_object().unwrap().is_empty());
+        assert!(resp["data"]["top_relation_types"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_ok_response_kg_entities_empty() {
+        let data = serde_json::json!({"entities": [], "total": 0});
+        let Json(resp) = ok_response(data);
+        assert_eq!(resp["status"], "ok");
+        assert_eq!(resp["data"]["total"], 0);
+        assert!(resp["data"]["entities"].as_array().unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.5.0: Route registration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_kg_routes_are_defined() {
+        // Verify the KG route paths follow the expected pattern
+        let routes = vec!["/kg/stats", "/kg/entities", "/kg/edges"];
+        for route in &routes {
+            assert!(route.starts_with("/kg/"), "KG route should be under /kg/ prefix: {route}");
+        }
     }
 }

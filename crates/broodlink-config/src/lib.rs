@@ -465,6 +465,17 @@ pub struct MemorySearchConfig {
     pub reranker_enabled: bool,
     #[serde(default = "default_max_content_length")]
     pub max_content_length: usize,
+    // v0.5.0: Knowledge graph
+    #[serde(default = "default_kg_enabled")]
+    pub kg_enabled: bool,
+    #[serde(default = "default_kg_extraction_model")]
+    pub kg_extraction_model: String,
+    #[serde(default = "default_kg_entity_similarity_threshold")]
+    pub kg_entity_similarity_threshold: f64,
+    #[serde(default = "default_kg_max_hops")]
+    pub kg_max_hops: u32,
+    #[serde(default = "default_kg_extraction_timeout_seconds")]
+    pub kg_extraction_timeout_seconds: u64,
 }
 
 impl Default for MemorySearchConfig {
@@ -474,6 +485,11 @@ impl Default for MemorySearchConfig {
             reranker_model: default_reranker_model(),
             reranker_enabled: default_reranker_enabled(),
             max_content_length: default_max_content_length(),
+            kg_enabled: default_kg_enabled(),
+            kg_extraction_model: default_kg_extraction_model(),
+            kg_entity_similarity_threshold: default_kg_entity_similarity_threshold(),
+            kg_max_hops: default_kg_max_hops(),
+            kg_extraction_timeout_seconds: default_kg_extraction_timeout_seconds(),
         }
     }
 }
@@ -492,6 +508,26 @@ fn default_reranker_enabled() -> bool {
 
 fn default_max_content_length() -> usize {
     2000
+}
+
+fn default_kg_enabled() -> bool {
+    true
+}
+
+fn default_kg_extraction_model() -> String {
+    "qwen3:1.7b".to_string()
+}
+
+fn default_kg_entity_similarity_threshold() -> f64 {
+    0.85
+}
+
+fn default_kg_max_hops() -> u32 {
+    3
+}
+
+fn default_kg_extraction_timeout_seconds() -> u64 {
+    120
 }
 
 impl Config {
@@ -711,6 +747,13 @@ api_key_name = "STATUS_API_KEY"
         assert_eq!(cfg.memory_search.reranker_model, "snowflake-arctic-embed2:137m");
         assert!(cfg.memory_search.reranker_enabled);
         assert_eq!(cfg.memory_search.max_content_length, 2000);
+
+        // v0.5.0: Knowledge graph defaults
+        assert!(cfg.memory_search.kg_enabled);
+        assert_eq!(cfg.memory_search.kg_extraction_model, "qwen3:1.7b");
+        assert!((cfg.memory_search.kg_entity_similarity_threshold - 0.85).abs() < f64::EPSILON);
+        assert_eq!(cfg.memory_search.kg_max_hops, 3);
+        assert_eq!(cfg.memory_search.kg_extraction_timeout_seconds, 120);
 
         std::env::remove_var("BROODLINK_CONFIG");
     }

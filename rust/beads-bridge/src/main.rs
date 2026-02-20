@@ -575,6 +575,28 @@ static TOOL_REGISTRY: std::sync::LazyLock<Vec<serde_json::Value>> =
                 "rerank": p_bool("Enable reranking via dedicated model (default false)"),
             }), &["query"]),
 
+            // --- Knowledge Graph (Postgres) ---
+            tool_def("graph_search", "Search for entities and their direct relationships in the knowledge graph.", serde_json::json!({
+                "query": p_str("Entity name or search term"),
+                "entity_type": p_str("Optional filter: person, service, concept, location, technology, organization, event, other"),
+                "include_edges": p_bool("Include direct relationships in results (default true)"),
+                "limit": p_int("Max entities returned (default 10)"),
+            }), &["query"]),
+            tool_def("graph_traverse", "Multi-hop graph traversal starting from an entity. Follows chains of relationships.", serde_json::json!({
+                "start_entity": p_str("Entity name to start traversal from"),
+                "max_hops": p_int("Maximum traversal depth (default 3, capped by config)"),
+                "relation_types": p_str("Optional comma-separated filter, e.g. 'DEPENDS_ON,RUNS_ON'"),
+                "direction": p_str("'outgoing', 'incoming', or 'both' (default 'both')"),
+            }), &["start_entity"]),
+            tool_def("graph_update_edge", "Manage temporal validity of relationships. Invalidate outdated edges or update descriptions.", serde_json::json!({
+                "source_entity": p_str("Source entity name"),
+                "target_entity": p_str("Target entity name"),
+                "relation_type": p_str("Relationship type (UPPER_SNAKE_CASE)"),
+                "action": p_str("'invalidate' (set valid_to=NOW) or 'update_description'"),
+                "description": p_str("New description (required for update_description action)"),
+            }), &["source_entity", "target_entity", "relation_type", "action"]),
+            tool_def("graph_stats", "Overview of the knowledge graph state: entity counts, edge counts, type distribution, most connected entities.", serde_json::json!({}), &[]),
+
             // --- Work ---
             tool_def("log_work", "Log a work entry. Actions: created, modified, fixed, deployed, conversation.", serde_json::json!({
                 "action": p_str("Action type, e.g. 'fixed', 'deployed', 'conversation'"),
@@ -1021,6 +1043,12 @@ async fn tool_dispatch(
         "semantic_search" => tool_semantic_search(&state, agent_id, params).await,
         "hybrid_search" => tool_hybrid_search(&state, agent_id, params).await,
 
+        // --- Knowledge Graph (Postgres) ---
+        "graph_search" => tool_graph_search(&state, agent_id, params).await,
+        "graph_traverse" => tool_graph_traverse(&state, agent_id, params).await,
+        "graph_update_edge" => tool_graph_update_edge(&state, agent_id, params).await,
+        "graph_stats" => tool_graph_stats(&state, agent_id, params).await,
+
         // --- Work (Postgres) ---
         "log_work" => tool_log_work(&state, agent_id, params).await,
         "get_work_log" => tool_get_work_log(&state, agent_id, params).await,
@@ -1345,11 +1373,13 @@ async fn tool_store_memory(
     .map(|r| r.0)
     .unwrap_or(0);
 
-    // Outbox write for embedding pipeline
+    // Outbox write for embedding pipeline (includes memory_id + tags for KG extraction)
     let outbox_payload = serde_json::json!({
         "topic": topic,
         "content": content,
         "agent_name": agent_id,
+        "memory_id": memory_id.to_string(),
+        "tags": tags_str.unwrap_or(""),
     });
     write_outbox(&state.pg, "embed", &outbox_payload).await?;
 
@@ -2029,6 +2059,493 @@ async fn tool_hybrid_search(
         "query": query,
         "total": total,
         "method": method,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Knowledge Graph tools (Postgres: kg_entities, kg_edges)
+// ---------------------------------------------------------------------------
+
+/// Search Qdrant broodlink_kg_entities collection for entity name similarity.
+async fn search_kg_entities_qdrant(
+    state: &AppState,
+    query_embedding: &[f64],
+    limit: i64,
+) -> Result<Vec<(String, String, String, f64)>, BroodlinkError> {
+    state.qdrant_breaker.check().map_err(BroodlinkError::CircuitOpen)?;
+
+    let qdrant_url = format!(
+        "{}/collections/broodlink_kg_entities/points/search",
+        state.config.qdrant.url,
+    );
+    let qdrant_body = serde_json::json!({
+        "vector": { "name": "default", "vector": query_embedding },
+        "limit": limit,
+        "with_payload": true,
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&qdrant_url)
+        .json(&qdrant_body)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| {
+            state.qdrant_breaker.record_failure();
+            BroodlinkError::Internal(format!("qdrant kg request failed: {e}"))
+        })?;
+
+    if !resp.status().is_success() {
+        state.qdrant_breaker.record_failure();
+        return Err(BroodlinkError::Internal(format!(
+            "qdrant kg returned status {}",
+            resp.status()
+        )));
+    }
+    state.qdrant_breaker.record_success();
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| BroodlinkError::Internal(format!("qdrant kg parse: {e}")))?;
+
+    let mut results = Vec::new();
+    if let Some(points) = json.get("result").and_then(|r| r.as_array()) {
+        for point in points {
+            let score = point.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
+            let payload = point.get("payload").cloned().unwrap_or(serde_json::json!({}));
+            let entity_id = payload.get("entity_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let entity_type = payload.get("entity_type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if !entity_id.is_empty() {
+                results.push((entity_id, name, entity_type, score));
+            }
+        }
+    }
+    Ok(results)
+}
+
+async fn tool_graph_search(
+    state: &AppState,
+    _agent_id: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let query = param_str(params, "query")?;
+    let entity_type = param_str_opt(params, "entity_type");
+    let include_edges = param_bool_opt(params, "include_edges").unwrap_or(true);
+    let limit = param_i64_opt(params, "limit").unwrap_or(10);
+
+    // 1. Text search via ILIKE
+    let text_rows: Vec<(String, String, String, Option<String>, serde_json::Value, i32, String, String)> =
+        if let Some(etype) = entity_type {
+            sqlx::query_as(
+                "SELECT entity_id, name, entity_type, description, properties, mention_count,
+                        first_seen::text, last_seen::text
+                 FROM kg_entities
+                 WHERE lower(name) LIKE '%' || lower($1) || '%' AND entity_type = $2
+                 ORDER BY mention_count DESC LIMIT $3",
+            )
+            .bind(query)
+            .bind(etype)
+            .bind(limit)
+            .fetch_all(&state.pg)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT entity_id, name, entity_type, description, properties, mention_count,
+                        first_seen::text, last_seen::text
+                 FROM kg_entities
+                 WHERE lower(name) LIKE '%' || lower($1) || '%'
+                 ORDER BY mention_count DESC LIMIT $2",
+            )
+            .bind(query)
+            .bind(limit)
+            .fetch_all(&state.pg)
+            .await?
+        };
+
+    // 2. Also search by embedding similarity (best-effort)
+    let mut seen_ids: std::collections::HashSet<String> = text_rows.iter().map(|r| r.0.clone()).collect();
+
+    let mut entities: Vec<serde_json::Value> = text_rows
+        .iter()
+        .map(|(eid, name, etype, desc, props, mentions, first, last)| {
+            serde_json::json!({
+                "entity_id": eid,
+                "name": name,
+                "entity_type": etype,
+                "description": desc,
+                "properties": props,
+                "mention_count": mentions,
+                "first_seen": first,
+                "last_seen": last,
+            })
+        })
+        .collect();
+
+    // Embedding similarity search (non-fatal if circuit open)
+    if (entities.len() as i64) < limit {
+        if let Ok(emb) = get_ollama_embedding(state, query).await {
+            if let Ok(qdrant_results) = search_kg_entities_qdrant(state, &emb, limit).await {
+                for (eid, _name, _etype, _score) in qdrant_results {
+                    if seen_ids.contains(&eid) {
+                        continue;
+                    }
+                    seen_ids.insert(eid.clone());
+                    // Fetch full entity from Postgres
+                    let row: Option<(String, String, String, Option<String>, serde_json::Value, i32, String, String)> =
+                        sqlx::query_as(
+                            "SELECT entity_id, name, entity_type, description, properties, mention_count,
+                                    first_seen::text, last_seen::text
+                             FROM kg_entities WHERE entity_id = $1",
+                        )
+                        .bind(&eid)
+                        .fetch_optional(&state.pg)
+                        .await?;
+                    if let Some((eid2, name, etype, desc, props, mentions, first, last)) = row {
+                        if entity_type.is_none() || entity_type == Some(&etype) {
+                            entities.push(serde_json::json!({
+                                "entity_id": eid2,
+                                "name": name,
+                                "entity_type": etype,
+                                "description": desc,
+                                "properties": props,
+                                "mention_count": mentions,
+                                "first_seen": first,
+                                "last_seen": last,
+                            }));
+                        }
+                    }
+                    if entities.len() as i64 >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Optionally fetch edges for each entity
+    if include_edges {
+        for entity in entities.iter_mut() {
+            let eid = entity["entity_id"].as_str().unwrap_or("");
+            let edge_rows: Vec<(String, String, Option<String>, f64, String, String, String, String, String)> =
+                sqlx::query_as(
+                    "SELECT e.edge_id, e.relation_type, e.description, e.weight, e.valid_from::text,
+                            CASE WHEN e.source_id = $1 THEN 'outgoing' ELSE 'incoming' END,
+                            CASE WHEN e.source_id = $1 THEN t.name ELSE s.name END,
+                            CASE WHEN e.source_id = $1 THEN t.entity_type ELSE s.entity_type END,
+                            CASE WHEN e.source_id = $1 THEN t.entity_id ELSE s.entity_id END
+                     FROM kg_edges e
+                     JOIN kg_entities s ON e.source_id = s.entity_id
+                     JOIN kg_entities t ON e.target_id = t.entity_id
+                     WHERE (e.source_id = $1 OR e.target_id = $1) AND e.valid_to IS NULL",
+                )
+                .bind(eid)
+                .fetch_all(&state.pg)
+                .await?;
+
+            let edges: Vec<serde_json::Value> = edge_rows
+                .iter()
+                .map(|(edge_id, rel, desc, weight, valid_from, direction, related_name, related_type, _related_id)| {
+                    serde_json::json!({
+                        "edge_id": edge_id,
+                        "direction": direction,
+                        "relation_type": rel,
+                        "related_entity": related_name,
+                        "related_entity_type": related_type,
+                        "description": desc,
+                        "weight": weight,
+                        "valid_from": valid_from,
+                    })
+                })
+                .collect();
+            entity["edges"] = serde_json::json!(edges);
+        }
+    }
+
+    let total = entities.len();
+    Ok(serde_json::json!({
+        "entities": entities,
+        "query": query,
+        "total": total,
+    }))
+}
+
+async fn tool_graph_traverse(
+    state: &AppState,
+    _agent_id: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let start_entity = param_str(params, "start_entity")?;
+    let config_max = state.config.memory_search.kg_max_hops as i64;
+    let max_hops = param_i64_opt(params, "max_hops").unwrap_or(config_max).min(config_max);
+    let relation_types_str = param_str_opt(params, "relation_types");
+    let direction = param_str_opt(params, "direction").unwrap_or("both");
+
+    // Build the direction filter for the recursive CTE
+    let direction_join = match direction {
+        "outgoing" => "edge.source_id = t.entity_id",
+        "incoming" => "edge.target_id = t.entity_id",
+        _ => "(edge.source_id = t.entity_id OR edge.target_id = t.entity_id)",
+    };
+
+    let next_entity_expr = match direction {
+        "outgoing" => "edge.target_id",
+        "incoming" => "edge.source_id",
+        _ => "CASE WHEN edge.source_id = t.entity_id THEN edge.target_id ELSE edge.source_id END",
+    };
+
+    let direction_label = match direction {
+        "outgoing" => "'outgoing'",
+        "incoming" => "'incoming'",
+        _ => "CASE WHEN edge.source_id = t.entity_id THEN 'outgoing' ELSE 'incoming' END",
+    };
+
+    // Build optional relation_type filter
+    let relation_filter = if let Some(rt_str) = relation_types_str {
+        let types: Vec<&str> = rt_str.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        if types.is_empty() {
+            String::new()
+        } else {
+            let quoted: Vec<String> = types.iter().map(|t| format!("'{}'", t.replace('\'', "''"))).collect();
+            format!(" AND edge.relation_type IN ({})", quoted.join(", "))
+        }
+    } else {
+        String::new()
+    };
+
+    let sql = format!(
+        "WITH RECURSIVE traversal AS (
+            SELECT
+                e.entity_id, e.name, e.entity_type,
+                NULL::varchar AS from_entity,
+                NULL::varchar AS relation_type,
+                NULL::varchar AS edge_direction,
+                0 AS depth,
+                ARRAY[e.entity_id]::varchar[] AS path
+            FROM kg_entities e
+            WHERE lower(e.name) = lower($1)
+
+            UNION ALL
+
+            SELECT
+                next_e.entity_id, next_e.name, next_e.entity_type,
+                t.name AS from_entity,
+                edge.relation_type,
+                {direction_label}::varchar,
+                t.depth + 1,
+                t.path || next_e.entity_id
+            FROM traversal t
+            JOIN kg_edges edge ON (
+                {direction_join}
+                AND edge.valid_to IS NULL
+                {relation_filter}
+            )
+            JOIN kg_entities next_e ON (
+                next_e.entity_id = {next_entity_expr}
+            )
+            WHERE t.depth < $2
+            AND NOT next_e.entity_id = ANY(t.path)
+        )
+        SELECT entity_id, name, entity_type, from_entity, relation_type, edge_direction, depth
+        FROM traversal ORDER BY depth, name"
+    );
+
+    let rows: Vec<(String, String, String, Option<String>, Option<String>, Option<String>, i32)> =
+        sqlx::query_as(&sql)
+            .bind(start_entity)
+            .bind(max_hops)
+            .fetch_all(&state.pg)
+            .await?;
+
+    let nodes: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(eid, name, etype, from_ent, rel_type, _dir, depth)| {
+            let mut node = serde_json::json!({
+                "entity_id": eid,
+                "name": name,
+                "type": etype,
+                "depth": depth,
+            });
+            if let Some(from) = from_ent {
+                node["from"] = serde_json::json!(from);
+            }
+            if let Some(rel) = rel_type {
+                node["via_relation"] = serde_json::json!(rel);
+            }
+            node
+        })
+        .collect();
+
+    let max_depth = rows.iter().map(|r| r.6).max().unwrap_or(0);
+
+    Ok(serde_json::json!({
+        "start": start_entity,
+        "nodes": nodes,
+        "total_nodes": nodes.len(),
+        "max_depth_reached": max_depth,
+    }))
+}
+
+async fn tool_graph_update_edge(
+    state: &AppState,
+    agent_id: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let source_entity = param_str(params, "source_entity")?;
+    let target_entity = param_str(params, "target_entity")?;
+    let relation_type = param_str(params, "relation_type")?;
+    let action = param_str(params, "action")?;
+    let description = param_str_opt(params, "description");
+
+    // Look up entity IDs
+    let source_id: String = sqlx::query_as::<_, (String,)>(
+        "SELECT entity_id FROM kg_entities WHERE lower(name) = lower($1)",
+    )
+    .bind(source_entity)
+    .fetch_optional(&state.pg)
+    .await?
+    .map(|r| r.0)
+    .ok_or_else(|| BroodlinkError::NotFound(format!("entity not found: {source_entity}")))?;
+
+    let target_id: String = sqlx::query_as::<_, (String,)>(
+        "SELECT entity_id FROM kg_entities WHERE lower(name) = lower($1)",
+    )
+    .bind(target_entity)
+    .fetch_optional(&state.pg)
+    .await?
+    .map(|r| r.0)
+    .ok_or_else(|| BroodlinkError::NotFound(format!("entity not found: {target_entity}")))?;
+
+    // Find active edge
+    let edge_id: String = sqlx::query_as::<_, (String,)>(
+        "SELECT edge_id FROM kg_edges
+         WHERE source_id = $1 AND target_id = $2 AND relation_type = $3 AND valid_to IS NULL",
+    )
+    .bind(&source_id)
+    .bind(&target_id)
+    .bind(relation_type)
+    .fetch_optional(&state.pg)
+    .await?
+    .map(|r| r.0)
+    .ok_or_else(|| {
+        BroodlinkError::NotFound(format!(
+            "no active edge: {source_entity} --{relation_type}--> {target_entity}"
+        ))
+    })?;
+
+    match action {
+        "invalidate" => {
+            sqlx::query("UPDATE kg_edges SET valid_to = NOW(), updated_at = NOW() WHERE edge_id = $1")
+                .bind(&edge_id)
+                .execute(&state.pg)
+                .await?;
+        }
+        "update_description" => {
+            let desc = description.ok_or_else(|| BroodlinkError::Validation {
+                field: "description".to_string(),
+                message: "required for update_description action".to_string(),
+            })?;
+            sqlx::query("UPDATE kg_edges SET description = $1, updated_at = NOW() WHERE edge_id = $2")
+                .bind(desc)
+                .bind(&edge_id)
+                .execute(&state.pg)
+                .await?;
+        }
+        _ => {
+            return Err(BroodlinkError::Validation {
+                field: "action".to_string(),
+                message: "must be 'invalidate' or 'update_description'".to_string(),
+            });
+        }
+    }
+
+    // Audit log
+    let trace_id = Uuid::new_v4().to_string();
+    let _ = write_audit_log(
+        &state.pg,
+        &trace_id,
+        agent_id,
+        SERVICE_NAME,
+        &format!("graph_update_edge:{action}"),
+        true,
+        None,
+    )
+    .await;
+
+    Ok(serde_json::json!({
+        "edge_id": edge_id,
+        "action": action,
+        "source": source_entity,
+        "target": target_entity,
+        "relation_type": relation_type,
+    }))
+}
+
+async fn tool_graph_stats(
+    state: &AppState,
+    _agent_id: &str,
+    _params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    // Parallel queries
+    let (total_entities, active_edges, historical_edges, type_rows, relation_rows, connected_rows, last_updated) = tokio::join!(
+        sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM kg_entities")
+            .fetch_one(&state.pg),
+        sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM kg_edges WHERE valid_to IS NULL")
+            .fetch_one(&state.pg),
+        sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM kg_edges WHERE valid_to IS NOT NULL")
+            .fetch_one(&state.pg),
+        sqlx::query_as::<_, (String, i64)>(
+            "SELECT entity_type, COUNT(*) FROM kg_entities GROUP BY entity_type ORDER BY COUNT(*) DESC"
+        ).fetch_all(&state.pg),
+        sqlx::query_as::<_, (String, i64)>(
+            "SELECT relation_type, COUNT(*) as cnt FROM kg_edges WHERE valid_to IS NULL
+             GROUP BY relation_type ORDER BY cnt DESC LIMIT 10"
+        ).fetch_all(&state.pg),
+        sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT e.name, e.entity_type, COUNT(ed.id) as edge_count
+             FROM kg_entities e
+             LEFT JOIN kg_edges ed ON (ed.source_id = e.entity_id OR ed.target_id = e.entity_id) AND ed.valid_to IS NULL
+             GROUP BY e.entity_id, e.name, e.entity_type
+             ORDER BY edge_count DESC LIMIT 10"
+        ).fetch_all(&state.pg),
+        sqlx::query_as::<_, (Option<String>,)>("SELECT MAX(updated_at)::text FROM kg_edges")
+            .fetch_one(&state.pg),
+    );
+
+    let total_entities = total_entities.map(|r| r.0).unwrap_or(0);
+    let active_edges = active_edges.map(|r| r.0).unwrap_or(0);
+    let historical_edges = historical_edges.map(|r| r.0).unwrap_or(0);
+
+    let entity_types: serde_json::Map<String, serde_json::Value> = type_rows
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(t, c)| (t, serde_json::Value::from(c)))
+        .collect();
+
+    let top_relation_types: Vec<serde_json::Value> = relation_rows
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(r, c)| serde_json::json!({"relation": r, "count": c}))
+        .collect();
+
+    let most_connected: Vec<serde_json::Value> = connected_rows
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(n, t, c)| serde_json::json!({"name": n, "type": t, "edge_count": c}))
+        .collect();
+
+    let last = last_updated.ok().and_then(|r| r.0).unwrap_or_default();
+
+    Ok(serde_json::json!({
+        "total_entities": total_entities,
+        "total_active_edges": active_edges,
+        "total_historical_edges": historical_edges,
+        "entity_types": entity_types,
+        "top_relation_types": top_relation_types,
+        "most_connected_entities": most_connected,
+        "last_updated": last,
     }))
 }
 
@@ -3393,6 +3910,7 @@ fn is_readonly_tool(tool: &str) -> bool {
             | "beads_list_issues" | "beads_get_issue" | "beads_list_formulas"
             | "beads_get_convoy" | "read_messages" | "list_projects"
             | "list_skills" | "ping"
+            | "graph_search" | "graph_traverse" | "graph_stats"
     )
 }
 
@@ -5112,7 +5630,7 @@ mod tests {
     #[test]
     fn test_tool_registry_count() {
         // Must match the number of match arms in tool_dispatch (excluding the _ fallback)
-        assert_eq!(TOOL_REGISTRY.len(), 62, "tool registry should have 62 tools");
+        assert_eq!(TOOL_REGISTRY.len(), 66, "tool registry should have 66 tools");
     }
 
     #[test]
@@ -5145,6 +5663,8 @@ mod tests {
             "delegate_task", "accept_delegation", "reject_delegation", "complete_delegation",
             "start_stream", "emit_stream_event",
             "a2a_discover", "a2a_delegate",
+            // v0.5.0 knowledge graph tools
+            "graph_search", "graph_traverse", "graph_update_edge", "graph_stats",
         ] {
             assert!(names.contains(expected), "registry missing tool: {expected}");
         }
@@ -5465,5 +5985,252 @@ mod tests {
         let b = vec![-1.0, 0.0];
         let sim = cosine_similarity(&a, &b);
         assert!((sim - (-1.0)).abs() < 1e-10, "opposite vectors should have similarity -1.0");
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.5.0: Knowledge Graph tool registry schema tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_graph_search_tool_schema() {
+        let tool = TOOL_REGISTRY
+            .iter()
+            .find(|t| t["function"]["name"] == "graph_search")
+            .expect("graph_search must exist in registry");
+
+        let params = &tool["function"]["parameters"];
+        assert_eq!(params["type"], "object");
+
+        // Required params
+        let required = params["required"].as_array().unwrap();
+        assert!(required.contains(&json!("query")), "query must be required");
+        assert!(!required.contains(&json!("entity_type")), "entity_type must be optional");
+        assert!(!required.contains(&json!("include_edges")), "include_edges must be optional");
+        assert!(!required.contains(&json!("limit")), "limit must be optional");
+
+        // Properties exist
+        let props = params["properties"].as_object().unwrap();
+        assert!(props.contains_key("query"));
+        assert!(props.contains_key("entity_type"));
+        assert!(props.contains_key("include_edges"));
+        assert!(props.contains_key("limit"));
+    }
+
+    #[test]
+    fn test_graph_traverse_tool_schema() {
+        let tool = TOOL_REGISTRY
+            .iter()
+            .find(|t| t["function"]["name"] == "graph_traverse")
+            .expect("graph_traverse must exist in registry");
+
+        let params = &tool["function"]["parameters"];
+        let required = params["required"].as_array().unwrap();
+        assert!(required.contains(&json!("start_entity")), "start_entity must be required");
+        assert_eq!(required.len(), 1, "only start_entity should be required");
+
+        let props = params["properties"].as_object().unwrap();
+        assert!(props.contains_key("start_entity"));
+        assert!(props.contains_key("max_hops"));
+        assert!(props.contains_key("relation_types"));
+        assert!(props.contains_key("direction"));
+    }
+
+    #[test]
+    fn test_graph_update_edge_tool_schema() {
+        let tool = TOOL_REGISTRY
+            .iter()
+            .find(|t| t["function"]["name"] == "graph_update_edge")
+            .expect("graph_update_edge must exist in registry");
+
+        let params = &tool["function"]["parameters"];
+        let required: Vec<&str> = params["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+
+        assert!(required.contains(&"source_entity"));
+        assert!(required.contains(&"target_entity"));
+        assert!(required.contains(&"relation_type"));
+        assert!(required.contains(&"action"));
+        assert!(!required.contains(&"description"), "description must be optional");
+
+        let props = params["properties"].as_object().unwrap();
+        assert!(props.contains_key("description"), "description property must exist");
+    }
+
+    #[test]
+    fn test_graph_stats_tool_schema() {
+        let tool = TOOL_REGISTRY
+            .iter()
+            .find(|t| t["function"]["name"] == "graph_stats")
+            .expect("graph_stats must exist in registry");
+
+        let params = &tool["function"]["parameters"];
+        assert_eq!(params["type"], "object");
+
+        // No required params
+        let required = params.get("required").and_then(|v| v.as_array());
+        assert!(
+            required.map_or(true, |r| r.is_empty()),
+            "graph_stats should have no required params"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.5.0: is_readonly_tool coverage for KG tools
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_kg_readonly_tools() {
+        assert!(is_readonly_tool("graph_search"), "graph_search should be readonly");
+        assert!(is_readonly_tool("graph_traverse"), "graph_traverse should be readonly");
+        assert!(is_readonly_tool("graph_stats"), "graph_stats should be readonly");
+    }
+
+    #[test]
+    fn test_kg_write_tools_not_readonly() {
+        assert!(!is_readonly_tool("graph_update_edge"), "graph_update_edge should NOT be readonly");
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.5.0: KG tool parameter validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_graph_search_requires_query() {
+        let params = json!({});
+        let result = param_str(&params, "query");
+        assert!(result.is_err(), "graph_search should reject missing query");
+    }
+
+    #[test]
+    fn test_graph_search_optional_defaults() {
+        let params = json!({"query": "test"});
+        // include_edges defaults to true
+        assert_eq!(param_bool_opt(&params, "include_edges"), None);
+        // limit defaults via unwrap_or(10)
+        assert_eq!(param_i64_opt(&params, "limit"), None);
+        // entity_type is optional
+        assert_eq!(param_str_opt(&params, "entity_type"), None);
+    }
+
+    #[test]
+    fn test_graph_traverse_requires_start_entity() {
+        let params = json!({});
+        let result = param_str(&params, "start_entity");
+        assert!(result.is_err(), "graph_traverse should reject missing start_entity");
+    }
+
+    #[test]
+    fn test_graph_traverse_direction_defaults() {
+        let params = json!({"start_entity": "alice"});
+        let direction = param_str_opt(&params, "direction").unwrap_or("both");
+        assert_eq!(direction, "both", "direction should default to 'both'");
+    }
+
+    #[test]
+    fn test_graph_traverse_max_hops_capping() {
+        // Simulates the capping logic from tool_graph_traverse
+        let config_max: i64 = 3;
+        let user_hops: i64 = 10;
+        let effective = user_hops.min(config_max);
+        assert_eq!(effective, 3, "max_hops should be capped by config");
+
+        let user_hops: i64 = 2;
+        let effective = user_hops.min(config_max);
+        assert_eq!(effective, 2, "max_hops below config should be preserved");
+    }
+
+    #[test]
+    fn test_graph_traverse_relation_filter_parsing() {
+        // Simulates the relation_types parsing logic from tool_graph_traverse
+        let rt_str = "DEPENDS_ON, RUNS_ON, MANAGES";
+        let types: Vec<&str> = rt_str.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        assert_eq!(types, vec!["DEPENDS_ON", "RUNS_ON", "MANAGES"]);
+
+        let quoted: Vec<String> = types.iter().map(|t| format!("'{}'", t.replace('\'', "''"))).collect();
+        let filter = format!(" AND edge.relation_type IN ({})", quoted.join(", "));
+        assert_eq!(
+            filter,
+            " AND edge.relation_type IN ('DEPENDS_ON', 'RUNS_ON', 'MANAGES')"
+        );
+    }
+
+    #[test]
+    fn test_graph_traverse_empty_relation_filter() {
+        let rt_str = "";
+        let types: Vec<&str> = rt_str.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        assert!(types.is_empty(), "empty string should produce no relation types");
+    }
+
+    #[test]
+    fn test_graph_traverse_sql_injection_in_relation_types() {
+        // Verify the quoting logic escapes single quotes
+        let rt_str = "DEPENDS_ON, O'REILLY";
+        let types: Vec<&str> = rt_str.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let quoted: Vec<String> = types.iter().map(|t| format!("'{}'", t.replace('\'', "''"))).collect();
+        assert_eq!(quoted[1], "'O''REILLY'", "single quotes should be escaped");
+    }
+
+    #[test]
+    fn test_graph_update_edge_requires_all_four_params() {
+        let params = json!({"source_entity": "a", "target_entity": "b", "relation_type": "R"});
+        assert!(param_str(&params, "action").is_err(), "missing action should fail");
+
+        let params = json!({"target_entity": "b", "relation_type": "R", "action": "invalidate"});
+        assert!(param_str(&params, "source_entity").is_err(), "missing source_entity should fail");
+    }
+
+    #[test]
+    fn test_graph_update_edge_invalid_action_type() {
+        // The handler validates action is "invalidate" or "update_description"
+        // This test verifies the validation logic pattern
+        let action = "delete";
+        let valid = matches!(action, "invalidate" | "update_description");
+        assert!(!valid, "'delete' should not be a valid action");
+
+        let action = "invalidate";
+        let valid = matches!(action, "invalidate" | "update_description");
+        assert!(valid, "'invalidate' should be valid");
+
+        let action = "update_description";
+        let valid = matches!(action, "invalidate" | "update_description");
+        assert!(valid, "'update_description' should be valid");
+    }
+
+    #[test]
+    fn test_graph_traverse_direction_sql_mapping() {
+        // Verifies the direction → SQL clause mapping logic
+        for (direction, expected_join) in &[
+            ("outgoing", "edge.source_id = t.entity_id"),
+            ("incoming", "edge.target_id = t.entity_id"),
+            ("both", "(edge.source_id = t.entity_id OR edge.target_id = t.entity_id)"),
+            ("unknown", "(edge.source_id = t.entity_id OR edge.target_id = t.entity_id)"),
+        ] {
+            let join = match *direction {
+                "outgoing" => "edge.source_id = t.entity_id",
+                "incoming" => "edge.target_id = t.entity_id",
+                _ => "(edge.source_id = t.entity_id OR edge.target_id = t.entity_id)",
+            };
+            assert_eq!(join, *expected_join, "direction '{direction}' should map correctly");
+        }
+    }
+
+    #[test]
+    fn test_graph_traverse_next_entity_expr_mapping() {
+        for (direction, expected) in &[
+            ("outgoing", "edge.target_id"),
+            ("incoming", "edge.source_id"),
+            ("both", "CASE WHEN edge.source_id = t.entity_id THEN edge.target_id ELSE edge.source_id END"),
+        ] {
+            let expr = match *direction {
+                "outgoing" => "edge.target_id",
+                "incoming" => "edge.source_id",
+                _ => "CASE WHEN edge.source_id = t.entity_id THEN edge.target_id ELSE edge.source_id END",
+            };
+            assert_eq!(expr, *expected, "direction '{direction}' next_entity_expr mismatch");
+        }
     }
 }

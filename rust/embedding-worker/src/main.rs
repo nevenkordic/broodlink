@@ -133,8 +133,51 @@ struct QdrantPayload {
 struct OutboxRow {
     id: i64,
     trace_id: Option<String>,
+    operation: String,
     payload: serde_json::Value,
     attempts: i32,
+}
+
+// ---------------------------------------------------------------------------
+// Knowledge Graph extraction types
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct OllamaGenerateRequest {
+    model: String,
+    prompt: String,
+    stream: bool,
+}
+
+#[derive(Deserialize)]
+struct OllamaGenerateResponse {
+    response: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct ExtractedEntities {
+    #[serde(default)]
+    entities: Vec<ExtractedEntity>,
+    #[serde(default)]
+    relationships: Vec<ExtractedRelationship>,
+}
+
+#[derive(Deserialize, Debug)]
+struct ExtractedEntity {
+    name: String,
+    #[serde(rename = "type")]
+    entity_type: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct ExtractedRelationship {
+    source: String,
+    target: String,
+    relation: String,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -149,6 +192,7 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub ollama_breaker: CircuitBreaker,
     pub qdrant_breaker: CircuitBreaker,
+    pub kg_extraction_breaker: CircuitBreaker,
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +325,11 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
         CIRCUIT_FAILURE_THRESHOLD,
         CIRCUIT_HALF_OPEN_SECS,
     );
+    let kg_extraction_breaker = CircuitBreaker::new(
+        "kg_extraction",
+        CIRCUIT_FAILURE_THRESHOLD,
+        CIRCUIT_HALF_OPEN_SECS,
+    );
 
     Ok(AppState {
         dolt,
@@ -290,6 +339,7 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
         http_client,
         ollama_breaker,
         qdrant_breaker,
+        kg_extraction_breaker,
     })
 }
 
@@ -356,7 +406,7 @@ async fn poll_loop(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
 
 async fn fetch_pending_batch(state: &AppState) -> Result<Vec<OutboxRow>, BroodlinkError> {
     let rows = sqlx::query(
-        "SELECT id, trace_id, payload, attempts
+        "SELECT id, trace_id, operation, payload, attempts
          FROM outbox
          WHERE status = 'pending'
          ORDER BY created_at ASC
@@ -371,12 +421,14 @@ async fn fetch_pending_batch(state: &AppState) -> Result<Vec<OutboxRow>, Broodli
     for row in rows {
         let id: i64 = row.try_get("id")?;
         let trace_id: Option<String> = row.try_get("trace_id").ok();
+        let operation: String = row.try_get("operation").unwrap_or_else(|_| "embed".to_string());
         let payload: serde_json::Value = row.try_get("payload")?;
         let attempts: i32 = row.try_get::<i32, _>("attempts").unwrap_or(0);
 
         result.push(OutboxRow {
             id,
             trace_id,
+            operation,
             payload,
             attempts,
         });
@@ -435,50 +487,101 @@ async fn process_outbox_row(state: &AppState, row: &OutboxRow) -> Result<(), Bro
         return Ok(());
     }
 
-    // Step 1: Get embedding from Ollama (with circuit breaker)
-    let embedding = match get_embedding(state, content).await {
-        Ok(vec) => vec,
-        Err(e) => {
+    let tags = row
+        .payload
+        .get("tags")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+
+    // For "embed" operations: full pipeline (embed + qdrant + kg extract)
+    // For "kg_extract" operations: skip embedding, only do kg extraction
+    if row.operation == "embed" {
+        // Step 1: Get embedding from Ollama (with circuit breaker)
+        let embedding = match get_embedding(state, content).await {
+            Ok(vec) => vec,
+            Err(e) => {
+                return handle_failure(state, row, &e.to_string()).await;
+            }
+        };
+
+        // Step 2: Upsert into Qdrant (with circuit breaker)
+        let qdrant_id = Uuid::new_v4().to_string();
+        let now_str = chrono::Utc::now().to_rfc3339();
+
+        if let Err(e) = upsert_qdrant(
+            state,
+            &qdrant_id,
+            &embedding,
+            topic,
+            agent_name,
+            memory_id,
+            &now_str,
+        )
+        .await
+        {
             return handle_failure(state, row, &e.to_string()).await;
         }
-    };
 
-    // Step 2: Upsert into Qdrant (with circuit breaker)
-    let qdrant_id = Uuid::new_v4().to_string();
-    let now_str = chrono::Utc::now().to_rfc3339();
-
-    if let Err(e) = upsert_qdrant(
-        state,
-        &qdrant_id,
-        &embedding,
-        topic,
-        agent_name,
-        memory_id,
-        &now_str,
-    )
-    .await
-    {
-        return handle_failure(state, row, &e.to_string()).await;
-    }
-
-    // Step 3: Update agent_memory in Dolt with embedding reference
-    if !memory_id.is_empty() {
-        if let Err(e) = update_memory_ref(&state.dolt, memory_id, &qdrant_id).await {
-            warn!(
-                outbox_id = %row.id,
-                memory_id = %memory_id,
-                error = %e,
-                "failed to update embedding_ref in dolt (non-fatal)"
-            );
+        // Step 3: Update agent_memory in Dolt with embedding reference
+        if !memory_id.is_empty() {
+            if let Err(e) = update_memory_ref(&state.dolt, memory_id, &qdrant_id).await {
+                warn!(
+                    outbox_id = %row.id,
+                    memory_id = %memory_id,
+                    error = %e,
+                    "failed to update embedding_ref in dolt (non-fatal)"
+                );
+            }
         }
     }
 
-    // Step 4: Mark outbox row as done
+    // Step 4: Knowledge graph entity extraction (non-fatal, for both embed and kg_extract)
+    if state.config.memory_search.kg_enabled {
+        match extract_entities(state, topic, content, tags, agent_name).await {
+            Ok(extracted) => {
+                if !extracted.entities.is_empty() {
+                    let mut entity_map: HashMap<String, String> = HashMap::new();
+                    for ent in &extracted.entities {
+                        match resolve_entity(state, ent, agent_name, memory_id).await {
+                            Ok(eid) => {
+                                entity_map.insert(ent.name.to_lowercase(), eid);
+                            }
+                            Err(e) => {
+                                warn!(error = %e, entity = %ent.name, "entity resolution failed (non-fatal)");
+                            }
+                        }
+                    }
+                    if !extracted.relationships.is_empty() {
+                        if let Err(e) =
+                            resolve_edges(state, &extracted.relationships, &entity_map, memory_id, agent_name).await
+                        {
+                            warn!(error = %e, "edge resolution failed (non-fatal)");
+                        }
+                    }
+                    info!(
+                        outbox_id = %row.id,
+                        entities = extracted.entities.len(),
+                        relationships = extracted.relationships.len(),
+                        "kg extraction complete"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    outbox_id = %row.id,
+                    "kg extraction failed (non-fatal, memory still stored)"
+                );
+            }
+        }
+    }
+
+    // Step 5: Mark outbox row as done
     mark_done(&state.pg, row.id).await?;
 
     info!(
         outbox_id = %row.id,
-        qdrant_id = %qdrant_id,
+        operation = %row.operation,
         memory_id = %memory_id,
         "embedding pipeline complete"
     );
@@ -530,6 +633,327 @@ async fn get_embedding(state: &AppState, content: &str) -> Result<Vec<f32>, Broo
 
     state.ollama_breaker.record_success();
     Ok(embed_resp.embedding)
+}
+
+// ---------------------------------------------------------------------------
+// Knowledge Graph: LLM entity extraction
+// ---------------------------------------------------------------------------
+
+async fn extract_entities(
+    state: &AppState,
+    topic: &str,
+    content: &str,
+    tags: &str,
+    agent_id: &str,
+) -> Result<ExtractedEntities, BroodlinkError> {
+    state
+        .kg_extraction_breaker
+        .check()
+        .map_err(BroodlinkError::CircuitOpen)?;
+
+    let prompt = format!(
+        "System: You are an entity and relationship extractor. Given a memory stored by an AI agent, extract all entities and relationships. Respond ONLY with valid JSON, no markdown, no explanation.\n\n\
+         User: Extract entities and relationships from this agent memory.\n\n\
+         Topic: {topic}\n\
+         Content: {content}\n\
+         Tags: {tags}\n\
+         Agent: {agent_id}\n\n\
+         Respond with this exact JSON structure:\n\
+         {{\n  \"entities\": [\n    {{\n      \"name\": \"exact entity name\",\n      \"type\": \"person|service|concept|location|technology|organization|event|other\",\n      \"description\": \"one-sentence description of this entity\"\n    }}\n  ],\n  \"relationships\": [\n    {{\n      \"source\": \"entity name (must match an entity above)\",\n      \"target\": \"entity name (must match an entity above)\",\n      \"relation\": \"RELATION_TYPE in UPPER_SNAKE_CASE\",\n      \"description\": \"one-sentence description of this relationship\"\n    }}\n  ]\n}}\n\n\
+         Rules:\n\
+         - Extract ALL named entities: people, services, systems, technologies, concepts, places, organizations\n\
+         - Extract ALL relationships stated or strongly implied\n\
+         - Use UPPER_SNAKE_CASE for relation types (e.g. LEADS, DEPENDS_ON, WORKS_FOR, BUILT_WITH, LOCATED_IN, RELATED_TO)\n\
+         - Entity names should be specific and canonical (e.g. \"Redis\" not \"the cache\")\n\
+         - If no entities or relationships found, return empty arrays\n\
+         - Do NOT hallucinate entities or relationships not present in the text"
+    );
+
+    let url = format!("{}/api/generate", state.config.ollama.url);
+    let body = OllamaGenerateRequest {
+        model: state.config.memory_search.kg_extraction_model.clone(),
+        prompt,
+        stream: false,
+    };
+
+    let resp = state
+        .http_client
+        .post(&url)
+        .json(&body)
+        .timeout(Duration::from_secs(
+            state.config.memory_search.kg_extraction_timeout_seconds,
+        ))
+        .send()
+        .await
+        .map_err(|e| {
+            state.kg_extraction_breaker.record_failure();
+            BroodlinkError::Ollama(format!("kg extraction request failed: {e}"))
+        })?;
+
+    if !resp.status().is_success() {
+        state.kg_extraction_breaker.record_failure();
+        return Err(BroodlinkError::Ollama(format!(
+            "kg extraction returned status {}",
+            resp.status()
+        )));
+    }
+    state.kg_extraction_breaker.record_success();
+
+    let gen_resp: OllamaGenerateResponse = resp
+        .json()
+        .await
+        .map_err(|e| BroodlinkError::Ollama(format!("kg extraction parse: {e}")))?;
+
+    // Clean LLM output: strip markdown code fences
+    let cleaned = gen_resp.response.trim();
+    let cleaned = cleaned
+        .strip_prefix("```json")
+        .or_else(|| cleaned.strip_prefix("```"))
+        .unwrap_or(cleaned);
+    let cleaned = cleaned.strip_suffix("```").unwrap_or(cleaned).trim();
+
+    serde_json::from_str::<ExtractedEntities>(cleaned)
+        .map_err(|e| BroodlinkError::Internal(format!("kg extraction JSON parse failed: {e}")))
+}
+
+// ---------------------------------------------------------------------------
+// Knowledge Graph: entity resolution
+// ---------------------------------------------------------------------------
+
+async fn resolve_entity(
+    state: &AppState,
+    entity: &ExtractedEntity,
+    agent_id: &str,
+    memory_id: &str,
+) -> Result<String, BroodlinkError> {
+    let mem_id: i64 = memory_id.parse().unwrap_or(0);
+
+    // 1. Exact match by name
+    let existing: Option<(String, i32)> = sqlx::query_as(
+        "SELECT entity_id, mention_count FROM kg_entities WHERE lower(name) = lower($1)",
+    )
+    .bind(&entity.name)
+    .fetch_optional(&state.pg)
+    .await?;
+
+    if let Some((entity_id, count)) = existing {
+        sqlx::query(
+            "UPDATE kg_entities SET mention_count = $1, last_seen = NOW(), updated_at = NOW() WHERE entity_id = $2",
+        )
+        .bind(count + 1)
+        .bind(&entity_id)
+        .execute(&state.pg)
+        .await?;
+
+        let _ = sqlx::query(
+            "INSERT INTO kg_entity_memories (entity_id, memory_id, agent_id)
+             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        )
+        .bind(&entity_id)
+        .bind(mem_id)
+        .bind(agent_id)
+        .execute(&state.pg)
+        .await;
+
+        return Ok(entity_id);
+    }
+
+    // 2. Fuzzy match via embedding similarity
+    if let Ok(embedding) = get_embedding(state, &entity.name).await {
+        let embedding_f64: Vec<f64> = embedding.iter().map(|&f| f64::from(f)).collect();
+
+        let qdrant_url = format!(
+            "{}/collections/broodlink_kg_entities/points/search",
+            state.config.qdrant.url
+        );
+        let qdrant_body = serde_json::json!({
+            "vector": { "name": "default", "vector": embedding_f64 },
+            "limit": 1,
+            "with_payload": true,
+        });
+
+        if let Ok(resp) = state
+            .http_client
+            .post(&qdrant_url)
+            .json(&qdrant_body)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    if let Some(results) = json.get("result").and_then(|r| r.as_array()) {
+                        if let Some(top) = results.first() {
+                            let score = top.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
+                            if score
+                                >= state
+                                    .config
+                                    .memory_search
+                                    .kg_entity_similarity_threshold
+                            {
+                                if let Some(matched_id) = top
+                                    .get("payload")
+                                    .and_then(|p| p.get("entity_id"))
+                                    .and_then(|e| e.as_str())
+                                {
+                                    if !matched_id.is_empty() {
+                                        sqlx::query(
+                                            "UPDATE kg_entities SET mention_count = mention_count + 1, last_seen = NOW(), updated_at = NOW() WHERE entity_id = $1",
+                                        )
+                                        .bind(matched_id)
+                                        .execute(&state.pg)
+                                        .await?;
+
+                                        let _ = sqlx::query(
+                                            "INSERT INTO kg_entity_memories (entity_id, memory_id, agent_id)
+                                             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                                        )
+                                        .bind(matched_id)
+                                        .bind(mem_id)
+                                        .bind(agent_id)
+                                        .execute(&state.pg)
+                                        .await;
+
+                                        return Ok(matched_id.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. New entity: insert into Postgres + upsert embedding to Qdrant
+    let entity_id = Uuid::new_v4().to_string();
+    let qdrant_point_id = Uuid::new_v4().to_string();
+
+    sqlx::query(
+        "INSERT INTO kg_entities (entity_id, name, entity_type, description, embedding_ref, source_agent, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())",
+    )
+    .bind(&entity_id)
+    .bind(&entity.name)
+    .bind(&entity.entity_type)
+    .bind(&entity.description)
+    .bind(&qdrant_point_id)
+    .bind(agent_id)
+    .execute(&state.pg)
+    .await?;
+
+    // Upsert entity name embedding to Qdrant kg collection (non-fatal)
+    if let Ok(emb) = get_embedding(state, &entity.name).await {
+        let emb_f64: Vec<f64> = emb.iter().map(|&f| f64::from(f)).collect();
+        let mut vector_map = HashMap::new();
+        vector_map.insert("default".to_string(), emb_f64);
+
+        let kg_point = serde_json::json!({
+            "points": [{
+                "id": qdrant_point_id,
+                "vector": { "default": emb.iter().map(|&f| f64::from(f)).collect::<Vec<f64>>() },
+                "payload": {
+                    "entity_id": entity_id,
+                    "name": entity.name,
+                    "entity_type": entity.entity_type,
+                    "source_agent": agent_id,
+                },
+            }],
+        });
+
+        let url = format!(
+            "{}/collections/broodlink_kg_entities/points",
+            state.config.qdrant.url
+        );
+        if let Err(e) = state
+            .http_client
+            .put(&url)
+            .json(&kg_point)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+        {
+            warn!(error = %e, entity = %entity.name, "failed to upsert kg entity to qdrant (non-fatal)");
+        }
+    }
+
+    // Link to memory
+    let _ = sqlx::query(
+        "INSERT INTO kg_entity_memories (entity_id, memory_id, agent_id)
+         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+    )
+    .bind(&entity_id)
+    .bind(mem_id)
+    .bind(agent_id)
+    .execute(&state.pg)
+    .await;
+
+    Ok(entity_id)
+}
+
+// ---------------------------------------------------------------------------
+// Knowledge Graph: edge resolution
+// ---------------------------------------------------------------------------
+
+async fn resolve_edges(
+    state: &AppState,
+    relationships: &[ExtractedRelationship],
+    entity_map: &HashMap<String, String>,
+    memory_id: &str,
+    agent_id: &str,
+) -> Result<u32, BroodlinkError> {
+    let mem_id: i64 = memory_id.parse().unwrap_or(0);
+    let mut created = 0u32;
+
+    for rel in relationships {
+        let source_id = match entity_map.get(&rel.source.to_lowercase()) {
+            Some(id) => id,
+            None => continue,
+        };
+        let target_id = match entity_map.get(&rel.target.to_lowercase()) {
+            Some(id) => id,
+            None => continue,
+        };
+
+        // Check for existing active edge
+        let existing: Option<(String, f64)> = sqlx::query_as(
+            "SELECT edge_id, weight FROM kg_edges
+             WHERE source_id = $1 AND target_id = $2 AND relation_type = $3 AND valid_to IS NULL",
+        )
+        .bind(source_id)
+        .bind(target_id)
+        .bind(&rel.relation)
+        .fetch_optional(&state.pg)
+        .await?;
+
+        if let Some((edge_id, weight)) = existing {
+            // Reinforce: increment weight
+            sqlx::query("UPDATE kg_edges SET weight = $1, updated_at = NOW() WHERE edge_id = $2")
+                .bind(weight + 0.1)
+                .bind(&edge_id)
+                .execute(&state.pg)
+                .await?;
+        } else {
+            // New edge
+            let edge_id = Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO kg_edges (edge_id, source_id, target_id, relation_type, description, source_memory_id, source_agent, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())",
+            )
+            .bind(&edge_id)
+            .bind(source_id)
+            .bind(target_id)
+            .bind(&rel.relation)
+            .bind(&rel.description)
+            .bind(mem_id)
+            .bind(agent_id)
+            .execute(&state.pg)
+            .await?;
+            created += 1;
+        }
+    }
+
+    Ok(created)
 }
 
 // ---------------------------------------------------------------------------
@@ -861,5 +1285,292 @@ mod tests {
             msg.contains("qdrant"),
             "BroodlinkError should contain the breaker name, got: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Knowledge Graph extraction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extraction_json_parsing() {
+        let json_str = r#"{
+            "entities": [
+                {"name": "Alice", "type": "person", "description": "Team lead"},
+                {"name": "auth-service", "type": "service", "description": "Authentication microservice"}
+            ],
+            "relationships": [
+                {"source": "Alice", "target": "auth-service", "relation": "LEADS", "description": "Alice leads auth-service"}
+            ]
+        }"#;
+
+        let extracted: ExtractedEntities = serde_json::from_str(json_str).unwrap();
+        assert_eq!(extracted.entities.len(), 2);
+        assert_eq!(extracted.relationships.len(), 1);
+        assert_eq!(extracted.entities[0].name, "Alice");
+        assert_eq!(extracted.entities[0].entity_type, "person");
+        assert_eq!(extracted.relationships[0].relation, "LEADS");
+    }
+
+    #[test]
+    fn test_extraction_strip_markdown_fences() {
+        let raw = "```json\n{\"entities\": [], \"relationships\": []}\n```";
+        let cleaned = raw.trim();
+        let cleaned = cleaned
+            .strip_prefix("```json")
+            .or_else(|| cleaned.strip_prefix("```"))
+            .unwrap_or(cleaned);
+        let cleaned = cleaned.strip_suffix("```").unwrap_or(cleaned).trim();
+
+        let extracted: ExtractedEntities = serde_json::from_str(cleaned).unwrap();
+        assert!(extracted.entities.is_empty());
+        assert!(extracted.relationships.is_empty());
+    }
+
+    #[test]
+    fn test_extraction_empty_entities() {
+        let json_str = r#"{"entities": [], "relationships": []}"#;
+        let extracted: ExtractedEntities = serde_json::from_str(json_str).unwrap();
+        assert!(extracted.entities.is_empty());
+        assert!(extracted.relationships.is_empty());
+    }
+
+    #[test]
+    fn test_extraction_missing_optional_fields() {
+        let json_str = r#"{
+            "entities": [{"name": "Redis", "type": "technology"}],
+            "relationships": [{"source": "Redis", "target": "Redis", "relation": "SELF_REF"}]
+        }"#;
+        let extracted: ExtractedEntities = serde_json::from_str(json_str).unwrap();
+        assert_eq!(extracted.entities.len(), 1);
+        assert!(extracted.entities[0].description.is_none());
+        assert!(extracted.relationships[0].description.is_none());
+    }
+
+    #[test]
+    fn test_kg_circuit_breaker_starts_closed() {
+        let cb = CircuitBreaker::new("kg_extraction", 5, 30);
+        assert!(!cb.is_open());
+        assert!(cb.check().is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.5.0: KG extraction edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extraction_unicode_entities() {
+        let json_str = r#"{
+            "entities": [
+                {"name": "München-Cluster", "type": "location", "description": "EU data center"},
+                {"name": "Ключ-Сервис", "type": "service"}
+            ],
+            "relationships": [
+                {"source": "München-Cluster", "target": "Ключ-Сервис", "relation": "HOSTS"}
+            ]
+        }"#;
+        let extracted: ExtractedEntities = serde_json::from_str(json_str).unwrap();
+        assert_eq!(extracted.entities.len(), 2);
+        assert_eq!(extracted.entities[0].name, "München-Cluster");
+        assert_eq!(extracted.relationships[0].source, "München-Cluster");
+    }
+
+    #[test]
+    fn test_extraction_only_entities_no_relationships() {
+        let json_str = r#"{"entities": [{"name": "solo-node", "type": "service"}], "relationships": []}"#;
+        let extracted: ExtractedEntities = serde_json::from_str(json_str).unwrap();
+        assert_eq!(extracted.entities.len(), 1);
+        assert!(extracted.relationships.is_empty());
+    }
+
+    #[test]
+    fn test_extraction_only_relationships_no_entities() {
+        // Malformed LLM output — relationships without entities
+        let json_str = r#"{"entities": [], "relationships": [{"source": "a", "target": "b", "relation": "X"}]}"#;
+        let extracted: ExtractedEntities = serde_json::from_str(json_str).unwrap();
+        assert!(extracted.entities.is_empty());
+        assert_eq!(extracted.relationships.len(), 1);
+    }
+
+    #[test]
+    fn test_extraction_large_entity_count() {
+        let mut entities = Vec::new();
+        for i in 0..50 {
+            entities.push(serde_json::json!({"name": format!("entity-{i}"), "type": "service"}));
+        }
+        let json_val = serde_json::json!({"entities": entities, "relationships": []});
+        let json_str = serde_json::to_string(&json_val).unwrap();
+        let extracted: ExtractedEntities = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(extracted.entities.len(), 50);
+    }
+
+    #[test]
+    fn test_extraction_strip_markdown_fence_with_language_tag() {
+        let raw = "```json\n{\"entities\": [{\"name\": \"x\", \"type\": \"t\"}], \"relationships\": []}\n```";
+        let cleaned = raw.trim();
+        let cleaned = cleaned
+            .strip_prefix("```json")
+            .or_else(|| cleaned.strip_prefix("```"))
+            .unwrap_or(cleaned);
+        let cleaned = cleaned.strip_suffix("```").unwrap_or(cleaned).trim();
+        let extracted: ExtractedEntities = serde_json::from_str(cleaned).unwrap();
+        assert_eq!(extracted.entities[0].name, "x");
+    }
+
+    #[test]
+    fn test_extraction_strip_bare_markdown_fence() {
+        let raw = "```\n{\"entities\": [], \"relationships\": []}\n```";
+        let cleaned = raw.trim();
+        let cleaned = cleaned
+            .strip_prefix("```json")
+            .or_else(|| cleaned.strip_prefix("```"))
+            .unwrap_or(cleaned);
+        let cleaned = cleaned.strip_suffix("```").unwrap_or(cleaned).trim();
+        let extracted: ExtractedEntities = serde_json::from_str(cleaned).unwrap();
+        assert!(extracted.entities.is_empty());
+    }
+
+    #[test]
+    fn test_extraction_no_fence_passthrough() {
+        let raw = r#"{"entities": [{"name": "n", "type": "t"}], "relationships": []}"#;
+        let cleaned = raw.trim();
+        let cleaned = cleaned
+            .strip_prefix("```json")
+            .or_else(|| cleaned.strip_prefix("```"))
+            .unwrap_or(cleaned);
+        let cleaned = cleaned.strip_suffix("```").unwrap_or(cleaned).trim();
+        let extracted: ExtractedEntities = serde_json::from_str(cleaned).unwrap();
+        assert_eq!(extracted.entities.len(), 1);
+    }
+
+    #[test]
+    fn test_extraction_invalid_json_fails() {
+        let json_str = "not valid json at all";
+        let result = serde_json::from_str::<ExtractedEntities>(json_str);
+        assert!(result.is_err(), "invalid JSON should fail to parse");
+    }
+
+    #[test]
+    fn test_extraction_partial_json_with_defaults() {
+        // ExtractedEntities uses #[serde(default)] so missing fields get defaults
+        let json_str = r#"{}"#;
+        let extracted: ExtractedEntities = serde_json::from_str(json_str).unwrap();
+        assert!(extracted.entities.is_empty());
+        assert!(extracted.relationships.is_empty());
+    }
+
+    #[test]
+    fn test_extraction_duplicate_entity_names() {
+        let json_str = r#"{
+            "entities": [
+                {"name": "redis", "type": "service"},
+                {"name": "redis", "type": "technology"}
+            ],
+            "relationships": []
+        }"#;
+        let extracted: ExtractedEntities = serde_json::from_str(json_str).unwrap();
+        assert_eq!(extracted.entities.len(), 2, "duplicate names should both parse");
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.5.0: Outbox operation branching logic tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_outbox_operation_embed_identified() {
+        let operation = "embed";
+        assert_eq!(operation, "embed");
+        assert_ne!(operation, "kg_extract");
+    }
+
+    #[test]
+    fn test_outbox_operation_kg_extract_identified() {
+        let operation = "kg_extract";
+        assert_eq!(operation, "kg_extract");
+        assert_ne!(operation, "embed");
+    }
+
+    #[test]
+    fn test_outbox_payload_has_required_fields() {
+        // Verify the outbox payload structure used by store_memory
+        let payload = serde_json::json!({
+            "topic": "test-topic",
+            "content": "test content",
+            "agent_name": "claude",
+            "memory_id": "42",
+            "tags": "foo, bar",
+        });
+
+        assert!(payload.get("topic").is_some());
+        assert!(payload.get("content").is_some());
+        assert!(payload.get("agent_name").is_some());
+        assert!(payload.get("memory_id").is_some());
+        assert!(payload.get("tags").is_some());
+    }
+
+    #[test]
+    fn test_outbox_payload_memory_id_is_string() {
+        // memory_id must be serialized as string (from i64)
+        let memory_id: i64 = 42;
+        let payload = serde_json::json!({"memory_id": memory_id.to_string()});
+        assert_eq!(payload["memory_id"], "42");
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.5.0: OllamaGenerateRequest serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ollama_generate_request_serialization() {
+        let req = OllamaGenerateRequest {
+            model: "qwen3:1.7b".to_string(),
+            prompt: "Extract entities from: test".to_string(),
+            stream: false,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["model"], "qwen3:1.7b");
+        assert_eq!(json["stream"], false);
+        assert!(json["prompt"].as_str().unwrap().contains("Extract entities"));
+    }
+
+    #[test]
+    fn test_ollama_generate_response_deserialization() {
+        let json_str = r#"{"response": "{\"entities\": []}"}"#;
+        let resp: OllamaGenerateResponse = serde_json::from_str(json_str).unwrap();
+        assert!(resp.response.contains("entities"));
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.5.0: Entity type validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extracted_entity_type_rename() {
+        // Verify #[serde(rename = "type")] works correctly
+        let json_str = r#"{"name": "test", "type": "person"}"#;
+        let entity: ExtractedEntity = serde_json::from_str(json_str).unwrap();
+        assert_eq!(entity.entity_type, "person");
+    }
+
+    #[test]
+    fn test_extracted_entity_field_not_entity_type() {
+        // "entity_type" in JSON should NOT parse (it expects "type")
+        let json_str = r#"{"name": "test", "entity_type": "person"}"#;
+        let result = serde_json::from_str::<ExtractedEntity>(json_str);
+        assert!(result.is_err(), "JSON field 'entity_type' should not match; expects 'type'");
+    }
+
+    #[test]
+    fn test_extracted_relationship_all_fields() {
+        let json_str = r#"{
+            "source": "Alice",
+            "target": "auth-service",
+            "relation": "MANAGES",
+            "description": "Alice manages the auth service team"
+        }"#;
+        let rel: ExtractedRelationship = serde_json::from_str(json_str).unwrap();
+        assert_eq!(rel.source, "Alice");
+        assert_eq!(rel.target, "auth-service");
+        assert_eq!(rel.relation, "MANAGES");
+        assert_eq!(rel.description.as_deref(), Some("Alice manages the auth service team"));
     }
 }

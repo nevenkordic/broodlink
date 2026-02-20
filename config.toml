@@ -105,6 +105,11 @@ decay_lambda = 0.01                                # exponential decay rate (hal
 reranker_model = "snowflake-arctic-embed2:137m"    # dedicated reranker model
 reranker_enabled = true                            # set false to disable reranking globally
 max_content_length = 2000                          # truncate content in results (chars, 0 = no limit)
+kg_enabled = true                                  # enable knowledge graph entity extraction
+kg_extraction_model = "qwen3:1.7b"                 # model for entity/relationship extraction
+kg_entity_similarity_threshold = 0.85              # cosine threshold for entity deduplication
+kg_max_hops = 3                                    # max traversal depth for graph_traverse
+kg_extraction_timeout_seconds = 120                # timeout for LLM extraction calls (high for cold model loading)
 
 [agents.claude]
 agent_id           = "claude"

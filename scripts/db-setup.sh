@@ -53,7 +53,8 @@ for migration in \
   009_a2a_gateway \
   010_task_result \
   011_workflow_orchestration \
-  012_memory_fulltext; do
+  012_memory_fulltext \
+  013_knowledge_graph; do
   echo "  Applying ${migration}..."
   PGPASSWORD=$PGPASSWORD psql \
     -h 127.0.0.1 -U broodlink_agent \
@@ -138,7 +139,23 @@ curl -sf -X PUT \
     }
   }' > /dev/null 2>&1 || echo "  (collection already exists or Qdrant not reachable)"
 
-echo "  Qdrant collection ready."
+echo "  broodlink_memory collection ready."
+
+curl -sf -X PUT \
+  http://localhost:6333/collections/broodlink_kg_entities \
+  -H "Content-Type: application/json" \
+  ${QDRANT_AUTH} \
+  -d '{
+    "vectors": {
+      "default": {
+        "size": 768,
+        "distance": "Cosine",
+        "on_disk": true
+      }
+    }
+  }' > /dev/null 2>&1 || echo "  (collection already exists or Qdrant not reachable)"
+
+echo "  broodlink_kg_entities collection ready."
 echo ""
 
 echo "=== Database setup complete ==="

@@ -404,6 +404,13 @@ async fn run_cycle(state: &AppState) -> Result<(), BroodlinkError> {
     }
 
     // -----------------------------------------------------------------------
+    // 5f. Sync unprocessed memories for KG extraction
+    // -----------------------------------------------------------------------
+    if let Err(e) = sync_kg_unprocessed_memories(&state.dolt, &state.pg).await {
+        warn!(error = %e, "kg unprocessed memory sync failed");
+    }
+
+    // -----------------------------------------------------------------------
     // 6. Publish broodlink.<env>.health (NATS)
     // -----------------------------------------------------------------------
     let dolt_ok = sqlx::query("SELECT 1").execute(&state.dolt).await.is_ok();
@@ -984,6 +991,82 @@ async fn sync_memory_search_index(
         {
             warn!(error = %e, topic = %topic, "sync: failed to upsert memory_search_index");
         }
+    }
+
+    Ok(())
+}
+
+/// Sync unprocessed Dolt memories for knowledge graph extraction via outbox.
+async fn sync_kg_unprocessed_memories(
+    dolt: &MySqlPool,
+    pg: &PgPool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Find max memory_id already linked in kg_entity_memories
+    let max_processed: Option<i64> = sqlx::query_as::<_, (Option<i64>,)>(
+        "SELECT MAX(memory_id) FROM kg_entity_memories",
+    )
+    .fetch_one(pg)
+    .await
+    .ok()
+    .and_then(|r| r.0);
+
+    let since_id = max_processed.unwrap_or(0);
+
+    // Fetch Dolt memories with id > max processed
+    let rows = sqlx::query_as::<_, (i64, String, String, String, Option<serde_json::Value>)>(
+        "SELECT id, agent_name, topic, content, tags
+         FROM agent_memory
+         WHERE id > ?
+         ORDER BY id ASC
+         LIMIT 50",
+    )
+    .bind(since_id)
+    .fetch_all(dolt)
+    .await?;
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let mut queued = 0u64;
+    for (id, agent_name, topic, content, tags) in &rows {
+        let tags_str: String = tags
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+
+        let payload = serde_json::json!({
+            "topic": topic,
+            "content": content,
+            "agent_name": agent_name,
+            "memory_id": id.to_string(),
+            "tags": tags_str,
+        });
+
+        let trace_id = Uuid::new_v4().to_string();
+        if let Err(e) = sqlx::query(
+            "INSERT INTO outbox (trace_id, operation, payload, status, created_at)
+             VALUES ($1, 'kg_extract', $2, 'pending', NOW())",
+        )
+        .bind(&trace_id)
+        .bind(&payload)
+        .execute(pg)
+        .await
+        {
+            warn!(error = %e, memory_id = id, "failed to queue kg_extract outbox row");
+        } else {
+            queued += 1;
+        }
+    }
+
+    if queued > 0 {
+        info!(queued = queued, "queued unprocessed memories for kg extraction");
     }
 
     Ok(())
