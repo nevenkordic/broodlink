@@ -94,7 +94,7 @@ check_page "/" "Sidebar nav links" \
   'href="/guardrails/"'
 
 check_page "/" "Version badge" \
-  "v0.5.0"
+  "v0.6.0"
 
 check_page "/" "Logo" \
   "broodlink-logo.svg"
@@ -165,6 +165,22 @@ check_page "/knowledge-graph/" "Knowledge Graph page" \
 echo ""
 
 # -----------------------------------------------------------------------
+# v0.6.0 Control Panel page
+# -----------------------------------------------------------------------
+echo "--- v0.6.0 Pages ---"
+
+check_page "/control/" "Control Panel page" \
+  "Control Panel" \
+  "control.js" \
+  "tab-agents" \
+  "tab-budgets" \
+  "tab-webhooks" \
+  "ctrl-metric-agents" \
+  "ctrl-toast-container"
+
+echo ""
+
+# -----------------------------------------------------------------------
 # v0.3.0 nav
 # -----------------------------------------------------------------------
 echo "--- v0.3.0 Navigation ---"
@@ -174,6 +190,9 @@ check_page "/" "A2A nav link" \
 
 check_page "/" "Knowledge Graph nav link" \
   'href="/knowledge-graph/"'
+
+check_page "/" "Control Panel nav link" \
+  'href="/control/"'
 
 echo ""
 

@@ -26,10 +26,11 @@ After startup, you'll have:
 | URL | What |
 |-----|------|
 | http://localhost:1313 | Dashboard (Hugo) |
+| http://localhost:1313/control/ | Control Panel (admin) |
 | http://localhost:3310/health | beads-bridge API |
 | http://localhost:3312/api/v1/health | status-api |
 | http://localhost:3311/health | MCP server |
-| http://localhost:3313/health | A2A gateway |
+| http://localhost:3313/health | A2A gateway + webhook gateway |
 
 ## Architecture
 
@@ -37,7 +38,7 @@ After startup, you'll have:
                     Agents (Claude, Qwen, custom bots, ...)
                             │
                     ┌───────▼───────┐
-                    │ beads-bridge  │ :3310  Tool API (66 tools)
+                    │ beads-bridge  │ :3310  Tool API (75 tools)
                     │               │   JWT RS256 + Rate Limiting
                     └──┬────┬───┬──┘
                        │    │   │
@@ -74,31 +75,34 @@ After startup, you'll have:
 
 ### Data Flow
 
-1. **Tool calls** -- Agent sends POST to `/api/v1/tool/<name>` -- beads-bridge validates JWT, checks rate limits and guardrails, writes audit log, dispatches to Dolt or Postgres
-2. **Memory + embeddings + search** -- `store_memory` inserts to Dolt + Postgres full-text index + outbox row -- embedding-worker polls outbox every 2s -- Ollama generates vector -- Qdrant upsert -- extracts entities/relationships via LLM and stores in knowledge graph (Postgres `kg_entities`/`kg_edges` + Qdrant `broodlink_kg_entities`) -- `hybrid_search` fuses BM25 (Postgres tsvector) + vector (Qdrant) with temporal decay and optional reranking -- `graph_search`/`graph_traverse` query the knowledge graph -- graceful degradation to BM25-only or vector-only if a backend is down
-3. **Task routing** -- `create_task` writes to Postgres + publishes NATS -- coordinator scores all eligible agents (success rate, load, cost, recency) -- claims atomically -- dispatches to winning agent
-4. **Workflow orchestration** -- `start_workflow` creates a `workflow_runs` row + publishes NATS -- coordinator loads formula TOML, creates step tasks sequentially -- completing a step auto-creates the next with accumulated results -- all step results collected in `step_results` JSONB
-5. **Heartbeat cycle** (every 5 min) -- Dolt commit, Beads issue sync, agent metrics computation, daily summary generation, stale agent deactivation, memory search index sync (Dolt → Postgres), knowledge graph backfill for unprocessed memories
+1. **Tool calls** -- Agent sends POST to `/api/v1/tool/<name>` -- beads-bridge validates JWT (kid-based multi-key), checks rate limits, guardrails, and budget, writes audit log, dispatches to Dolt or Postgres
+2. **Memory + embeddings + search** -- `store_memory` inserts to Dolt + Postgres full-text index + outbox row -- embedding-worker polls outbox every 2s -- Ollama generates vector -- Qdrant upsert -- extracts entities/relationships via LLM and stores in knowledge graph (Postgres `kg_entities`/`kg_edges` + Qdrant `broodlink_kg_entities`) -- `hybrid_search` fuses BM25 (Postgres tsvector) + vector (Qdrant) with temporal decay and optional reranking -- `graph_search`/`graph_traverse` query the knowledge graph -- graceful degradation to BM25-only or vector-only if a backend is down -- `delete_memory` cleans up Dolt, Postgres, and Qdrant vectors
+3. **Task routing** -- `create_task` writes to Postgres + publishes NATS -- coordinator scores all eligible agents (success rate, load, cost, recency) -- claims atomically -- dispatches to winning agent -- failed tasks land in dead-letter queue with auto-retry (exponential backoff)
+4. **Workflow orchestration** -- `start_workflow` creates a `workflow_runs` row + publishes NATS -- coordinator loads formula TOML -- supports conditional steps (`when` expressions), per-step retries, parallel step groups, step timeouts, and `on_failure` error handlers -- all step results collected in `step_results` JSONB
+5. **Multi-agent collaboration** -- `decompose_task` splits work into sub-tasks with merge strategies (concatenate, vote, best) -- `create_workspace` + `workspace_read`/`workspace_write` for shared context -- coordinator tracks child completions and auto-merges results
+6. **Budget enforcement** -- `check_budget` middleware deducts tokens per tool call -- `set_budget`/`get_budget` tools for management -- daily replenishment via heartbeat -- `BudgetExhausted` error (402) blocks calls when depleted
+7. **Webhook gateway** -- a2a-gateway receives Slack slash commands, Teams bot messages, Telegram updates -- parses `/broodlink <command>` into tool calls -- outbound notifications for agent.offline, task.failed, budget.low, workflow events, guardrail violations
+8. **Heartbeat cycle** (every 5 min) -- Dolt commit, Beads issue sync, agent metrics computation, daily summary generation, stale agent deactivation, memory search index sync (Dolt → Postgres), knowledge graph backfill, KG entity/edge expiry with weight decay, daily budget replenishment
 
 ### Databases
 
 | Database | Port | Purpose |
 |----------|------|---------|
 | **Dolt** (MySQL wire protocol) | 3307 | Versioned brain: agent_memory, decisions, agent_profiles, projects, skills, beads_issues, daily_summary |
-| **PostgreSQL** | 5432 | Hot paths: task_queue, messages, work_log, audit_log, outbox, residency_log, approval_policies, approval_gates, agent_metrics, delegations, streams, guardrail_policies, guardrail_violations, a2a_task_map, workflow_runs, memory_search_index (BM25 full-text), kg_entities, kg_edges, kg_entity_memories |
+| **PostgreSQL** | 5432 | Hot paths: task_queue, messages, work_log, audit_log, outbox, residency_log, approval_policies, approval_gates, agent_metrics, delegations, streams, guardrail_policies, guardrail_violations, a2a_task_map, workflow_runs, memory_search_index (BM25 full-text), kg_entities, kg_edges, kg_entity_memories, budget_transactions, tool_cost_map, dead_letter_queue, task_decompositions, shared_workspaces, webhook_endpoints, webhook_log |
 | **Qdrant** | 6333 | Semantic vector search: `broodlink_memory` (768-dim nomic-embed-text) for hybrid_search, `broodlink_kg_entities` (768-dim) for knowledge graph entity similarity |
 
 ## Services
 
 | Service | Port | Transport | Purpose |
 |---------|------|-----------|---------|
-| beads-bridge | 3310 | HTTP + NATS | Universal tool API (66 tools), JWT RS256 auth, rate limiting, circuit breakers, SSE streaming |
-| coordinator | -- | NATS only | Smart task routing with weighted scoring, atomic claiming, exponential backoff, dead-letter queue, sequential workflow orchestration |
-| heartbeat | -- | NATS + DB | 5-min sync cycle: Dolt commit, Beads sync, agent metrics, daily summary, stale agent deactivation |
+| beads-bridge | 3310 | HTTP + NATS | Universal tool API (75 tools), JWT RS256 auth with kid-based multi-key validation, rate limiting, budget enforcement, circuit breakers, JWKS endpoint, SSE streaming |
+| coordinator | -- | NATS only | Smart task routing with weighted scoring, atomic claiming, exponential backoff, dead-letter queue with auto-retry, workflow orchestration with conditional steps, parallel groups, per-step retries, timeouts, and error handlers, multi-agent task decomposition |
+| heartbeat | -- | NATS + DB | 5-min sync cycle: Dolt commit, Beads sync, agent metrics, daily summary, stale agent deactivation, KG entity/edge expiry with weight decay, daily budget replenishment |
 | embedding-worker | -- | NATS + DB | Outbox poll -- Ollama `nomic-embed-text` embeddings -- Qdrant upsert -- LLM entity extraction for knowledge graph, circuit breakers |
-| status-api | 3312 | HTTP | Dashboard API with API key auth, CORS, and SSE stream proxy |
+| status-api | 3312 | HTTP | Dashboard API with API key auth, CORS, SSE stream proxy, and control panel endpoints (agent toggle, budget set, task cancel, webhook CRUD, guardrails, DLQ) |
 | mcp-server | 3311 | HTTP + stdio | MCP protocol server (streamable HTTP + legacy stdio), proxies bridge tools |
-| a2a-gateway | 3313 | HTTP | Google A2A protocol gateway, AgentCard discovery, cross-system task delegation |
+| a2a-gateway | 3313 | HTTP | Google A2A protocol gateway, AgentCard discovery, cross-system task delegation, webhook gateway for Slack/Teams/Telegram with inbound command parsing and outbound event notifications |
 
 ### Shared Crates
 
@@ -129,12 +133,13 @@ All configuration lives in `config.toml`. Every field can be overridden with env
 ## Testing
 
 ```bash
-cargo test --workspace                    # 196 unit tests
-bash tests/run-all.sh                     # 17 integration test suites
+cargo test --workspace                    # 204 unit tests
+bash tests/run-all.sh                     # 19 integration test suites (627 total assertions)
 bash tests/e2e.sh                         # 95 end-to-end tests (requires running services)
+bash tests/v060-regression.sh             # 105 v0.6.0 regression tests
 ```
 
-The E2E suite covers: service health, JWT/API key auth, all tool categories, status API endpoints, background service verification, SSE streaming, NATS integration, error handling, database round-trips, semantic search, hybrid memory search, and knowledge graph tools.
+The E2E suite covers: service health, JWT/API key auth, all tool categories, status API endpoints, background service verification, SSE streaming, NATS integration, error handling, database round-trips, semantic search, hybrid memory search, and knowledge graph tools. The v0.6.0 regression suite covers: budget enforcement, DLQ tooling, OTLP telemetry, KG expiry, JWT rotation, workflow branching, dashboard control panel, multi-agent collaboration, and webhooks.
 
 ## Prerequisites
 
@@ -157,7 +162,8 @@ The E2E suite covers: service health, JWT/API key auth, all tool categories, sta
 | `scripts/start-services.sh` | Start/stop all 7 Rust services + Hugo (`--stop` to stop) |
 | `scripts/build.sh` | cargo deny + tests + release build + Hugo |
 | `scripts/secrets-init.sh` | Generate JWT keypair, create `.secrets/env`, scaffold `secrets.skeleton.json` |
-| `scripts/db-setup.sh` | Create databases, run all 15 migrations, create Qdrant collections |
+| `scripts/db-setup.sh` | Create databases, run all 20 migrations, create Qdrant collections |
+| `scripts/rotate-jwt-keys.sh` | Generate new JWT keypair with kid fingerprint, retire old keys after grace period |
 | `scripts/backfill-search-index.sh` | One-time backfill of Postgres memory_search_index from Dolt agent_memory |
 | `scripts/backfill-knowledge-graph.sh` | One-time backfill of knowledge graph entities from existing memories |
 | `scripts/onboard-agent.sh` | Register an agent: generate JWT, insert profile, create system prompt |
@@ -175,17 +181,17 @@ broodlink/
 │   ├── broodlink-telemetry/      # OpenTelemetry + OTLP export
 │   └── broodlink-runtime/        # CircuitBreaker, shutdown_signal, connect_nats
 ├── rust/
-│   ├── beads-bridge/             # Universal tool API (66 tools)
+│   ├── beads-bridge/             # Universal tool API (75 tools)
 │   ├── coordinator/              # NATS task routing + workflow orchestration
 │   ├── heartbeat/                # Periodic sync + health checks
 │   ├── embedding-worker/         # Outbox → Ollama → Qdrant pipeline + KG entity extraction
-│   ├── status-api/               # Read-only dashboard API
+│   ├── status-api/               # Dashboard API + control panel endpoints
 │   ├── mcp-server/               # MCP protocol server
-│   └── a2a-gateway/              # A2A protocol gateway
+│   └── a2a-gateway/              # A2A protocol gateway + webhook gateway
 ├── agents/                       # Python agent SDK (any OpenAI-compatible LLM)
 ├── status-site/                  # Hugo dashboard (WCAG 2.1 AA)
 │   └── themes/broodlink-status/
-├── migrations/                   # SQL migrations (15 files, additive only)
+├── migrations/                   # SQL migrations (20 files, additive only)
 │   ├── 001_dolt_brain.sql
 │   ├── 002_postgres_hotpaths.sql
 │   ├── 003_postgres_functions.sql
@@ -200,7 +206,12 @@ broodlink/
 │   ├── 010_task_result.sql
 │   ├── 011_workflow_orchestration.sql
 │   ├── 012_memory_fulltext.sql
-│   └── 013_knowledge_graph.sql
+│   ├── 013_knowledge_graph.sql
+│   ├── 014_budget_enforcement.sql
+│   ├── 015_dead_letter_queue.sql
+│   ├── 016_workflow_branching.sql
+│   ├── 017_multi_agent_collab.sql
+│   └── 018_webhooks.sql
 ├── tests/                        # Integration + E2E test suites
 ├── templates/                    # System prompt template for agent onboarding
 ├── scripts/                      # Build, setup, onboarding, and dev scripts
@@ -226,8 +237,9 @@ Located in `.beads/formulas/`:
 
 ## External Integrations
 
-- **MCP**: Agents connect via the mcp-server, which proxies all 66 bridge tools over MCP protocol (streamable HTTP or stdio transport) with JWT authentication
+- **MCP**: Agents connect via the mcp-server, which proxies all 75 bridge tools over MCP protocol (streamable HTTP or stdio transport) with JWT authentication
 - **A2A**: The a2a-gateway implements Google's Agent-to-Agent protocol -- exposes an AgentCard at `/.well-known/agent.json`, accepts task delegation from external A2A-compatible agents, and bridges them to internal Broodlink tasks
+- **Webhooks**: The a2a-gateway also serves as a webhook gateway -- receives Slack slash commands (`/broodlink agents`), Teams bot messages, and Telegram bot updates -- parses commands into bridge tool calls -- sends outbound notifications (agent.offline, task.failed, budget.low, workflow events, guardrail violations) to configured webhook endpoints
 
 ## License
 
