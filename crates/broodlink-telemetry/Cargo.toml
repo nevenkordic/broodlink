@@ -14,6 +14,7 @@ opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 thiserror = { workspace = true }
+http = "1"
 
 [dev-dependencies]
 toml = "0.8"

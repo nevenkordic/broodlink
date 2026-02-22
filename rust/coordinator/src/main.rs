@@ -148,6 +148,8 @@ struct TaskFailedPayload {
     task_id: String,
     #[allow(dead_code)]
     agent_id: String,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 /// Metrics payload published to `broodlink.metrics.coordinator`.
@@ -554,6 +556,28 @@ async fn publish_dead_letter(
     .execute(&state.pg)
     .await;
 
+    // Persist to dead_letter_queue for inspection and auto-retry
+    let max_retries = state.config.dlq.max_retries as i32;
+    let backoff_ms = state.config.dlq.backoff_base_ms as i64;
+    let next_retry = if state.config.dlq.auto_retry_enabled {
+        // First retry after backoff_base_ms
+        Some(chrono::Utc::now() + chrono::Duration::milliseconds(backoff_ms))
+    } else {
+        None
+    };
+
+    let _ = sqlx::query(
+        "INSERT INTO dead_letter_queue (task_id, reason, source_service, max_retries, next_retry_at)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(task_id)
+    .bind(reason)
+    .bind(SERVICE_NAME)
+    .bind(max_retries)
+    .bind(next_retry)
+    .execute(&state.pg)
+    .await;
+
     Ok(())
 }
 
@@ -567,6 +591,8 @@ struct FormulaFile {
     formula: FormulaMetadata,
     #[serde(default)]
     steps: Vec<FormulaStep>,
+    #[serde(default)]
+    on_failure: Option<FormulaStep>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -591,6 +617,17 @@ struct FormulaStep {
     #[serde(default)]
     input: Option<FormulaInput>,
     output: String,
+    // v0.6.0: Workflow branching
+    #[serde(default)]
+    when: Option<String>,
+    #[serde(default)]
+    retries: Option<u32>,
+    #[serde(default)]
+    backoff: Option<String>,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+    #[serde(default)]
+    group: Option<u32>,
 }
 
 /// A step's input can be a single key or multiple keys.
@@ -637,6 +674,58 @@ fn render_prompt(template: &str, params: &serde_json::Value) -> String {
         }
     }
     result
+}
+
+/// Evaluate a simple condition expression against step_results.
+/// Supports: `key.count > N`, `key.count < N`, `key == "value"`, `key.exists`
+fn evaluate_condition(expr: &str, step_results: &serde_json::Value) -> bool {
+    let expr = expr.trim();
+
+    // key.exists
+    if let Some(key) = expr.strip_suffix(".exists") {
+        return step_results.get(key).is_some();
+    }
+
+    // key.count > N  or  key.count < N
+    if let Some((left, right)) = expr.split_once('>') {
+        let left = left.trim();
+        if let Some(key) = left.strip_suffix(".count") {
+            let key = key.trim();
+            if let Ok(n) = right.trim().parse::<usize>() {
+                return step_results
+                    .get(key)
+                    .and_then(|v| v.as_array())
+                    .map_or(false, |arr| arr.len() > n);
+            }
+        }
+    }
+
+    if let Some((left, right)) = expr.split_once('<') {
+        let left = left.trim();
+        if let Some(key) = left.strip_suffix(".count") {
+            let key = key.trim();
+            if let Ok(n) = right.trim().parse::<usize>() {
+                return step_results
+                    .get(key)
+                    .and_then(|v| v.as_array())
+                    .map_or(false, |arr| arr.len() < n);
+            }
+        }
+    }
+
+    // key == "value"
+    if let Some((left, right)) = expr.split_once("==") {
+        let key = left.trim();
+        let val = right.trim().trim_matches('"');
+        return step_results
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map_or(false, |s| s == val);
+    }
+
+    // Default: true (unknown conditions don't block)
+    warn!(condition = %expr, "unknown condition expression, defaulting to true");
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -721,9 +810,14 @@ async fn create_step_task(
         step.name,
     );
 
+    // Calculate timeout_at if step has timeout_seconds
+    let timeout_at: Option<chrono::DateTime<chrono::Utc>> = step
+        .timeout_seconds
+        .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64));
+
     sqlx::query(
-        "INSERT INTO task_queue (id, trace_id, title, description, status, priority, formula_name, convoy_id, workflow_run_id, step_index, step_name, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'pending', 5, $5, $6, $7, $8, $9, NOW(), NOW())",
+        "INSERT INTO task_queue (id, trace_id, title, description, status, priority, formula_name, convoy_id, workflow_run_id, step_index, step_name, timeout_at, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'pending', 5, $5, $6, $7, $8, $9, $10, NOW(), NOW())",
     )
     .bind(&task_id)
     .bind(&trace_id)
@@ -734,6 +828,7 @@ async fn create_step_task(
     .bind(workflow_id)
     .bind(step_index as i32)
     .bind(&step.name)
+    .bind(timeout_at)
     .execute(&state.pg)
     .await?;
 
@@ -843,10 +938,39 @@ async fn handle_task_completed(
         }
     }
 
-    let next_step = step_index + 1;
+    // Check if this step was part of a parallel group
+    let current_group = step_def.group;
+    if current_group.is_some() {
+        // Decrement parallel_pending counter
+        sqlx::query(
+            "UPDATE workflow_runs SET parallel_pending = parallel_pending - 1, step_results = $1, updated_at = NOW()
+             WHERE id = $2",
+        )
+        .bind(&step_results)
+        .bind(&workflow_run_id)
+        .execute(&state.pg)
+        .await?;
 
-    if next_step < total_steps as usize {
-        // Update step_results and create next step
+        // Check if more parallel tasks pending
+        let pending: i32 = sqlx::query_as::<_, (i32,)>(
+            "SELECT parallel_pending FROM workflow_runs WHERE id = $1",
+        )
+        .bind(&workflow_run_id)
+        .fetch_one(&state.pg)
+        .await?
+        .0;
+
+        if pending > 0 {
+            info!(
+                workflow_id = %workflow_run_id,
+                remaining = pending,
+                "parallel step completed, waiting for others"
+            );
+            return Ok(());
+        }
+        // All parallel steps done — fall through to advance
+    } else {
+        // Sequential step — just update step_results
         sqlx::query(
             "UPDATE workflow_runs SET step_results = $1, updated_at = NOW()
              WHERE id = $2",
@@ -855,18 +979,100 @@ async fn handle_task_completed(
         .bind(&workflow_run_id)
         .execute(&state.pg)
         .await?;
+    }
 
-        create_step_task(
-            state,
-            &workflow_run_id,
-            &convoy_id,
-            &formula_name,
-            &formula,
-            next_step,
-            &params,
-            &step_results,
-        )
-        .await?;
+    // Find the next step(s) to execute
+    let next_step = step_index + 1;
+
+    // Skip ahead past any steps in the same group (they ran in parallel)
+    let mut advance_to = next_step;
+    if let Some(grp) = current_group {
+        while advance_to < formula.steps.len() {
+            if formula.steps[advance_to].group == Some(grp) {
+                advance_to += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    if advance_to < total_steps as usize {
+        // Check if next step(s) form a parallel group
+        let next_def = &formula.steps[advance_to];
+        let next_group = next_def.group;
+
+        if let Some(grp) = next_group {
+            // Collect all steps in this parallel group
+            let group_steps: Vec<usize> = (advance_to..formula.steps.len())
+                .take_while(|&i| formula.steps[i].group == Some(grp))
+                .collect();
+
+            let group_size = group_steps.len() as i32;
+
+            // Set parallel_pending counter
+            sqlx::query(
+                "UPDATE workflow_runs SET parallel_pending = $1, updated_at = NOW()
+                 WHERE id = $2",
+            )
+            .bind(group_size)
+            .bind(&workflow_run_id)
+            .execute(&state.pg)
+            .await?;
+
+            // Create all parallel tasks
+            for &si in &group_steps {
+                let step = &formula.steps[si];
+                // Evaluate conditional
+                if let Some(ref cond) = step.when {
+                    if !evaluate_condition(cond, &step_results) {
+                        info!(step = %step.name, condition = %cond, "skipping step (condition false)");
+                        // Decrement pending since we're skipping
+                        sqlx::query(
+                            "UPDATE workflow_runs SET parallel_pending = parallel_pending - 1 WHERE id = $1",
+                        )
+                        .bind(&workflow_run_id)
+                        .execute(&state.pg)
+                        .await?;
+                        continue;
+                    }
+                }
+                create_step_task(
+                    state, &workflow_run_id, &convoy_id, &formula_name,
+                    &formula, si, &params, &step_results,
+                ).await?;
+            }
+        } else {
+            // Sequential step — evaluate condition
+            if let Some(ref cond) = next_def.when {
+                if !evaluate_condition(cond, &step_results) {
+                    info!(step = %next_def.name, condition = %cond, "skipping step (condition false)");
+                    // Skip to step after this one by recursively handling as if this step completed
+                    // We do this by advancing step_results and trying the next step
+                    let skip_step = advance_to + 1;
+                    if skip_step < total_steps as usize {
+                        create_step_task(
+                            state, &workflow_run_id, &convoy_id, &formula_name,
+                            &formula, skip_step, &params, &step_results,
+                        ).await?;
+                    } else {
+                        // All remaining steps skipped — complete workflow
+                        sqlx::query(
+                            "UPDATE workflow_runs SET status = 'completed', step_results = $1, completed_at = NOW(), updated_at = NOW()
+                             WHERE id = $2",
+                        )
+                        .bind(&step_results)
+                        .bind(&workflow_run_id)
+                        .execute(&state.pg)
+                        .await?;
+                    }
+                    return Ok(());
+                }
+            }
+            create_step_task(
+                state, &workflow_run_id, &convoy_id, &formula_name,
+                &formula, advance_to, &params, &step_results,
+            ).await?;
+        }
     } else {
         // All steps done — mark workflow as completed
         sqlx::query(
@@ -910,20 +1116,163 @@ async fn handle_task_failed(
 ) -> Result<(), BroodlinkError> {
     // Check if this task belongs to a workflow
     let row = sqlx::query(
-        "SELECT workflow_run_id FROM task_queue WHERE id = $1",
+        "SELECT workflow_run_id, step_index, step_name, retry_count
+         FROM task_queue WHERE id = $1",
     )
     .bind(&payload.task_id)
     .fetch_optional(&state.pg)
     .await?;
 
-    let workflow_run_id: Option<String> = row
-        .and_then(|r| r.get("workflow_run_id"));
+    let row = match row {
+        Some(r) => r,
+        None => return Ok(()),
+    };
 
+    let workflow_run_id: Option<String> = row.get("workflow_run_id");
     let workflow_run_id = match workflow_run_id {
         Some(id) => id,
         None => return Ok(()), // not a workflow task, ignore
     };
 
+    let step_index: i32 = row.get::<Option<i32>, _>("step_index").unwrap_or(0);
+    let retry_count: i32 = row.get::<Option<i32>, _>("retry_count").unwrap_or(0);
+
+    // Load formula to check step-level retry config
+    let wf_row = sqlx::query(
+        "SELECT formula_name, convoy_id, params, step_results
+         FROM workflow_runs WHERE id = $1",
+    )
+    .bind(&workflow_run_id)
+    .fetch_optional(&state.pg)
+    .await?;
+
+    let wf_row = match wf_row {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+
+    let formula_name: String = wf_row.get("formula_name");
+    let convoy_id: String = wf_row.get("convoy_id");
+    let params: serde_json::Value = wf_row.get("params");
+    let step_results: serde_json::Value = wf_row.get("step_results");
+
+    let formula = load_formula(&state.config, &formula_name)?;
+    let step_def = formula.steps.get(step_index as usize);
+
+    // Check if step has retries configured
+    if let Some(step) = step_def {
+        let max_retries = step.retries.unwrap_or(0) as i32;
+        if retry_count < max_retries {
+            let new_count = retry_count + 1;
+            let backoff_ms = match step.backoff.as_deref() {
+                Some("exponential") => 1000i64 * 2i64.pow(new_count as u32),
+                _ => 1000,
+            };
+
+            info!(
+                task_id = %payload.task_id,
+                workflow_id = %workflow_run_id,
+                step = %step.name,
+                retry = new_count,
+                max = max_retries,
+                "retrying workflow step"
+            );
+
+            // Reset task to pending with incremented retry_count
+            sqlx::query(
+                "UPDATE task_queue SET status = 'pending', retry_count = $1, updated_at = NOW()
+                 WHERE id = $2",
+            )
+            .bind(new_count)
+            .bind(&payload.task_id)
+            .execute(&state.pg)
+            .await?;
+
+            // Schedule retry after backoff
+            tokio::time::sleep(Duration::from_millis(backoff_ms as u64)).await;
+
+            // Re-publish task_available
+            let subject = format!(
+                "{}.{}.coordinator.task_available",
+                state.config.nats.subject_prefix, state.config.broodlink.env,
+            );
+            let nats_payload = serde_json::json!({
+                "task_id": payload.task_id,
+                "role": step.agent_role,
+                "retry": true,
+                "retry_count": new_count,
+            });
+            if let Ok(bytes) = serde_json::to_vec(&nats_payload) {
+                let _ = state.nats.publish(subject, bytes.into()).await;
+            }
+
+            return Ok(());
+        }
+    }
+
+    // Retries exhausted — check for on_failure handler
+    if let Some(ref error_handler) = formula.on_failure {
+        warn!(
+            task_id = %payload.task_id,
+            workflow_id = %workflow_run_id,
+            "step retries exhausted, invoking on_failure handler"
+        );
+
+        // Create the error handler task
+        let handler_task_id = Uuid::new_v4().to_string();
+        let handler_trace_id = Uuid::new_v4().to_string();
+        let error_context = serde_json::json!({
+            "failed_task_id": payload.task_id,
+            "failed_step": step_def.map(|s| s.name.as_str()).unwrap_or("unknown"),
+            "error": payload.error.as_deref().unwrap_or("unknown"),
+            "step_results": step_results,
+        });
+
+        let mut rendered = render_prompt(&error_handler.prompt, &params);
+        rendered.push_str(&format!("\n\n--- Error context ---\n{error_context}"));
+
+        sqlx::query(
+            "INSERT INTO task_queue (id, trace_id, title, description, status, priority, formula_name, convoy_id, workflow_run_id, step_name, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, 'pending', 10, $5, $6, $7, $8, NOW(), NOW())",
+        )
+        .bind(&handler_task_id)
+        .bind(&handler_trace_id)
+        .bind(format!("[error-handler] {} — {}", formula_name, error_handler.name))
+        .bind(&rendered)
+        .bind(&formula_name)
+        .bind(&convoy_id)
+        .bind(&workflow_run_id)
+        .bind(&error_handler.name)
+        .execute(&state.pg)
+        .await?;
+
+        // Track error handler in workflow_runs
+        sqlx::query(
+            "UPDATE workflow_runs SET error_handler_task_id = $1, updated_at = NOW()
+             WHERE id = $2",
+        )
+        .bind(&handler_task_id)
+        .bind(&workflow_run_id)
+        .execute(&state.pg)
+        .await?;
+
+        // Publish for routing
+        let subject = format!(
+            "{}.{}.coordinator.task_available",
+            state.config.nats.subject_prefix, state.config.broodlink.env,
+        );
+        let nats_payload = serde_json::json!({
+            "task_id": handler_task_id,
+            "role": error_handler.agent_role,
+        });
+        if let Ok(bytes) = serde_json::to_vec(&nats_payload) {
+            let _ = state.nats.publish(subject, bytes.into()).await;
+        }
+
+        return Ok(());
+    }
+
+    // No retries, no error handler — mark workflow as failed
     warn!(
         task_id = %payload.task_id,
         workflow_id = %workflow_run_id,
@@ -1517,6 +1866,126 @@ async fn metrics_loop(state: Arc<AppState>, mut shutdown_rx: watch::Receiver<boo
 }
 
 // ---------------------------------------------------------------------------
+// DLQ auto-retry loop
+// ---------------------------------------------------------------------------
+
+async fn dlq_retry_loop(state: Arc<AppState>, mut shutdown_rx: watch::Receiver<bool>) {
+    if !state.config.dlq.auto_retry_enabled {
+        info!("DLQ auto-retry disabled");
+        return;
+    }
+
+    let check_secs = state.config.dlq.check_interval_secs;
+    let mut interval = tokio::time::interval(Duration::from_secs(check_secs));
+
+    info!(interval_secs = check_secs, "DLQ retry loop started");
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                match check_dlq_retries(&state).await {
+                    Ok(retried) => {
+                        if retried > 0 {
+                            info!(retried = retried, "DLQ entries retried");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "DLQ retry check failed");
+                    }
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                info!("shutdown signal, stopping DLQ retry loop");
+                break;
+            }
+        }
+    }
+}
+
+async fn check_dlq_retries(state: &AppState) -> Result<u64, BroodlinkError> {
+    // Find DLQ entries eligible for retry: unresolved, retry_count < max_retries, next_retry_at <= now
+    let entries: Vec<(i64, String, i32, i32)> = sqlx::query_as(
+        "SELECT id, task_id, retry_count, max_retries
+         FROM dead_letter_queue
+         WHERE resolved = FALSE
+           AND retry_count < max_retries
+           AND next_retry_at <= NOW()
+         ORDER BY next_retry_at ASC
+         LIMIT 10",
+    )
+    .fetch_all(&state.pg)
+    .await?;
+
+    let mut retried = 0u64;
+
+    for (dlq_id, task_id, retry_count, max_retries) in &entries {
+        let new_count = retry_count + 1;
+
+        // Reset task to 'pending' for re-routing
+        let updated = sqlx::query(
+            "UPDATE task_queue SET status = 'pending', retry_count = $1, updated_at = NOW()
+             WHERE id = $2 AND status = 'failed'",
+        )
+        .bind(new_count)
+        .bind(task_id)
+        .execute(&state.pg)
+        .await?;
+
+        if updated.rows_affected() == 0 {
+            // Task no longer in 'failed' state — mark DLQ entry resolved
+            let _ = sqlx::query(
+                "UPDATE dead_letter_queue SET resolved = TRUE, resolved_by = 'auto-skip', updated_at = NOW()
+                 WHERE id = $1",
+            )
+            .bind(dlq_id)
+            .execute(&state.pg)
+            .await;
+            continue;
+        }
+
+        // Calculate next retry with exponential backoff
+        let backoff_ms = state.config.dlq.backoff_base_ms as i64 * 2i64.pow(new_count as u32);
+        let next_retry = if new_count < *max_retries {
+            Some(chrono::Utc::now() + chrono::Duration::milliseconds(backoff_ms))
+        } else {
+            None // No more retries
+        };
+
+        // Update DLQ entry
+        let _ = sqlx::query(
+            "UPDATE dead_letter_queue SET retry_count = $1, next_retry_at = $2, updated_at = NOW()
+             WHERE id = $3",
+        )
+        .bind(new_count)
+        .bind(next_retry)
+        .bind(dlq_id)
+        .execute(&state.pg)
+        .await;
+
+        // Publish task_available event for re-routing
+        let subject = format!(
+            "{}.{}.coordinator.task_available",
+            state.config.nats.subject_prefix, state.config.broodlink.env,
+        );
+        let nats_payload = serde_json::json!({
+            "task_id": task_id,
+            "retry": true,
+            "retry_count": new_count,
+        });
+        if let Ok(bytes) = serde_json::to_vec(&nats_payload) {
+            if let Err(e) = state.nats.publish(subject, bytes.into()).await {
+                warn!(error = %e, task_id = %task_id, "failed to publish retry event");
+            }
+        }
+
+        info!(task_id = %task_id, retry = new_count, max = max_retries, "DLQ task retried");
+        retried += 1;
+    }
+
+    Ok(retried)
+}
+
+// ---------------------------------------------------------------------------
 // Initialization
 // ---------------------------------------------------------------------------
 
@@ -1665,6 +2134,13 @@ async fn main() {
         metrics_loop(metrics_state, metrics_shutdown).await;
     });
 
+    // Spawn the DLQ auto-retry loop
+    let dlq_state = Arc::clone(&state);
+    let dlq_shutdown = shutdown_rx.clone();
+    let dlq_handle = tokio::spawn(async move {
+        dlq_retry_loop(dlq_state, dlq_shutdown).await;
+    });
+
     // Wait for shutdown signal
     shutdown_signal().await;
 
@@ -1681,6 +2157,7 @@ async fn main() {
         let _ = task_completed_handle.await;
         let _ = task_failed_handle.await;
         let _ = metrics_handle.await;
+        let _ = dlq_handle.await;
     })
     .await;
 

@@ -61,6 +61,17 @@ pub struct Config {
     // --- v0.4.0 additions ---
     #[serde(default)]
     pub memory_search: MemorySearchConfig,
+    // --- v0.6.0 additions ---
+    #[serde(default)]
+    pub jwt: JwtConfig,
+    #[serde(default)]
+    pub budget: BudgetConfig,
+    #[serde(default)]
+    pub dlq: DlqConfig,
+    #[serde(default)]
+    pub collaboration: CollaborationConfig,
+    #[serde(default)]
+    pub webhooks: WebhookConfig,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -476,6 +487,15 @@ pub struct MemorySearchConfig {
     pub kg_max_hops: u32,
     #[serde(default = "default_kg_extraction_timeout_seconds")]
     pub kg_extraction_timeout_seconds: u64,
+    // v0.6.0: Knowledge graph expiry
+    #[serde(default = "default_kg_entity_ttl_days")]
+    pub kg_entity_ttl_days: u32,
+    #[serde(default = "default_kg_edge_decay_rate")]
+    pub kg_edge_decay_rate: f64,
+    #[serde(default = "default_kg_cleanup_interval_hours")]
+    pub kg_cleanup_interval_hours: u32,
+    #[serde(default = "default_kg_min_mention_count")]
+    pub kg_min_mention_count: u32,
 }
 
 impl Default for MemorySearchConfig {
@@ -490,6 +510,10 @@ impl Default for MemorySearchConfig {
             kg_entity_similarity_threshold: default_kg_entity_similarity_threshold(),
             kg_max_hops: default_kg_max_hops(),
             kg_extraction_timeout_seconds: default_kg_extraction_timeout_seconds(),
+            kg_entity_ttl_days: default_kg_entity_ttl_days(),
+            kg_edge_decay_rate: default_kg_edge_decay_rate(),
+            kg_cleanup_interval_hours: default_kg_cleanup_interval_hours(),
+            kg_min_mention_count: default_kg_min_mention_count(),
         }
     }
 }
@@ -528,6 +552,204 @@ fn default_kg_max_hops() -> u32 {
 
 fn default_kg_extraction_timeout_seconds() -> u64 {
     120
+}
+
+// --- v0.6.0: JWT key rotation ---
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct JwtConfig {
+    #[serde(default = "default_jwt_keys_dir")]
+    pub keys_dir: String,
+    #[serde(default = "default_jwt_grace_period_hours")]
+    pub grace_period_hours: u32,
+}
+
+impl Default for JwtConfig {
+    fn default() -> Self {
+        Self {
+            keys_dir: default_jwt_keys_dir(),
+            grace_period_hours: default_jwt_grace_period_hours(),
+        }
+    }
+}
+
+fn default_jwt_keys_dir() -> String {
+    "~/.broodlink".to_string()
+}
+
+fn default_jwt_grace_period_hours() -> u32 {
+    24
+}
+
+// --- v0.6.0: Agent budget enforcement ---
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct BudgetConfig {
+    #[serde(default = "default_budget_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_daily_replenishment")]
+    pub daily_replenishment: i64,
+    #[serde(default = "default_replenish_hour_utc")]
+    pub replenish_hour_utc: u32,
+    #[serde(default = "default_low_budget_threshold")]
+    pub low_budget_threshold: i64,
+    #[serde(default = "default_tool_cost")]
+    pub default_tool_cost: i64,
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_budget_enabled(),
+            daily_replenishment: default_daily_replenishment(),
+            replenish_hour_utc: default_replenish_hour_utc(),
+            low_budget_threshold: default_low_budget_threshold(),
+            default_tool_cost: default_tool_cost(),
+        }
+    }
+}
+
+fn default_budget_enabled() -> bool {
+    true
+}
+
+fn default_daily_replenishment() -> i64 {
+    100_000
+}
+
+fn default_replenish_hour_utc() -> u32 {
+    0
+}
+
+fn default_low_budget_threshold() -> i64 {
+    1000
+}
+
+fn default_tool_cost() -> i64 {
+    1
+}
+
+// --- v0.6.0: Dead-letter queue ---
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct DlqConfig {
+    #[serde(default = "default_dlq_auto_retry")]
+    pub auto_retry_enabled: bool,
+    #[serde(default = "default_dlq_max_retries")]
+    pub max_retries: u32,
+    #[serde(default = "default_dlq_backoff_base_ms")]
+    pub backoff_base_ms: u64,
+    #[serde(default = "default_dlq_check_interval_secs")]
+    pub check_interval_secs: u64,
+}
+
+impl Default for DlqConfig {
+    fn default() -> Self {
+        Self {
+            auto_retry_enabled: default_dlq_auto_retry(),
+            max_retries: default_dlq_max_retries(),
+            backoff_base_ms: default_dlq_backoff_base_ms(),
+            check_interval_secs: default_dlq_check_interval_secs(),
+        }
+    }
+}
+
+fn default_dlq_auto_retry() -> bool {
+    true
+}
+
+fn default_dlq_max_retries() -> u32 {
+    3
+}
+
+fn default_dlq_backoff_base_ms() -> u64 {
+    1000
+}
+
+fn default_dlq_check_interval_secs() -> u64 {
+    60
+}
+
+// --- v0.6.0: Multi-agent collaboration ---
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct CollaborationConfig {
+    #[serde(default = "default_max_sub_tasks")]
+    pub max_sub_tasks: u32,
+    #[serde(default = "default_workspace_ttl_hours")]
+    pub workspace_ttl_hours: u32,
+}
+
+impl Default for CollaborationConfig {
+    fn default() -> Self {
+        Self {
+            max_sub_tasks: default_max_sub_tasks(),
+            workspace_ttl_hours: default_workspace_ttl_hours(),
+        }
+    }
+}
+
+fn default_max_sub_tasks() -> u32 {
+    10
+}
+
+fn default_workspace_ttl_hours() -> u32 {
+    24
+}
+
+// --- v0.6.0: Webhook gateway ---
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct WebhookConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub slack_signing_secret: Option<String>,
+    #[serde(default)]
+    pub teams_app_id: Option<String>,
+    #[serde(default)]
+    pub telegram_bot_token: Option<String>,
+    #[serde(default = "default_webhook_delivery_timeout_secs")]
+    pub delivery_timeout_secs: u64,
+    #[serde(default = "default_webhook_max_retries")]
+    pub max_retries: u32,
+}
+
+impl Default for WebhookConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            slack_signing_secret: None,
+            teams_app_id: None,
+            telegram_bot_token: None,
+            delivery_timeout_secs: default_webhook_delivery_timeout_secs(),
+            max_retries: default_webhook_max_retries(),
+        }
+    }
+}
+
+fn default_webhook_delivery_timeout_secs() -> u64 {
+    10
+}
+
+fn default_webhook_max_retries() -> u32 {
+    3
+}
+
+fn default_kg_entity_ttl_days() -> u32 {
+    90
+}
+
+fn default_kg_edge_decay_rate() -> f64 {
+    0.005
+}
+
+fn default_kg_cleanup_interval_hours() -> u32 {
+    24
+}
+
+fn default_kg_min_mention_count() -> u32 {
+    3
 }
 
 impl Config {

@@ -411,6 +411,67 @@ async fn run_cycle(state: &AppState) -> Result<(), BroodlinkError> {
     }
 
     // -----------------------------------------------------------------------
+    // 5g. Knowledge graph cleanup (edge decay, stale entity pruning)
+    // -----------------------------------------------------------------------
+    match kg_cleanup_cycle(&state.pg, &state.config).await {
+        Ok(stats) => {
+            if stats.edges_decayed > 0 || stats.edges_expired > 0 || stats.entities_pruned > 0 || stats.orphans_removed > 0 {
+                info!(
+                    edges_decayed = stats.edges_decayed,
+                    edges_expired = stats.edges_expired,
+                    entities_pruned = stats.entities_pruned,
+                    orphans_removed = stats.orphans_removed,
+                    "kg cleanup completed"
+                );
+                let subj = format!("{prefix}.{env}.kg.cleanup");
+                publish_nats(&state.nats, &subj, &serde_json::json!({
+                    "service": SERVICE_NAME,
+                    "edges_decayed": stats.edges_decayed,
+                    "edges_expired": stats.edges_expired,
+                    "entities_pruned": stats.entities_pruned,
+                    "orphans_removed": stats.orphans_removed,
+                    "timestamp": Utc::now().to_rfc3339(),
+                })).await;
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "kg cleanup failed");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 5h. Daily budget replenishment (Dolt + Postgres)
+    // -----------------------------------------------------------------------
+    if state.config.budget.enabled {
+        match replenish_budgets(&state.dolt, &state.pg, &state.config).await {
+            Ok(n) => {
+                if n > 0 {
+                    info!(agents = n, "budget replenishment completed");
+                    let subj = format!("{prefix}.{env}.budget.replenished");
+                    publish_nats(&state.nats, &subj, &serde_json::json!({
+                        "service": SERVICE_NAME,
+                        "agents_replenished": n,
+                        "amount": state.config.budget.daily_replenishment,
+                        "timestamp": Utc::now().to_rfc3339(),
+                    })).await;
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "budget replenishment failed");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 5i. Outbound webhook notifications
+    // -----------------------------------------------------------------------
+    if state.config.webhooks.enabled {
+        if let Err(e) = deliver_outbound_notifications(&state.dolt, &state.pg, &state.config).await {
+            warn!(error = %e, "outbound webhook delivery failed");
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // 6. Publish broodlink.<env>.health (NATS)
     // -----------------------------------------------------------------------
     let dolt_ok = sqlx::query("SELECT 1").execute(&state.dolt).await.is_ok();
@@ -1067,6 +1128,375 @@ async fn sync_kg_unprocessed_memories(
 
     if queued > 0 {
         info!(queued = queued, "queued unprocessed memories for kg extraction");
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Knowledge graph cleanup (v0.6.0)
+// ---------------------------------------------------------------------------
+
+struct KgCleanupStats {
+    edges_decayed: u64,
+    edges_expired: u64,
+    entities_pruned: u64,
+    orphans_removed: u64,
+}
+
+/// Replenish agent budgets. Runs every cycle but only actually tops up
+/// agents whose balance is below the daily_replenishment threshold.
+/// This is idempotent — running multiple times per day just sets the
+/// budget to the replenishment amount if it's below that.
+async fn replenish_budgets(
+    dolt: &MySqlPool,
+    pg: &PgPool,
+    config: &Config,
+) -> Result<u64, BroodlinkError> {
+    let amount = config.budget.daily_replenishment;
+
+    // Only replenish agents whose budget is below the daily amount
+    let result = sqlx::query(
+        "UPDATE agent_profiles SET budget_tokens = ? WHERE active = TRUE AND budget_tokens < ?",
+    )
+    .bind(amount)
+    .bind(amount)
+    .execute(dolt)
+    .await?;
+
+    let count = result.rows_affected();
+
+    if count > 0 {
+        // Record replenishment transactions for auditing
+        // Fetch agents that were replenished (balance now equals amount)
+        let agents: Vec<(String, i64)> = sqlx::query_as::<_, (String, i64)>(
+            "SELECT agent_id, COALESCE(budget_tokens, 0) FROM agent_profiles WHERE active = TRUE AND budget_tokens = ?",
+        )
+        .bind(amount)
+        .fetch_all(dolt)
+        .await?;
+
+        for (agent_id, balance) in &agents {
+            let _ = sqlx::query(
+                "INSERT INTO budget_transactions (agent_id, tool_name, cost_tokens, balance_after, trace_id)
+                 VALUES ($1, 'replenishment', $2, $3, 'heartbeat')",
+            )
+            .bind(agent_id)
+            .bind(amount)
+            .bind(balance)
+            .execute(pg)
+            .await;
+        }
+    }
+
+    Ok(count)
+}
+
+async fn kg_cleanup_cycle(
+    pg: &PgPool,
+    config: &Config,
+) -> Result<KgCleanupStats, BroodlinkError> {
+    let ms = &config.memory_search;
+    let decay_rate = ms.kg_edge_decay_rate;
+    let ttl_days = ms.kg_entity_ttl_days;
+    let min_mentions = ms.kg_min_mention_count;
+
+    // 1. Edge weight decay: reduce weights by decay_rate for edges not updated today
+    let edges_decayed = if decay_rate > 0.0 {
+        let factor = 1.0 - decay_rate;
+        let result = sqlx::query(
+            "UPDATE kg_edges SET weight = weight * $1, updated_at = NOW()
+             WHERE valid_to IS NULL AND updated_at < NOW() - INTERVAL '1 day'",
+        )
+        .bind(factor)
+        .execute(pg)
+        .await?;
+        result.rows_affected()
+    } else {
+        0
+    };
+
+    // 2. Expire edges with weight below threshold
+    let result = sqlx::query(
+        "UPDATE kg_edges SET valid_to = NOW(), updated_at = NOW()
+         WHERE valid_to IS NULL AND weight < 0.1",
+    )
+    .execute(pg)
+    .await?;
+    let edges_expired = result.rows_affected();
+
+    // 3. Prune stale entities (not seen within TTL, low mention count)
+    let entities_pruned = if ttl_days > 0 {
+        let ttl_interval = format!("{ttl_days} days");
+        // Delete entity_memories links first
+        sqlx::query(
+            "DELETE FROM kg_entity_memories WHERE entity_id IN (
+                SELECT entity_id FROM kg_entities
+                WHERE last_seen < NOW() - $1::interval AND mention_count < $2
+            )",
+        )
+        .bind(&ttl_interval)
+        .bind(min_mentions as i32)
+        .execute(pg)
+        .await?;
+
+        // Delete edges referencing stale entities
+        sqlx::query(
+            "UPDATE kg_edges SET valid_to = NOW(), updated_at = NOW()
+             WHERE valid_to IS NULL AND (
+                source_id IN (SELECT entity_id FROM kg_entities WHERE last_seen < NOW() - $1::interval AND mention_count < $2)
+                OR target_id IN (SELECT entity_id FROM kg_entities WHERE last_seen < NOW() - $1::interval AND mention_count < $2)
+             )",
+        )
+        .bind(&ttl_interval)
+        .bind(min_mentions as i32)
+        .execute(pg)
+        .await?;
+
+        let result = sqlx::query(
+            "DELETE FROM kg_entities
+             WHERE last_seen < NOW() - $1::interval AND mention_count < $2",
+        )
+        .bind(&ttl_interval)
+        .bind(min_mentions as i32)
+        .execute(pg)
+        .await?;
+        result.rows_affected()
+    } else {
+        0
+    };
+
+    // 4. Remove orphan entities (no active edges, no entity_memories links)
+    let result = sqlx::query(
+        "DELETE FROM kg_entities WHERE entity_id IN (
+            SELECT e.entity_id FROM kg_entities e
+            LEFT JOIN kg_edges ea ON (ea.source_id = e.entity_id OR ea.target_id = e.entity_id) AND ea.valid_to IS NULL
+            LEFT JOIN kg_entity_memories em ON em.entity_id = e.entity_id
+            WHERE ea.edge_id IS NULL AND em.entity_id IS NULL
+        )",
+    )
+    .execute(pg)
+    .await?;
+    let orphans_removed = result.rows_affected();
+
+    Ok(KgCleanupStats {
+        edges_decayed,
+        edges_expired,
+        entities_pruned,
+        orphans_removed,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Outbound webhook notifications (v0.6.0)
+// ---------------------------------------------------------------------------
+
+/// Check for notification-worthy conditions and deliver to registered webhook endpoints.
+async fn deliver_outbound_notifications(
+    dolt: &MySqlPool,
+    pg: &PgPool,
+    config: &Config,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Fetch active webhook endpoints with their subscribed events
+    let endpoints: Vec<(String, String, Option<String>, serde_json::Value)> = sqlx::query_as(
+        "SELECT id, platform, webhook_url, events FROM webhook_endpoints WHERE active = true AND webhook_url IS NOT NULL",
+    )
+    .fetch_all(pg)
+    .await?;
+
+    if endpoints.is_empty() {
+        return Ok(());
+    }
+
+    let mut notifications: Vec<(String, serde_json::Value)> = Vec::new();
+
+    // Check: agent.offline — agents that became inactive this cycle
+    let offline_agents: Vec<(String,)> = sqlx::query_as(
+        "SELECT agent_id FROM agent_profiles
+         WHERE active = false
+           AND last_seen IS NOT NULL
+           AND last_seen > NOW() - INTERVAL 10 MINUTE",
+    )
+    .fetch_all(dolt)
+    .await
+    .unwrap_or_default();
+
+    for (agent_id,) in &offline_agents {
+        notifications.push((
+            "agent.offline".to_string(),
+            serde_json::json!({
+                "event": "agent.offline",
+                "agent_id": agent_id,
+                "message": format!("Agent {agent_id} went offline"),
+            }),
+        ));
+    }
+
+    // Check: budget.low — agents with budget below threshold
+    if config.budget.enabled {
+        let threshold = config.budget.low_budget_threshold;
+        let low_budget: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT agent_id, COALESCE(budget_tokens, 0) FROM agent_profiles
+             WHERE active = true AND budget_tokens < ? AND budget_tokens >= 0",
+        )
+        .bind(threshold)
+        .fetch_all(dolt)
+        .await
+        .unwrap_or_default();
+
+        for (agent_id, balance) in &low_budget {
+            notifications.push((
+                "budget.low".to_string(),
+                serde_json::json!({
+                    "event": "budget.low",
+                    "agent_id": agent_id,
+                    "balance": balance,
+                    "threshold": threshold,
+                    "message": format!("Agent {agent_id} budget low: {balance} tokens"),
+                }),
+            ));
+        }
+    }
+
+    // Check: task.failed — recent DLQ entries (last 5 minutes)
+    let dlq_entries: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT id, task_id, reason FROM dead_letter_queue
+         WHERE resolved = false AND created_at > NOW() - INTERVAL '5 minutes'",
+    )
+    .fetch_all(pg)
+    .await
+    .unwrap_or_default();
+
+    for (id, task_id, reason) in &dlq_entries {
+        notifications.push((
+            "task.failed".to_string(),
+            serde_json::json!({
+                "event": "task.failed",
+                "dlq_id": id,
+                "task_id": task_id,
+                "reason": reason,
+                "message": format!("Task {task_id} failed: {reason}"),
+            }),
+        ));
+    }
+
+    // Check: workflow.completed / workflow.failed — recent workflow state changes
+    let wf_events: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, formula_name, status FROM workflow_runs
+         WHERE status IN ('completed', 'failed')
+           AND updated_at > NOW() - INTERVAL '5 minutes'",
+    )
+    .fetch_all(pg)
+    .await
+    .unwrap_or_default();
+
+    for (id, formula, status) in &wf_events {
+        let event_type = format!("workflow.{status}");
+        notifications.push((
+            event_type.clone(),
+            serde_json::json!({
+                "event": event_type,
+                "workflow_id": id,
+                "formula": formula,
+                "status": status,
+                "message": format!("Workflow '{formula}' {status}"),
+            }),
+        ));
+    }
+
+    // Check: approval.pending — approval gates waiting for review
+    let pending_approvals: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, task_id FROM approval_gates
+         WHERE status = 'pending'
+           AND created_at > NOW() - INTERVAL '5 minutes'",
+    )
+    .fetch_all(pg)
+    .await
+    .unwrap_or_default();
+
+    for (gate_id, task_id) in &pending_approvals {
+        notifications.push((
+            "approval.pending".to_string(),
+            serde_json::json!({
+                "event": "approval.pending",
+                "gate_id": gate_id,
+                "task_id": task_id,
+                "message": format!("Approval needed for task {task_id}"),
+            }),
+        ));
+    }
+
+    if notifications.is_empty() {
+        return Ok(());
+    }
+
+    // Deliver each notification to matching endpoints
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(config.webhooks.delivery_timeout_secs))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let mut delivered = 0u64;
+    for (event_type, payload) in &notifications {
+        for (eid, platform, webhook_url, events) in &endpoints {
+            // Check if endpoint subscribes to this event type
+            let subscribed = events
+                .as_array()
+                .map(|arr| {
+                    arr.is_empty()
+                        || arr.iter().any(|e| {
+                            e.as_str()
+                                .map(|s| s == event_type || event_type.starts_with(s))
+                                .unwrap_or(false)
+                        })
+                })
+                .unwrap_or(true); // empty = subscribe to all
+
+            if !subscribed {
+                continue;
+            }
+
+            let url = match webhook_url {
+                Some(u) => u,
+                None => continue,
+            };
+
+            let result = http_client
+                .post(url)
+                .header("Content-Type", "application/json")
+                .json(payload)
+                .send()
+                .await;
+
+            let (status, error_msg) = match result {
+                Ok(resp) if resp.status().is_success() => ("delivered", None),
+                Ok(resp) => ("failed", Some(format!("HTTP {}", resp.status()))),
+                Err(e) => ("failed", Some(e.to_string())),
+            };
+
+            // Log delivery attempt
+            let _ = sqlx::query(
+                "INSERT INTO webhook_log (endpoint_id, direction, event_type, payload, status, error_msg)
+                 VALUES ($1, 'outbound', $2, $3, $4, $5)",
+            )
+            .bind(eid)
+            .bind(event_type)
+            .bind(payload)
+            .bind(status)
+            .bind(&error_msg)
+            .execute(pg)
+            .await;
+
+            if status == "delivered" {
+                delivered += 1;
+            } else if let Some(msg) = &error_msg {
+                warn!(endpoint = %eid, platform = %platform, event = %event_type, error = %msg, "webhook delivery failed");
+            }
+        }
+    }
+
+    if delivered > 0 {
+        info!(delivered = delivered, total_events = notifications.len(), "outbound webhooks delivered");
     }
 
     Ok(())

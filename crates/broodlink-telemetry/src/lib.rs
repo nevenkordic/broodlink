@@ -58,7 +58,8 @@ impl Drop for TelemetryGuard {
 /// Initialize the tracing subscriber with optional OpenTelemetry export.
 ///
 /// When `config.enabled` is false (the default), sets up fmt-only output
-/// identical to the existing behavior. When true, adds an OTLP export layer.
+/// identical to the existing behavior. When true, adds an OTLP export layer
+/// and installs the W3C TraceContext propagator for cross-service correlation.
 ///
 /// # Errors
 ///
@@ -77,6 +78,11 @@ pub fn init_telemetry(
         .with_thread_ids(true);
 
     if config.enabled {
+        // Install W3C TraceContext propagator for cross-service trace correlation
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+
         let exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_tonic()
             .with_endpoint(&config.otlp_endpoint)
@@ -120,6 +126,74 @@ pub fn init_telemetry(
             .init();
 
         Ok(TelemetryGuard { _provider: None })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// W3C TraceContext propagation helpers
+// ---------------------------------------------------------------------------
+
+/// Adapter to extract W3C trace context from HTTP headers.
+struct HeaderExtractor<'a>(&'a http::HeaderMap);
+
+impl opentelemetry::propagation::Extractor for HeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|v| v.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(http::HeaderName::as_str).collect()
+    }
+}
+
+/// Adapter to inject W3C trace context into HTTP headers.
+struct HeaderInjector<'a>(&'a mut http::HeaderMap);
+
+impl opentelemetry::propagation::Injector for HeaderInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        if let Ok(name) = http::header::HeaderName::from_bytes(key.as_bytes()) {
+            if let Ok(val) = http::header::HeaderValue::from_str(&value) {
+                self.0.insert(name, val);
+            }
+        }
+    }
+}
+
+/// Extract W3C TraceContext from incoming HTTP headers and return an OTel context.
+/// Use this in middleware to link incoming requests to the distributed trace.
+#[must_use]
+pub fn extract_trace_context(headers: &http::HeaderMap) -> opentelemetry::Context {
+    let extractor = HeaderExtractor(headers);
+    opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.extract(&extractor)
+    })
+}
+
+/// Inject W3C TraceContext headers (traceparent, tracestate) into outbound HTTP headers.
+/// Use this before making outbound HTTP calls to propagate the trace.
+pub fn inject_trace_context(cx: &opentelemetry::Context, headers: &mut http::HeaderMap) {
+    let mut injector = HeaderInjector(headers);
+    opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(cx, &mut injector);
+    });
+}
+
+/// Get the current OTLP trace ID from the active tracing span.
+/// Returns the 32-hex-char trace ID if telemetry is active, otherwise returns None.
+#[must_use]
+pub fn current_trace_id() -> Option<String> {
+    use opentelemetry::trace::TraceContextExt;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    let span = tracing::Span::current();
+    let cx = span.context();
+    let span_ref = cx.span();
+    let trace_id = span_ref.span_context().trace_id();
+
+    if trace_id == opentelemetry::trace::TraceId::INVALID {
+        None
+    } else {
+        Some(trace_id.to_string())
     }
 }
 
@@ -167,5 +241,23 @@ sample_rate = 0.5
         assert!(config.enabled);
         assert_eq!(config.otlp_endpoint, "http://jaeger:4317");
         assert!((config.sample_rate - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_current_trace_id_returns_none_without_otel() {
+        // Without telemetry initialized, should return None
+        assert!(current_trace_id().is_none());
+    }
+
+    #[test]
+    fn test_header_injector_roundtrip() {
+        let mut headers = http::HeaderMap::new();
+        let mut injector = HeaderInjector(&mut headers);
+        use opentelemetry::propagation::Injector;
+        injector.set("traceparent", "00-abc123-def456-01".to_string());
+        assert_eq!(
+            headers.get("traceparent").and_then(|v| v.to_str().ok()),
+            Some("00-abc123-def456-01")
+        );
     }
 }

@@ -16,6 +16,9 @@
 //! - `POST /a2a/tasks/get`           — query task status
 //! - `POST /a2a/tasks/cancel`        — cancel a running task
 //! - `POST /a2a/tasks/sendSubscribe` — streaming task submission (SSE)
+//! - `POST /webhook/slack`            — receive Slack slash commands
+//! - `POST /webhook/teams`            — receive Teams bot messages
+//! - `POST /webhook/telegram`         — receive Telegram bot updates
 //! - `GET  /health`                   — health check
 
 use std::net::SocketAddr;
@@ -236,6 +239,10 @@ async fn main() {
         .route("/a2a/tasks/get", post(tasks_get_handler))
         .route("/a2a/tasks/cancel", post(tasks_cancel_handler))
         .route("/a2a/tasks/sendSubscribe", post(tasks_send_subscribe_handler))
+        // Webhook inbound routes
+        .route("/webhook/slack", post(webhook_slack_handler))
+        .route("/webhook/teams", post(webhook_teams_handler))
+        .route("/webhook/telegram", post(webhook_telegram_handler))
         .route("/health", get(health_handler))
         .layer(cors)
         .with_state(state);
@@ -908,6 +915,497 @@ async fn health_handler() -> impl IntoResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Webhook: Inbound command parsing
+// ---------------------------------------------------------------------------
+
+/// Parsed command from any chat platform.
+#[allow(dead_code)]
+struct WebhookCommand {
+    command: String,
+    args: Vec<String>,
+    user: String,
+    platform: String,
+}
+
+/// Parse a `/broodlink <command> [args...]` text string.
+fn parse_command_text(text: &str) -> Option<(String, Vec<String>)> {
+    let text = text.trim();
+    // Strip leading "/broodlink " prefix if present
+    let cmd_text = text
+        .strip_prefix("/broodlink ")
+        .or_else(|| text.strip_prefix("/broodlink"))
+        .or_else(|| text.strip_prefix("broodlink "))
+        .unwrap_or(text);
+
+    let parts: Vec<&str> = cmd_text.split_whitespace().collect();
+    if parts.is_empty() {
+        return None;
+    }
+
+    let command = parts[0].to_lowercase();
+    let args = parts[1..].iter().map(|s| (*s).to_string()).collect();
+    Some((command, args))
+}
+
+/// Execute a parsed webhook command via bridge calls.
+async fn execute_command(
+    state: &AppState,
+    cmd: &WebhookCommand,
+) -> String {
+    match cmd.command.as_str() {
+        "agents" | "list" => {
+            match bridge_call(state, "list_agents", serde_json::json!({})).await {
+                Ok(data) => {
+                    let agents = data
+                        .as_array()
+                        .or_else(|| data.get("agents").and_then(|a| a.as_array()));
+                    match agents {
+                        Some(arr) => {
+                            if arr.is_empty() {
+                                return "No agents registered.".to_string();
+                            }
+                            let mut lines = vec!["Agent Roster:".to_string()];
+                            for a in arr {
+                                let id = a.get("agent_id").and_then(|v| v.as_str()).unwrap_or("?");
+                                let role = a.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+                                let active = a.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+                                let icon = if active { "+" } else { "-" };
+                                lines.push(format!("  [{icon}] {id} ({role})"));
+                            }
+                            lines.join("\n")
+                        }
+                        None => format!("Agents: {data}"),
+                    }
+                }
+                Err(e) => format!("Error listing agents: {e}"),
+            }
+        }
+
+        "toggle" => {
+            let agent_id = match cmd.args.first() {
+                Some(id) => id,
+                None => return "Usage: toggle <agent_id>".to_string(),
+            };
+            match bridge_call(
+                state,
+                "toggle_agent",
+                serde_json::json!({ "agent_id": agent_id }),
+            )
+            .await
+            {
+                Ok(data) => {
+                    let new_state = data
+                        .get("active")
+                        .and_then(|v| v.as_bool())
+                        .map(|b| if b { "active" } else { "inactive" })
+                        .unwrap_or("toggled");
+                    format!("Agent {agent_id} is now {new_state}.")
+                }
+                Err(e) => format!("Error toggling {agent_id}: {e}"),
+            }
+        }
+
+        "budget" => {
+            let agent_id = match cmd.args.first() {
+                Some(id) => id,
+                None => return "Usage: budget <agent_id>".to_string(),
+            };
+            match bridge_call(
+                state,
+                "get_budget",
+                serde_json::json!({ "agent_id": agent_id }),
+            )
+            .await
+            {
+                Ok(data) => {
+                    let balance = data.get("balance").and_then(|v| v.as_i64()).unwrap_or(0);
+                    format!("Budget for {agent_id}: {balance} tokens")
+                }
+                Err(e) => format!("Error getting budget: {e}"),
+            }
+        }
+
+        "task" => {
+            let sub_cmd = cmd.args.first().map(String::as_str).unwrap_or("");
+            match sub_cmd {
+                "cancel" => {
+                    let task_id = match cmd.args.get(1) {
+                        Some(id) => id,
+                        None => return "Usage: task cancel <task_id>".to_string(),
+                    };
+                    match bridge_call(
+                        state,
+                        "fail_task",
+                        serde_json::json!({ "task_id": task_id }),
+                    )
+                    .await
+                    {
+                        Ok(_) => format!("Task {task_id} cancelled."),
+                        Err(e) => format!("Error cancelling task: {e}"),
+                    }
+                }
+                _ => "Usage: task cancel <task_id>".to_string(),
+            }
+        }
+
+        "workflow" => {
+            let sub_cmd = cmd.args.first().map(String::as_str).unwrap_or("");
+            match sub_cmd {
+                "start" => {
+                    let formula = match cmd.args.get(1) {
+                        Some(f) => f,
+                        None => return "Usage: workflow start <formula> [params]".to_string(),
+                    };
+                    let params_str = if cmd.args.len() > 2 {
+                        cmd.args[2..].join(" ")
+                    } else {
+                        String::new()
+                    };
+                    let params_json = if params_str.is_empty() {
+                        serde_json::json!({})
+                    } else {
+                        serde_json::from_str(&params_str).unwrap_or(serde_json::json!({}))
+                    };
+
+                    match bridge_call(
+                        state,
+                        "beads_run_formula",
+                        serde_json::json!({
+                            "formula": formula,
+                            "params": params_json,
+                        }),
+                    )
+                    .await
+                    {
+                        Ok(data) => {
+                            let run_id = data
+                                .get("workflow_run_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?");
+                            format!("Workflow '{formula}' started (run: {run_id})")
+                        }
+                        Err(e) => format!("Error starting workflow: {e}"),
+                    }
+                }
+                _ => "Usage: workflow start <formula> [params]".to_string(),
+            }
+        }
+
+        "dlq" => {
+            match bridge_call(state, "inspect_dlq", serde_json::json!({})).await {
+                Ok(data) => {
+                    let entries = data
+                        .as_array()
+                        .or_else(|| data.get("entries").and_then(|e| e.as_array()));
+                    match entries {
+                        Some(arr) => {
+                            let unresolved: Vec<_> = arr
+                                .iter()
+                                .filter(|e| !e.get("resolved").and_then(|v| v.as_bool()).unwrap_or(false))
+                                .collect();
+                            if unresolved.is_empty() {
+                                return "DLQ is empty.".to_string();
+                            }
+                            let mut lines = vec![format!("DLQ ({} entries):", unresolved.len())];
+                            for e in unresolved.iter().take(5) {
+                                let task = e.get("task_id").and_then(|v| v.as_str()).unwrap_or("?");
+                                let reason = e.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
+                                let retries = e.get("retry_count").and_then(|v| v.as_i64()).unwrap_or(0);
+                                lines.push(format!("  {task}: {reason} (retries: {retries})"));
+                            }
+                            if unresolved.len() > 5 {
+                                lines.push(format!("  ... and {} more", unresolved.len() - 5));
+                            }
+                            lines.join("\n")
+                        }
+                        None => format!("DLQ: {data}"),
+                    }
+                }
+                Err(e) => format!("Error inspecting DLQ: {e}"),
+            }
+        }
+
+        "help" => {
+            "Broodlink commands:\n\
+             \x20 agents         — list all agents\n\
+             \x20 toggle <id>    — toggle agent active/inactive\n\
+             \x20 budget <id>    — show agent budget\n\
+             \x20 task cancel <id> — cancel a task\n\
+             \x20 workflow start <formula> — start a workflow\n\
+             \x20 dlq            — show dead-letter queue\n\
+             \x20 help           — show this help"
+                .to_string()
+        }
+
+        other => format!("Unknown command: {other}. Try 'help'."),
+    }
+}
+
+/// Log inbound webhook to Postgres.
+async fn log_webhook(
+    pg: &PgPool,
+    endpoint_id: Option<&str>,
+    direction: &str,
+    event_type: &str,
+    payload: &serde_json::Value,
+    status: &str,
+    error_msg: Option<&str>,
+) {
+    // Use a sentinel endpoint_id for unregistered inbound webhooks
+    let eid = endpoint_id.unwrap_or("00000000-0000-0000-0000-000000000000");
+
+    // Ensure the sentinel endpoint exists (idempotent)
+    if endpoint_id.is_none() {
+        let _ = sqlx::query(
+            "INSERT INTO webhook_endpoints (id, platform, name, active)
+             VALUES ($1, 'generic', 'system', true)
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(eid)
+        .execute(pg)
+        .await;
+    }
+
+    let _ = sqlx::query(
+        "INSERT INTO webhook_log (endpoint_id, direction, event_type, payload, status, error_msg)
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(eid)
+    .bind(direction)
+    .bind(event_type)
+    .bind(payload)
+    .bind(status)
+    .bind(error_msg)
+    .execute(pg)
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// POST /webhook/slack — receive Slack slash commands
+// ---------------------------------------------------------------------------
+
+async fn webhook_slack_handler(
+    State(state): State<Arc<AppState>>,
+    _headers: HeaderMap,
+    body: String,
+) -> Response {
+    if !state.config.webhooks.enabled {
+        return (StatusCode::NOT_FOUND, "webhooks disabled").into_response();
+    }
+
+    // Parse form-encoded Slack slash command payload
+    let params: std::collections::HashMap<String, String> = body
+        .split('&')
+        .filter_map(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            let key = parts.next()?;
+            let value = parts.next().unwrap_or("");
+            Some((
+                urlencoding_decode(key),
+                urlencoding_decode(value),
+            ))
+        })
+        .collect();
+
+    let text = params.get("text").cloned().unwrap_or_default();
+    let user = params.get("user_name").cloned().unwrap_or_else(|| "slack-user".to_string());
+
+    info!(platform = "slack", user = %user, text = %text, "inbound webhook");
+
+    let (command, args) = match parse_command_text(&text) {
+        Some(pair) => pair,
+        None => {
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({"response_type": "ephemeral", "text": "Usage: /broodlink <command>. Try 'help'."}).to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    let payload_json = serde_json::to_value(&params).unwrap_or_default();
+    log_webhook(&state.pg, None, "inbound", &format!("slack.{command}"), &payload_json, "delivered", None).await;
+
+    let cmd = WebhookCommand {
+        command,
+        args,
+        user,
+        platform: "slack".to_string(),
+    };
+
+    let response_text = execute_command(&state, &cmd).await;
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({
+            "response_type": "in_channel",
+            "text": response_text,
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// POST /webhook/teams — receive Teams bot messages
+// ---------------------------------------------------------------------------
+
+async fn webhook_teams_handler(
+    State(state): State<Arc<AppState>>,
+    body: String,
+) -> Response {
+    if !state.config.webhooks.enabled {
+        return (StatusCode::NOT_FOUND, "webhooks disabled").into_response();
+    }
+
+    let payload: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("invalid json: {e}")).into_response();
+        }
+    };
+
+    let text = payload
+        .get("text")
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+    let user = payload
+        .get("from")
+        .and_then(|f| f.get("name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("teams-user");
+
+    info!(platform = "teams", user = %user, text = %text, "inbound webhook");
+
+    let (command, args) = match parse_command_text(text) {
+        Some(pair) => pair,
+        None => {
+            return (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({"type": "message", "text": "Usage: /broodlink <command>. Try 'help'."})),
+            )
+                .into_response();
+        }
+    };
+
+    log_webhook(&state.pg, None, "inbound", &format!("teams.{command}"), &payload, "delivered", None).await;
+
+    let cmd = WebhookCommand {
+        command,
+        args,
+        user: user.to_string(),
+        platform: "teams".to_string(),
+    };
+
+    let response_text = execute_command(&state, &cmd).await;
+
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "type": "message",
+            "text": response_text,
+        })),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// POST /webhook/telegram — receive Telegram bot updates
+// ---------------------------------------------------------------------------
+
+async fn webhook_telegram_handler(
+    State(state): State<Arc<AppState>>,
+    body: String,
+) -> Response {
+    if !state.config.webhooks.enabled {
+        return (StatusCode::NOT_FOUND, "webhooks disabled").into_response();
+    }
+
+    let payload: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("invalid json: {e}")).into_response();
+        }
+    };
+
+    let message = payload.get("message").unwrap_or(&payload);
+    let text = message
+        .get("text")
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+    let user = message
+        .get("from")
+        .and_then(|f| f.get("first_name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("telegram-user");
+    let chat_id = message
+        .get("chat")
+        .and_then(|c| c.get("id"))
+        .and_then(|id| id.as_i64())
+        .unwrap_or(0);
+
+    info!(platform = "telegram", user = %user, chat_id = chat_id, text = %text, "inbound webhook");
+
+    let (command, args) = match parse_command_text(text) {
+        Some(pair) => pair,
+        None => {
+            // For Telegram, respond via Telegram Bot API if configured
+            let reply = serde_json::json!({
+                "method": "sendMessage",
+                "chat_id": chat_id,
+                "text": "Usage: /broodlink <command>. Try 'help'.",
+            });
+            return (StatusCode::OK, axum::Json(reply)).into_response();
+        }
+    };
+
+    log_webhook(&state.pg, None, "inbound", &format!("telegram.{command}"), &payload, "delivered", None).await;
+
+    let cmd = WebhookCommand {
+        command,
+        args,
+        user: user.to_string(),
+        platform: "telegram".to_string(),
+    };
+
+    let response_text = execute_command(&state, &cmd).await;
+
+    let reply = serde_json::json!({
+        "method": "sendMessage",
+        "chat_id": chat_id,
+        "text": response_text,
+    });
+
+    (StatusCode::OK, axum::Json(reply)).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// URL decoding helper (minimal, no external dep)
+// ---------------------------------------------------------------------------
+
+fn urlencoding_decode(s: &str) -> String {
+    let s = s.replace('+', " ");
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let hex: String = chars.by_ref().take(2).collect();
+            if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                result.push(byte as char);
+            } else {
+                result.push('%');
+                result.push_str(&hex);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1002,5 +1500,46 @@ mod tests {
         assert_eq!(json["status"]["state"], "working");
         assert_eq!(json["status"]["message"], "processing");
         assert!(json.get("artifacts").is_none());
+    }
+
+    #[test]
+    fn test_parse_command_with_prefix() {
+        let (cmd, args) = parse_command_text("/broodlink agents").unwrap();
+        assert_eq!(cmd, "agents");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_parse_command_toggle() {
+        let (cmd, args) = parse_command_text("/broodlink toggle claude").unwrap();
+        assert_eq!(cmd, "toggle");
+        assert_eq!(args, vec!["claude"]);
+    }
+
+    #[test]
+    fn test_parse_command_task_cancel() {
+        let (cmd, args) = parse_command_text("/broodlink task cancel abc-123").unwrap();
+        assert_eq!(cmd, "task");
+        assert_eq!(args, vec!["cancel", "abc-123"]);
+    }
+
+    #[test]
+    fn test_parse_command_without_prefix() {
+        let (cmd, args) = parse_command_text("agents").unwrap();
+        assert_eq!(cmd, "agents");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_parse_command_empty() {
+        assert!(parse_command_text("").is_none());
+        assert!(parse_command_text("   ").is_none());
+    }
+
+    #[test]
+    fn test_urlencoding_decode() {
+        assert_eq!(urlencoding_decode("hello+world"), "hello world");
+        assert_eq!(urlencoding_decode("foo%20bar"), "foo bar");
+        assert_eq!(urlencoding_decode("100%25"), "100%");
     }
 }

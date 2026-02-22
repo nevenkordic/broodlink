@@ -73,8 +73,6 @@ services:
       - "4317:4317"
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
-    profiles:
-      - telemetry
     restart: unless-stopped
 
   # ── Broodlink Services ──────────────────────────────────────────

@@ -301,6 +301,7 @@ dependencies = [
  "chrono",
  "futures",
  "jsonwebtoken",
+ "opentelemetry",
  "regex",
  "reqwest",
  "serde",
@@ -312,6 +313,7 @@ dependencies = [
  "tower 0.4.13",
  "tower-http",
  "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
 ]
@@ -379,6 +381,7 @@ name = "broodlink-telemetry"
 version = "0.3.0"
 dependencies = [
  "broodlink-config",
+ "http 1.4.0",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

@@ -29,4 +29,6 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 tokio-stream = { workspace = true }
 axum-server = { workspace = true }
+opentelemetry = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 regex = "1"

@@ -87,6 +87,8 @@ pub enum BroodlinkError {
     CircuitOpen(String),
     #[error("guardrail blocked: {policy} — {message}")]
     Guardrail { policy: String, message: String },
+    #[error("budget exhausted: agent {agent_id} has {balance} tokens, needs {cost}")]
+    BudgetExhausted { agent_id: String, balance: i64, cost: i64 },
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -145,6 +147,10 @@ impl IntoResponse for BroodlinkError {
             Self::Guardrail { ref policy, ref message } => {
                 warn!(policy = %policy, message = %message, "guardrail blocked");
                 (StatusCode::FORBIDDEN, self.to_string())
+            }
+            Self::BudgetExhausted { ref agent_id, balance, cost } => {
+                warn!(agent = %agent_id, balance = balance, cost = cost, "budget exhausted");
+                (StatusCode::PAYMENT_REQUIRED, self.to_string())
             }
             Self::Internal(msg) => {
                 error!(msg = %msg, "internal error");
@@ -266,7 +272,7 @@ pub struct AppState {
     pub ollama_breaker: CircuitBreaker,
     pub reranker_breaker: CircuitBreaker,
     pub start_time: Instant,
-    pub jwt_decoding_key: jsonwebtoken::DecodingKey,
+    pub jwt_decoding_keys: Vec<(String, jsonwebtoken::DecodingKey)>, // (kid, key) pairs
     pub jwt_validation: jsonwebtoken::Validation,
 }
 
@@ -370,10 +376,44 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
     let dolt_password = secrets.get(&config.dolt.password_key).await?;
     let pg_password = secrets.get(&config.postgres.password_key).await?;
 
-    // JWT RS256 decoding key from secrets
+    // JWT RS256 decoding keys — load primary from secrets, then scan keys_dir for extras
+    let mut jwt_decoding_keys: Vec<(String, jsonwebtoken::DecodingKey)> = Vec::new();
+
+    // Primary key from secrets (always loaded)
     let jwt_public_pem = secrets.get("BROODLINK_JWT_PUBLIC_KEY").await?;
-    let jwt_decoding_key = jsonwebtoken::DecodingKey::from_rsa_pem(jwt_public_pem.as_bytes())
+    let primary_kid = compute_key_kid(jwt_public_pem.as_bytes());
+    let primary_key = jsonwebtoken::DecodingKey::from_rsa_pem(jwt_public_pem.as_bytes())
         .map_err(|e| BroodlinkError::Auth(format!("invalid JWT public key: {e}")))?;
+    jwt_decoding_keys.push((primary_kid.clone(), primary_key));
+    info!(kid = %primary_kid, "loaded primary JWT key");
+
+    // Scan keys_dir for additional public keys (for rotation)
+    let keys_dir = config.jwt.keys_dir.replace('~', &std::env::var("HOME").unwrap_or_default());
+    if let Ok(entries) = std::fs::read_dir(&keys_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let fname = entry.file_name().to_string_lossy().to_string();
+            // Load jwt-public-*.pem files (but skip the primary jwt-public.pem)
+            if fname.starts_with("jwt-public-") && fname.ends_with(".pem") {
+                if let Ok(pem_bytes) = std::fs::read(&path) {
+                    let kid = compute_key_kid(&pem_bytes);
+                    if kid != primary_kid {
+                        match jsonwebtoken::DecodingKey::from_rsa_pem(&pem_bytes) {
+                            Ok(dk) => {
+                                info!(kid = %kid, path = %path.display(), "loaded additional JWT key");
+                                jwt_decoding_keys.push((kid, dk));
+                            }
+                            Err(e) => {
+                                warn!(path = %path.display(), error = %e, "skipped invalid JWT key file");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    info!(count = jwt_decoding_keys.len(), "JWT decoding keys loaded");
+
     let mut jwt_validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
     jwt_validation.validate_exp = true;
     jwt_validation.set_required_spec_claims(&["sub", "agent_id", "exp", "iat"]);
@@ -496,7 +536,7 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
         ollama_breaker,
         reranker_breaker,
         start_time: Instant::now(),
-        jwt_decoding_key,
+        jwt_decoding_keys,
         jwt_validation,
     })
 }
@@ -505,6 +545,38 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
 #[allow(dead_code)]
 fn pg_read_pool(state: &AppState) -> &PgPool {
     state.pg_read.as_ref().unwrap_or(&state.pg)
+}
+
+/// Compute a short key ID (kid) from PEM bytes using SHA-256 truncated to 16 hex chars.
+fn compute_key_kid(pem_bytes: &[u8]) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    pem_bytes.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// JWKS endpoint — returns all loaded public keys with their kid identifiers (no auth required).
+async fn jwks_handler(
+    State(state): State<Arc<AppState>>,
+) -> axum::Json<serde_json::Value> {
+    let keys: Vec<serde_json::Value> = state
+        .jwt_decoding_keys
+        .iter()
+        .map(|(kid, _)| {
+            serde_json::json!({
+                "kid": kid,
+                "kty": "RSA",
+                "use": "sig",
+                "alg": "RS256",
+            })
+        })
+        .collect();
+
+    axum::Json(serde_json::json!({
+        "keys": keys,
+        "total": keys.len(),
+    }))
 }
 
 async fn shutdown_signal() {
@@ -596,6 +668,11 @@ static TOOL_REGISTRY: std::sync::LazyLock<Vec<serde_json::Value>> =
                 "description": p_str("New description (required for update_description action)"),
             }), &["source_entity", "target_entity", "relation_type", "action"]),
             tool_def("graph_stats", "Overview of the knowledge graph state: entity counts, edge counts, type distribution, most connected entities.", serde_json::json!({}), &[]),
+            tool_def("graph_prune", "Prune stale entities and decayed edges from the knowledge graph.", serde_json::json!({
+                "dry_run": p_bool("Preview what would be pruned without deleting (default true)"),
+                "max_age_days": p_int("Remove entities not seen in this many days (default from config)"),
+                "min_weight": p_number("Expire edges below this weight (default 0.1)"),
+            }), &[]),
 
             // --- Work ---
             tool_def("log_work", "Log a work entry. Actions: created, modified, fixed, deployed, conversation.", serde_json::json!({
@@ -867,6 +944,52 @@ static TOOL_REGISTRY: std::sync::LazyLock<Vec<serde_json::Value>> =
                 "formula_name": p_str("Formula name (e.g. 'research', 'build-feature')"),
                 "params": p_str("Optional JSON parameters for the formula template"),
             }), &["formula_name"]),
+
+            // --- Budget ---
+            tool_def("get_budget", "Get an agent's current budget balance and recent transactions.", serde_json::json!({
+                "agent_id": p_str("Agent to query (defaults to calling agent)"),
+                "limit": p_int("Number of recent transactions to include (default 10)"),
+            }), &[]),
+            tool_def("set_budget", "Set an agent's budget token balance. Requires strategist role.", serde_json::json!({
+                "agent_id": p_str("Target agent ID"),
+                "tokens": p_int("New budget token balance"),
+            }), &["agent_id", "tokens"]),
+            tool_def("get_cost_map", "List per-tool token costs.", serde_json::json!({}), &[]),
+
+            // --- Dead-Letter Queue ---
+            tool_def("inspect_dlq", "List dead-letter queue entries for failed tasks.", serde_json::json!({
+                "resolved": p_bool("Include resolved entries (default false)"),
+                "limit": p_int("Max entries to return (default 20)"),
+            }), &[]),
+            tool_def("retry_dlq_task", "Manually retry a dead-lettered task.", serde_json::json!({
+                "dlq_id": p_int("DLQ entry ID to retry"),
+            }), &["dlq_id"]),
+            tool_def("purge_dlq", "Remove resolved entries from the dead-letter queue.", serde_json::json!({
+                "older_than_days": p_int("Purge entries older than this many days (default 7)"),
+            }), &[]),
+
+            // --- Multi-Agent Collaboration ---
+            tool_def("decompose_task", "Decompose a task into sub-tasks assigned to different agents.", serde_json::json!({
+                "parent_task_id": p_str("Parent task ID to decompose"),
+                "sub_tasks": p_str("JSON array of sub-task definitions: [{title, description, role, cost_tier}]"),
+                "merge_strategy": p_str("How to combine results: concatenate (default), vote, best"),
+            }), &["parent_task_id", "sub_tasks"]),
+            tool_def("create_workspace", "Create a shared workspace for multi-agent collaboration.", serde_json::json!({
+                "name": p_str("Workspace name"),
+                "participants": p_str("JSON array of agent IDs"),
+                "context": p_str("Optional initial context JSON"),
+            }), &["name"]),
+            tool_def("workspace_read", "Read from a shared workspace.", serde_json::json!({
+                "workspace_id": p_str("Workspace ID"),
+            }), &["workspace_id"]),
+            tool_def("workspace_write", "Write data to a shared workspace.", serde_json::json!({
+                "workspace_id": p_str("Workspace ID"),
+                "key": p_str("Key to write"),
+                "value": p_str("Value to store (string or JSON)"),
+            }), &["workspace_id", "key", "value"]),
+            tool_def("merge_results", "Merge results from completed sub-tasks of a decomposed task.", serde_json::json!({
+                "parent_task_id": p_str("Parent task ID whose sub-tasks to merge"),
+            }), &["parent_task_id"]),
         ]
     });
 
@@ -887,6 +1010,7 @@ fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .route("/api/v1/tools", get(tools_metadata_handler))
+        .route("/api/v1/.well-known/jwks.json", get(jwks_handler))
         .route(
             "/api/v1/tool/:tool_name",
             post(tool_dispatch).layer(middleware::from_fn_with_state(
@@ -924,12 +1048,36 @@ async fn auth_middleware(
         .strip_prefix("Bearer ")
         .ok_or_else(|| BroodlinkError::Auth("expected Bearer token".to_string()))?;
 
-    let token_data = jsonwebtoken::decode::<Claims>(
-        token,
-        &state.jwt_decoding_key,
-        &state.jwt_validation,
-    )
-    .map_err(|e| BroodlinkError::Auth(format!("invalid token: {e}")))?;
+    // Multi-key validation: try kid-matched key first, then all keys
+    let token_data = {
+        let header_kid = jsonwebtoken::decode_header(token)
+            .ok()
+            .and_then(|h| h.kid);
+
+        if let Some(ref kid) = header_kid {
+            // Try the specific key matching the kid
+            if let Some((_, key)) = state.jwt_decoding_keys.iter().find(|(k, _)| k == kid) {
+                jsonwebtoken::decode::<Claims>(token, key, &state.jwt_validation)
+                    .map_err(|e| BroodlinkError::Auth(format!("invalid token (kid={kid}): {e}")))?
+            } else {
+                return Err(BroodlinkError::Auth(format!("unknown key id: {kid}")));
+            }
+        } else {
+            // No kid in header — try all keys (backward compatibility)
+            let mut last_err = String::new();
+            let mut result = None;
+            for (_, key) in &state.jwt_decoding_keys {
+                match jsonwebtoken::decode::<Claims>(token, key, &state.jwt_validation) {
+                    Ok(data) => {
+                        result = Some(data);
+                        break;
+                    }
+                    Err(e) => last_err = e.to_string(),
+                }
+            }
+            result.ok_or_else(|| BroodlinkError::Auth(format!("invalid token: {last_err}")))?
+        }
+    };
 
     // Rate limit check per agent
     state
@@ -1015,6 +1163,7 @@ async fn health_handler(
 // Tool dispatch — routes the 35 tools via path param
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(skip_all, fields(tool, agent, otel.kind = "server"))]
 async fn tool_dispatch(
     State(state): State<Arc<AppState>>,
     Path(tool_name): Path<String>,
@@ -1022,7 +1171,11 @@ async fn tool_dispatch(
     Json(body): Json<ToolRequest>,
 ) -> Result<Json<ToolResponse>, BroodlinkError> {
     let agent_id = &claims.agent_id;
-    let request_id = Uuid::new_v4().to_string();
+    tracing::Span::current().record("tool", &tracing::field::display(&tool_name));
+    tracing::Span::current().record("agent", &tracing::field::display(agent_id));
+    // Prefer OTLP trace ID for cross-service correlation; fall back to UUID
+    let request_id = broodlink_telemetry::current_trace_id()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let params = &body.params;
 
     info!(
@@ -1034,6 +1187,18 @@ async fn tool_dispatch(
 
     // Guardrail check — runs after auth+rate-limit, before tool execution
     check_guardrails(&state, agent_id, &tool_name, params).await?;
+
+    // Budget check — runs after guardrails, before tool execution
+    // Exempt read-only utility and budget-management tools to prevent lockout
+    let budget_exempt = matches!(
+        tool_name.as_str(),
+        "health_check" | "ping" | "get_budget" | "set_budget" | "get_cost_map" | "get_config_info"
+    );
+    let tool_cost = if state.config.budget.enabled && !budget_exempt {
+        check_budget(&state, agent_id, &tool_name).await?
+    } else {
+        0
+    };
 
     let result = match tool_name.as_str() {
         // --- Memory (Dolt) ---
@@ -1048,6 +1213,7 @@ async fn tool_dispatch(
         "graph_traverse" => tool_graph_traverse(&state, agent_id, params).await,
         "graph_update_edge" => tool_graph_update_edge(&state, agent_id, params).await,
         "graph_stats" => tool_graph_stats(&state, agent_id, params).await,
+        "graph_prune" => tool_graph_prune(&state, agent_id, params).await,
 
         // --- Work (Postgres) ---
         "log_work" => tool_log_work(&state, agent_id, params).await,
@@ -1139,6 +1305,23 @@ async fn tool_dispatch(
         // --- Workflow Orchestration ---
         "start_workflow" => tool_start_workflow(&state, agent_id, params).await,
 
+        // --- Budget ---
+        "get_budget" => tool_get_budget(&state, agent_id, params).await,
+        "set_budget" => tool_set_budget(&state, agent_id, params).await,
+        "get_cost_map" => tool_get_cost_map(&state, params).await,
+
+        // --- Dead-Letter Queue ---
+        "inspect_dlq" => tool_inspect_dlq(&state, params).await,
+        "retry_dlq_task" => tool_retry_dlq_task(&state, params).await,
+        "purge_dlq" => tool_purge_dlq(&state, params).await,
+
+        // --- Multi-Agent Collaboration ---
+        "decompose_task" => tool_decompose_task(&state, agent_id, params).await,
+        "create_workspace" => tool_create_workspace(&state, agent_id, params).await,
+        "workspace_read" => tool_workspace_read(&state, params).await,
+        "workspace_write" => tool_workspace_write(&state, agent_id, params).await,
+        "merge_results" => tool_merge_results(&state, params).await,
+
         "ping" => Ok(serde_json::json!({ "pong": true })),
 
         _ => Err(BroodlinkError::NotFound(format!(
@@ -1146,8 +1329,15 @@ async fn tool_dispatch(
         ))),
     };
 
-    // Audit log every tool invocation (best-effort, don't fail the request)
+    // Deduct budget on success (best-effort, don't fail the request)
     let success = result.is_ok();
+    if success && tool_cost > 0 {
+        if let Err(e) = deduct_budget(&state, agent_id, &tool_name, tool_cost, &request_id).await {
+            warn!(error = %e, agent = %agent_id, tool = %tool_name, "budget deduction failed");
+        }
+    }
+
+    // Audit log every tool invocation (best-effort, don't fail the request)
     let audit_error = result.as_ref().err().map(ToString::to_string);
     if let Err(e) = write_audit_log(
         &state.pg,
@@ -1478,6 +1668,42 @@ async fn tool_delete_memory(
     .await
     {
         warn!(error = %e, topic = %topic, "failed to delete from memory_search_index (non-fatal)");
+    }
+
+    // Also delete matching vectors from Qdrant (non-fatal)
+    if state.qdrant_breaker.check().is_ok() {
+        let qdrant_url = format!(
+            "{}/collections/{}/points/delete",
+            state.config.qdrant.url, state.config.qdrant.collection,
+        );
+        let filter_body = serde_json::json!({
+            "filter": {
+                "must": [
+                    { "key": "topic", "match": { "value": topic } },
+                    { "key": "agent_id", "match": { "value": agent_id } }
+                ]
+            }
+        });
+        let client = reqwest::Client::new();
+        match client
+            .post(&qdrant_url)
+            .json(&filter_body)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                state.qdrant_breaker.record_success();
+            }
+            Ok(resp) => {
+                state.qdrant_breaker.record_failure();
+                warn!(status = %resp.status(), topic = %topic, "qdrant delete returned non-success (non-fatal)");
+            }
+            Err(e) => {
+                state.qdrant_breaker.record_failure();
+                warn!(error = %e, topic = %topic, "failed to delete from qdrant (non-fatal)");
+            }
+        }
     }
 
     Ok(serde_json::json!({
@@ -2067,6 +2293,23 @@ async fn tool_hybrid_search(
 // ---------------------------------------------------------------------------
 
 /// Search Qdrant broodlink_kg_entities collection for entity name similarity.
+/// Compute a freshness score for a KG entity based on mention count and recency.
+/// Score in [0.0, 1.0]: higher = more fresh and well-referenced.
+fn compute_freshness(mention_count: i32, last_seen_str: &str, decay_rate: f64) -> f64 {
+    let mention_factor = (f64::from(mention_count) / 10.0).min(1.0);
+    let days_since = chrono::NaiveDateTime::parse_from_str(last_seen_str, "%Y-%m-%d %H:%M:%S%.f")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(last_seen_str, "%Y-%m-%d %H:%M:%S"))
+        .map(|dt| {
+            let now = chrono::Utc::now().naive_utc();
+            (now - dt).num_days().max(0) as f64
+        })
+        .unwrap_or(365.0);
+    let time_factor = (-decay_rate * days_since).exp();
+    // Weighted combination: 40% mention strength, 60% recency
+    let score = 0.4 * mention_factor + 0.6 * time_factor;
+    (score * 1000.0).round() / 1000.0 // Round to 3 decimal places
+}
+
 async fn search_kg_entities_qdrant(
     state: &AppState,
     query_embedding: &[f64],
@@ -2168,9 +2411,12 @@ async fn tool_graph_search(
     // 2. Also search by embedding similarity (best-effort)
     let mut seen_ids: std::collections::HashSet<String> = text_rows.iter().map(|r| r.0.clone()).collect();
 
+    let decay_rate = state.config.memory_search.kg_edge_decay_rate;
+
     let mut entities: Vec<serde_json::Value> = text_rows
         .iter()
         .map(|(eid, name, etype, desc, props, mentions, first, last)| {
+            let freshness = compute_freshness(*mentions, last, decay_rate);
             serde_json::json!({
                 "entity_id": eid,
                 "name": name,
@@ -2178,6 +2424,7 @@ async fn tool_graph_search(
                 "description": desc,
                 "properties": props,
                 "mention_count": mentions,
+                "freshness_score": freshness,
                 "first_seen": first,
                 "last_seen": last,
             })
@@ -2205,6 +2452,7 @@ async fn tool_graph_search(
                         .await?;
                     if let Some((eid2, name, etype, desc, props, mentions, first, last)) = row {
                         if entity_type.is_none() || entity_type == Some(&etype) {
+                            let freshness = compute_freshness(mentions, &last, decay_rate);
                             entities.push(serde_json::json!({
                                 "entity_id": eid2,
                                 "name": name,
@@ -2212,6 +2460,7 @@ async fn tool_graph_search(
                                 "description": desc,
                                 "properties": props,
                                 "mention_count": mentions,
+                                "freshness_score": freshness,
                                 "first_seen": first,
                                 "last_seen": last,
                             }));
@@ -2546,6 +2795,126 @@ async fn tool_graph_stats(
         "top_relation_types": top_relation_types,
         "most_connected_entities": most_connected,
         "last_updated": last,
+    }))
+}
+
+async fn tool_graph_prune(
+    state: &AppState,
+    _agent_id: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let dry_run = param_bool_opt(params, "dry_run").unwrap_or(true);
+    let max_age_days = param_i64_opt(params, "max_age_days")
+        .unwrap_or(i64::from(state.config.memory_search.kg_entity_ttl_days));
+    let min_weight = param_f64_opt(params, "min_weight").unwrap_or(0.1);
+    let min_mentions = i64::from(state.config.memory_search.kg_min_mention_count);
+
+    let ttl_interval = format!("{max_age_days} days");
+
+    // Preview: count what would be affected
+    let stale_entities: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM kg_entities
+         WHERE last_seen < NOW() - $1::interval AND mention_count < $2",
+    )
+    .bind(&ttl_interval)
+    .bind(min_mentions as i32)
+    .fetch_one(&state.pg)
+    .await?;
+
+    let low_weight_edges: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM kg_edges WHERE valid_to IS NULL AND weight < $1",
+    )
+    .bind(min_weight)
+    .fetch_one(&state.pg)
+    .await?;
+
+    let orphan_entities: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM kg_entities e
+         LEFT JOIN kg_edges ea ON (ea.source_id = e.entity_id OR ea.target_id = e.entity_id) AND ea.valid_to IS NULL
+         LEFT JOIN kg_entity_memories em ON em.entity_id = e.entity_id
+         WHERE ea.edge_id IS NULL AND em.entity_id IS NULL",
+    )
+    .fetch_one(&state.pg)
+    .await?;
+
+    if dry_run {
+        return Ok(serde_json::json!({
+            "dry_run": true,
+            "would_prune_entities": stale_entities.0,
+            "would_expire_edges": low_weight_edges.0,
+            "would_remove_orphans": orphan_entities.0,
+            "params": {
+                "max_age_days": max_age_days,
+                "min_weight": min_weight,
+                "min_mentions": min_mentions,
+            },
+        }));
+    }
+
+    // Execute: expire low-weight edges
+    let expired = sqlx::query(
+        "UPDATE kg_edges SET valid_to = NOW(), updated_at = NOW()
+         WHERE valid_to IS NULL AND weight < $1",
+    )
+    .bind(min_weight)
+    .execute(&state.pg)
+    .await?
+    .rows_affected();
+
+    // Delete stale entity_memories links
+    sqlx::query(
+        "DELETE FROM kg_entity_memories WHERE entity_id IN (
+            SELECT entity_id FROM kg_entities
+            WHERE last_seen < NOW() - $1::interval AND mention_count < $2
+        )",
+    )
+    .bind(&ttl_interval)
+    .bind(min_mentions as i32)
+    .execute(&state.pg)
+    .await?;
+
+    // Invalidate edges to stale entities
+    sqlx::query(
+        "UPDATE kg_edges SET valid_to = NOW(), updated_at = NOW()
+         WHERE valid_to IS NULL AND (
+            source_id IN (SELECT entity_id FROM kg_entities WHERE last_seen < NOW() - $1::interval AND mention_count < $2)
+            OR target_id IN (SELECT entity_id FROM kg_entities WHERE last_seen < NOW() - $1::interval AND mention_count < $2)
+         )",
+    )
+    .bind(&ttl_interval)
+    .bind(min_mentions as i32)
+    .execute(&state.pg)
+    .await?;
+
+    // Delete stale entities
+    let pruned = sqlx::query(
+        "DELETE FROM kg_entities
+         WHERE last_seen < NOW() - $1::interval AND mention_count < $2",
+    )
+    .bind(&ttl_interval)
+    .bind(min_mentions as i32)
+    .execute(&state.pg)
+    .await?
+    .rows_affected();
+
+    // Remove orphans
+    let orphans = sqlx::query(
+        "DELETE FROM kg_entities WHERE entity_id IN (
+            SELECT e.entity_id FROM kg_entities e
+            LEFT JOIN kg_edges ea ON (ea.source_id = e.entity_id OR ea.target_id = e.entity_id) AND ea.valid_to IS NULL
+            LEFT JOIN kg_entity_memories em ON em.entity_id = e.entity_id
+            WHERE ea.edge_id IS NULL AND em.entity_id IS NULL
+        )",
+    )
+    .execute(&state.pg)
+    .await?
+    .rows_affected();
+
+    Ok(serde_json::json!({
+        "dry_run": false,
+        "entities_pruned": pruned,
+        "edges_expired": expired,
+        "orphans_removed": orphans,
     }))
 }
 
@@ -3912,6 +4281,634 @@ fn is_readonly_tool(tool: &str) -> bool {
             | "list_skills" | "ping"
             | "graph_search" | "graph_traverse" | "graph_stats"
     )
+}
+
+// ---------------------------------------------------------------------------
+// Budget enforcement
+// ---------------------------------------------------------------------------
+
+/// Look up the cost for a tool call and verify the agent has sufficient budget.
+/// Returns the token cost to deduct after successful execution.
+async fn check_budget(
+    state: &AppState,
+    agent_id: &str,
+    tool_name: &str,
+) -> Result<i64, BroodlinkError> {
+    // Look up per-tool cost, fall back to config default
+    let cost: i64 = sqlx::query_as::<_, (i64,)>(
+        "SELECT cost_tokens FROM tool_cost_map WHERE tool_name = $1",
+    )
+    .bind(tool_name)
+    .fetch_optional(&state.pg)
+    .await?
+    .map_or(state.config.budget.default_tool_cost, |r| r.0);
+
+    if cost == 0 {
+        return Ok(0);
+    }
+
+    // Read current budget from Dolt agent_profiles
+    let balance: i64 = sqlx::query_as::<_, (i64,)>(
+        "SELECT COALESCE(budget_tokens, 0) FROM agent_profiles WHERE agent_id = ?",
+    )
+    .bind(agent_id)
+    .fetch_optional(&state.dolt)
+    .await?
+    .map_or(0, |r| r.0);
+
+    if balance < cost {
+        return Err(BroodlinkError::BudgetExhausted {
+            agent_id: agent_id.to_string(),
+            balance,
+            cost,
+        });
+    }
+
+    Ok(cost)
+}
+
+/// Deduct tokens from agent budget after successful tool execution.
+async fn deduct_budget(
+    state: &AppState,
+    agent_id: &str,
+    tool_name: &str,
+    cost: i64,
+    trace_id: &str,
+) -> Result<(), BroodlinkError> {
+    // Deduct from Dolt agent_profiles
+    sqlx::query("UPDATE agent_profiles SET budget_tokens = budget_tokens - ? WHERE agent_id = ?")
+        .bind(cost)
+        .bind(agent_id)
+        .execute(&state.dolt)
+        .await?;
+
+    // Read new balance
+    let new_balance: i64 = sqlx::query_as::<_, (i64,)>(
+        "SELECT COALESCE(budget_tokens, 0) FROM agent_profiles WHERE agent_id = ?",
+    )
+    .bind(agent_id)
+    .fetch_optional(&state.dolt)
+    .await?
+    .map_or(0, |r| r.0);
+
+    // Record transaction in Postgres
+    sqlx::query(
+        "INSERT INTO budget_transactions (agent_id, tool_name, cost_tokens, balance_after, trace_id)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(agent_id)
+    .bind(tool_name)
+    .bind(-cost)
+    .bind(new_balance)
+    .bind(trace_id)
+    .execute(&state.pg)
+    .await?;
+
+    // Warn if budget is running low
+    if new_balance < state.config.budget.low_budget_threshold && new_balance >= 0 {
+        warn!(
+            agent = %agent_id,
+            balance = new_balance,
+            threshold = state.config.budget.low_budget_threshold,
+            "agent budget running low"
+        );
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Budget tools
+// ---------------------------------------------------------------------------
+
+async fn tool_get_budget(
+    state: &AppState,
+    agent_id: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let target = param_str_opt(params, "agent_id").unwrap_or(agent_id);
+    let limit = param_i64_opt(params, "limit").unwrap_or(10);
+
+    // Current balance from Dolt
+    let balance: i64 = sqlx::query_as::<_, (i64,)>(
+        "SELECT COALESCE(budget_tokens, 0) FROM agent_profiles WHERE agent_id = ?",
+    )
+    .bind(target)
+    .fetch_optional(&state.dolt)
+    .await?
+    .map_or(0, |r| r.0);
+
+    // Recent transactions from Postgres
+    let rows = sqlx::query_as::<_, (String, i64, i64, String, String)>(
+        "SELECT tool_name, cost_tokens, balance_after, trace_id, created_at::text
+         FROM budget_transactions
+         WHERE agent_id = $1
+         ORDER BY created_at DESC
+         LIMIT $2",
+    )
+    .bind(target)
+    .bind(limit)
+    .fetch_all(&state.pg)
+    .await?;
+
+    let transactions: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(tool, cost, bal, tid, ts)| {
+            serde_json::json!({
+                "tool_name": tool,
+                "cost_tokens": cost,
+                "balance_after": bal,
+                "trace_id": tid,
+                "created_at": ts,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "agent_id": target,
+        "balance": balance,
+        "budget_enabled": state.config.budget.enabled,
+        "daily_replenishment": state.config.budget.daily_replenishment,
+        "low_threshold": state.config.budget.low_budget_threshold,
+        "transactions": transactions,
+    }))
+}
+
+async fn tool_set_budget(
+    state: &AppState,
+    agent_id: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let target = param_str(params, "agent_id")?;
+    let tokens = param_i64(params, "tokens")?;
+
+    // Read old balance
+    let old_balance: i64 = sqlx::query_as::<_, (i64,)>(
+        "SELECT COALESCE(budget_tokens, 0) FROM agent_profiles WHERE agent_id = ?",
+    )
+    .bind(target)
+    .fetch_optional(&state.dolt)
+    .await?
+    .map_or(0, |r| r.0);
+
+    // Update in Dolt
+    sqlx::query("UPDATE agent_profiles SET budget_tokens = ? WHERE agent_id = ?")
+        .bind(tokens)
+        .bind(target)
+        .execute(&state.dolt)
+        .await?;
+
+    // Record transaction
+    let diff = tokens - old_balance;
+    sqlx::query(
+        "INSERT INTO budget_transactions (agent_id, tool_name, cost_tokens, balance_after, trace_id)
+         VALUES ($1, 'set_budget', $2, $3, $4)",
+    )
+    .bind(target)
+    .bind(diff)
+    .bind(tokens)
+    .bind(format!("set-by-{agent_id}"))
+    .execute(&state.pg)
+    .await?;
+
+    Ok(serde_json::json!({
+        "agent_id": target,
+        "old_balance": old_balance,
+        "new_balance": tokens,
+        "set_by": agent_id,
+    }))
+}
+
+async fn tool_get_cost_map(
+    state: &AppState,
+    _params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let rows = sqlx::query_as::<_, (String, i64, String)>(
+        "SELECT tool_name, cost_tokens, COALESCE(description, '') FROM tool_cost_map ORDER BY cost_tokens DESC",
+    )
+    .fetch_all(&state.pg)
+    .await?;
+
+    let costs: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(name, cost, desc)| {
+            serde_json::json!({
+                "tool_name": name,
+                "cost_tokens": cost,
+                "description": desc,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "default_cost": state.config.budget.default_tool_cost,
+        "tools": costs,
+        "total": costs.len(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// DLQ tools
+// ---------------------------------------------------------------------------
+
+async fn tool_inspect_dlq(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let include_resolved = param_bool_opt(params, "resolved").unwrap_or(false);
+    let limit = param_i64_opt(params, "limit").unwrap_or(20);
+
+    let rows = if include_resolved {
+        sqlx::query_as::<_, (i64, String, String, String, i32, i32, bool, String, String)>(
+            "SELECT d.id, d.task_id, d.reason, d.source_service,
+                    d.retry_count, d.max_retries, d.resolved,
+                    COALESCE(d.resolved_by, ''), d.created_at::text
+             FROM dead_letter_queue d
+             ORDER BY d.created_at DESC
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&state.pg)
+        .await?
+    } else {
+        sqlx::query_as::<_, (i64, String, String, String, i32, i32, bool, String, String)>(
+            "SELECT d.id, d.task_id, d.reason, d.source_service,
+                    d.retry_count, d.max_retries, d.resolved,
+                    COALESCE(d.resolved_by, ''), d.created_at::text
+             FROM dead_letter_queue d
+             WHERE d.resolved = FALSE
+             ORDER BY d.created_at DESC
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&state.pg)
+        .await?
+    };
+
+    let entries: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(id, task_id, reason, svc, retries, max, resolved, by, ts)| {
+            serde_json::json!({
+                "id": id,
+                "task_id": task_id,
+                "reason": reason,
+                "source_service": svc,
+                "retry_count": retries,
+                "max_retries": max,
+                "resolved": resolved,
+                "resolved_by": by,
+                "created_at": ts,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "entries": entries,
+        "total": entries.len(),
+    }))
+}
+
+async fn tool_retry_dlq_task(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let dlq_id = param_i64(params, "dlq_id")?;
+
+    // Get the DLQ entry
+    let entry = sqlx::query_as::<_, (String, i32, i32, bool)>(
+        "SELECT task_id, retry_count, max_retries, resolved
+         FROM dead_letter_queue WHERE id = $1",
+    )
+    .bind(dlq_id)
+    .fetch_optional(&state.pg)
+    .await?;
+
+    let (task_id, retry_count, _max_retries, resolved) = match entry {
+        Some(e) => e,
+        None => return Err(BroodlinkError::NotFound(format!("DLQ entry {dlq_id}"))),
+    };
+
+    if resolved {
+        return Err(BroodlinkError::Validation {
+            field: "dlq_id".to_string(),
+            message: "entry already resolved".to_string(),
+        });
+    }
+
+    // Reset task to pending
+    sqlx::query(
+        "UPDATE task_queue SET status = 'pending', retry_count = $1, updated_at = NOW()
+         WHERE id = $2",
+    )
+    .bind(retry_count + 1)
+    .bind(&task_id)
+    .execute(&state.pg)
+    .await?;
+
+    // Mark DLQ entry as resolved
+    sqlx::query(
+        "UPDATE dead_letter_queue SET resolved = TRUE, resolved_by = 'manual', updated_at = NOW()
+         WHERE id = $1",
+    )
+    .bind(dlq_id)
+    .execute(&state.pg)
+    .await?;
+
+    // Publish task_available to re-route
+    let subject = format!(
+        "{}.{}.coordinator.task_available",
+        state.config.nats.subject_prefix, state.config.broodlink.env,
+    );
+    let nats_payload = serde_json::json!({
+        "task_id": task_id,
+        "retry": true,
+        "manual": true,
+    });
+    if let Ok(bytes) = serde_json::to_vec(&nats_payload) {
+        if let Err(e) = state.nats.publish(subject, bytes.into()).await {
+            warn!(error = %e, "failed to publish manual retry event");
+        }
+    }
+
+    Ok(serde_json::json!({
+        "dlq_id": dlq_id,
+        "task_id": task_id,
+        "retried": true,
+    }))
+}
+
+async fn tool_purge_dlq(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let older_than_days = param_i64_opt(params, "older_than_days").unwrap_or(7);
+
+    let result = sqlx::query(
+        "DELETE FROM dead_letter_queue
+         WHERE resolved = TRUE
+           AND created_at < NOW() - ($1 || ' days')::interval",
+    )
+    .bind(format!("{older_than_days}"))
+    .execute(&state.pg)
+    .await?;
+
+    Ok(serde_json::json!({
+        "purged": result.rows_affected(),
+        "older_than_days": older_than_days,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Multi-agent collaboration tools
+// ---------------------------------------------------------------------------
+
+async fn tool_decompose_task(
+    state: &AppState,
+    agent_id: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let parent_task_id = param_str(params, "parent_task_id")?;
+    let sub_tasks_raw = param_str(params, "sub_tasks")?;
+    let merge_strategy = param_str_opt(params, "merge_strategy").unwrap_or("concatenate");
+
+    let sub_tasks: Vec<serde_json::Value> = serde_json::from_str(sub_tasks_raw)
+        .map_err(|e| BroodlinkError::Validation {
+            field: "sub_tasks".to_string(),
+            message: format!("invalid JSON array: {e}"),
+        })?;
+
+    let max = state.config.collaboration.max_sub_tasks as usize;
+    if sub_tasks.len() > max {
+        return Err(BroodlinkError::Validation {
+            field: "sub_tasks".to_string(),
+            message: format!("too many sub-tasks ({} > max {})", sub_tasks.len(), max),
+        });
+    }
+
+    let mut child_ids = Vec::new();
+
+    for st in &sub_tasks {
+        let title = st.get("title").and_then(|v| v.as_str()).unwrap_or("sub-task");
+        let desc = st.get("description").and_then(|v| v.as_str()).unwrap_or("");
+        let role = st.get("role").and_then(|v| v.as_str()).unwrap_or("worker");
+        let cost_tier = st.get("cost_tier").and_then(|v| v.as_str()).unwrap_or("low");
+
+        let child_id = Uuid::new_v4().to_string();
+        let trace_id = Uuid::new_v4().to_string();
+
+        sqlx::query(
+            "INSERT INTO task_queue (id, trace_id, title, description, status, priority, parent_task_id, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, 'pending', 5, $5, NOW(), NOW())",
+        )
+        .bind(&child_id)
+        .bind(&trace_id)
+        .bind(title)
+        .bind(desc)
+        .bind(parent_task_id)
+        .execute(&state.pg)
+        .await?;
+
+        // Record decomposition
+        sqlx::query(
+            "INSERT INTO task_decompositions (parent_task_id, child_task_id, merge_strategy)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(parent_task_id)
+        .bind(&child_id)
+        .bind(merge_strategy)
+        .execute(&state.pg)
+        .await?;
+
+        // Publish for routing
+        let subject = format!(
+            "{}.{}.coordinator.task_available",
+            state.config.nats.subject_prefix, state.config.broodlink.env,
+        );
+        let nats_payload = serde_json::json!({
+            "task_id": child_id,
+            "role": role,
+            "cost_tier": cost_tier,
+            "parent_task_id": parent_task_id,
+        });
+        if let Ok(bytes) = serde_json::to_vec(&nats_payload) {
+            let _ = state.nats.publish(subject, bytes.into()).await;
+        }
+
+        child_ids.push(child_id);
+    }
+
+    Ok(serde_json::json!({
+        "parent_task_id": parent_task_id,
+        "child_task_ids": child_ids,
+        "merge_strategy": merge_strategy,
+        "decomposed_by": agent_id,
+        "count": child_ids.len(),
+    }))
+}
+
+async fn tool_create_workspace(
+    state: &AppState,
+    agent_id: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let name = param_str(params, "name")?;
+    let participants_raw = param_str_opt(params, "participants").unwrap_or("[]");
+    let context_raw = param_str_opt(params, "context").unwrap_or("{}");
+
+    let participants: serde_json::Value = serde_json::from_str(participants_raw)
+        .unwrap_or(serde_json::json!([]));
+    let context: serde_json::Value = serde_json::from_str(context_raw)
+        .unwrap_or(serde_json::json!({}));
+
+    let id = Uuid::new_v4().to_string();
+
+    sqlx::query(
+        "INSERT INTO shared_workspaces (id, name, owner_agent, participants, context)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(&id)
+    .bind(name)
+    .bind(agent_id)
+    .bind(&participants)
+    .bind(&context)
+    .execute(&state.pg)
+    .await?;
+
+    Ok(serde_json::json!({
+        "workspace_id": id,
+        "name": name,
+        "owner": agent_id,
+        "created": true,
+    }))
+}
+
+async fn tool_workspace_read(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let workspace_id = param_str(params, "workspace_id")?;
+
+    let row = sqlx::query_as::<_, (String, String, String, serde_json::Value, serde_json::Value, String, String)>(
+        "SELECT id, name, owner_agent, participants, context, status, created_at::text
+         FROM shared_workspaces WHERE id = $1",
+    )
+    .bind(workspace_id)
+    .fetch_optional(&state.pg)
+    .await?;
+
+    match row {
+        Some((id, name, owner, participants, context, status, created)) => {
+            Ok(serde_json::json!({
+                "workspace_id": id,
+                "name": name,
+                "owner_agent": owner,
+                "participants": participants,
+                "context": context,
+                "status": status,
+                "created_at": created,
+            }))
+        }
+        None => Err(BroodlinkError::NotFound(format!("workspace {workspace_id}"))),
+    }
+}
+
+async fn tool_workspace_write(
+    state: &AppState,
+    agent_id: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let workspace_id = param_str(params, "workspace_id")?;
+    let key = param_str(params, "key")?;
+    let value = param_str(params, "value")?;
+
+    // Parse value as JSON if possible, otherwise store as string
+    let json_val: serde_json::Value = serde_json::from_str(value)
+        .unwrap_or(serde_json::Value::String(value.to_string()));
+
+    // Update context JSONB by merging the key
+    sqlx::query(
+        "UPDATE shared_workspaces SET context = context || $1, updated_at = NOW()
+         WHERE id = $2 AND status = 'active'",
+    )
+    .bind(serde_json::json!({ key: json_val }))
+    .bind(workspace_id)
+    .execute(&state.pg)
+    .await?;
+
+    Ok(serde_json::json!({
+        "workspace_id": workspace_id,
+        "key": key,
+        "written_by": agent_id,
+        "success": true,
+    }))
+}
+
+async fn tool_merge_results(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let parent_task_id = param_str(params, "parent_task_id")?;
+
+    // Get decomposition info
+    let decomps: Vec<(String, String)> = sqlx::query_as(
+        "SELECT child_task_id, merge_strategy
+         FROM task_decompositions
+         WHERE parent_task_id = $1
+         ORDER BY id",
+    )
+    .bind(parent_task_id)
+    .fetch_all(&state.pg)
+    .await?;
+
+    if decomps.is_empty() {
+        return Err(BroodlinkError::NotFound(format!(
+            "no decompositions for task {parent_task_id}"
+        )));
+    }
+
+    let strategy = decomps.first().map(|(_, s)| s.as_str()).unwrap_or("concatenate");
+
+    // Get child task results
+    let child_ids: Vec<&str> = decomps.iter().map(|(id, _)| id.as_str()).collect();
+    let mut results = Vec::new();
+    let mut all_completed = true;
+
+    for child_id in &child_ids {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT status, COALESCE(description, '') FROM task_queue WHERE id = $1",
+        )
+        .bind(child_id)
+        .fetch_optional(&state.pg)
+        .await?;
+
+        match row {
+            Some((status, desc)) => {
+                if status != "completed" {
+                    all_completed = false;
+                }
+                results.push(serde_json::json!({
+                    "task_id": child_id,
+                    "status": status,
+                    "result": desc,
+                }));
+            }
+            None => {
+                all_completed = false;
+                results.push(serde_json::json!({
+                    "task_id": child_id,
+                    "status": "not_found",
+                }));
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "parent_task_id": parent_task_id,
+        "merge_strategy": strategy,
+        "all_completed": all_completed,
+        "child_count": results.len(),
+        "children": results,
+    }))
 }
 
 async fn check_guardrails(
@@ -5630,7 +6627,7 @@ mod tests {
     #[test]
     fn test_tool_registry_count() {
         // Must match the number of match arms in tool_dispatch (excluding the _ fallback)
-        assert_eq!(TOOL_REGISTRY.len(), 66, "tool registry should have 66 tools");
+        assert_eq!(TOOL_REGISTRY.len(), 78, "tool registry should have 78 tools");
     }
 
     #[test]

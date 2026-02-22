@@ -373,6 +373,18 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/kg/stats", get(handler_kg_stats))
         .route("/kg/entities", get(handler_kg_entities))
         .route("/kg/edges", get(handler_kg_edges))
+        // v0.6.0 dead-letter queue + budgets + control
+        .route("/dlq", get(handler_dlq))
+        .route("/budgets", get(handler_budgets))
+        .route("/agents/:agent_id/toggle", post(handler_agent_toggle))
+        .route("/budgets/:agent_id/set", post(handler_budget_set))
+        .route("/tasks/:task_id/cancel", post(handler_task_cancel))
+        .route("/workflows", get(handler_workflows))
+        // v0.6.0 webhooks
+        .route("/webhooks", get(handler_webhooks).post(handler_webhook_create))
+        .route("/webhooks/:endpoint_id/toggle", post(handler_webhook_toggle))
+        .route("/webhooks/:endpoint_id/delete", post(handler_webhook_delete))
+        .route("/webhook-log", get(handler_webhook_log))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
@@ -1093,6 +1105,386 @@ async fn handler_kg_edges(
     Ok(ok_response(serde_json::json!({
         "edges": edges,
         "total": edges.len(),
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/dlq
+// ---------------------------------------------------------------------------
+
+async fn handler_dlq(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let include_resolved = params.get("resolved").map_or(false, |v| v == "true");
+    let limit: i64 = params
+        .get("limit")
+        .and_then(|l| l.parse().ok())
+        .unwrap_or(50);
+
+    let rows: Vec<(i64, String, String, String, i32, i32, bool, Option<String>, String)> = if include_resolved {
+        sqlx::query_as(
+            "SELECT id, task_id, reason, source_service, retry_count, max_retries,
+                    resolved, resolved_by, created_at::text
+             FROM dead_letter_queue
+             ORDER BY created_at DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&state.pg)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT id, task_id, reason, source_service, retry_count, max_retries,
+                    resolved, resolved_by, created_at::text
+             FROM dead_letter_queue
+             WHERE resolved = FALSE
+             ORDER BY created_at DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&state.pg)
+        .await?
+    };
+
+    let entries: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(id, task_id, reason, svc, retries, max, resolved, by, ts)| {
+            serde_json::json!({
+                "id": id,
+                "task_id": task_id,
+                "reason": reason,
+                "source_service": svc,
+                "retry_count": retries,
+                "max_retries": max,
+                "resolved": resolved,
+                "resolved_by": by,
+                "created_at": ts,
+            })
+        })
+        .collect();
+
+    Ok(ok_response(serde_json::json!({
+        "entries": entries,
+        "total": entries.len(),
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/budgets
+// ---------------------------------------------------------------------------
+
+async fn handler_budgets(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let agents: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT agent_id, COALESCE(budget_tokens, 0) FROM agent_profiles ORDER BY agent_id",
+    )
+    .fetch_all(&state.dolt)
+    .await?;
+
+    let budgets: Vec<serde_json::Value> = agents
+        .into_iter()
+        .map(|(id, tokens)| {
+            serde_json::json!({
+                "agent_id": id,
+                "budget_tokens": tokens,
+            })
+        })
+        .collect();
+
+    Ok(ok_response(serde_json::json!({
+        "budgets": budgets,
+        "total": budgets.len(),
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/agents/:agent_id/toggle
+// ---------------------------------------------------------------------------
+
+async fn handler_agent_toggle(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(agent_id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let result = sqlx::query(
+        "UPDATE agent_profiles SET active = NOT active WHERE agent_id = ?",
+    )
+    .bind(&agent_id)
+    .execute(&state.dolt)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(StatusApiError::Internal(format!("agent {agent_id} not found")));
+    }
+
+    let (active,): (bool,) = sqlx::query_as(
+        "SELECT active FROM agent_profiles WHERE agent_id = ?",
+    )
+    .bind(&agent_id)
+    .fetch_one(&state.dolt)
+    .await?;
+
+    Ok(ok_response(serde_json::json!({
+        "agent_id": agent_id,
+        "active": active,
+        "toggled": true,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/budgets/:agent_id/set
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct SetBudgetBody {
+    tokens: i64,
+}
+
+async fn handler_budget_set(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(agent_id): axum::extract::Path<String>,
+    Json(body): Json<SetBudgetBody>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    sqlx::query("UPDATE agent_profiles SET budget_tokens = ? WHERE agent_id = ?")
+        .bind(body.tokens)
+        .bind(&agent_id)
+        .execute(&state.dolt)
+        .await?;
+
+    Ok(ok_response(serde_json::json!({
+        "agent_id": agent_id,
+        "new_balance": body.tokens,
+        "set": true,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/tasks/:task_id/cancel
+// ---------------------------------------------------------------------------
+
+async fn handler_task_cancel(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let result = sqlx::query(
+        "UPDATE task_queue SET status = 'failed', updated_at = NOW()
+         WHERE id = $1 AND status IN ('pending', 'claimed')",
+    )
+    .bind(&task_id)
+    .execute(&state.pg)
+    .await?;
+
+    Ok(ok_response(serde_json::json!({
+        "task_id": task_id,
+        "cancelled": result.rows_affected() > 0,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/workflows
+// ---------------------------------------------------------------------------
+
+async fn handler_workflows(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let limit: i64 = params.get("limit").and_then(|l| l.parse().ok()).unwrap_or(20);
+
+    let rows: Vec<(String, String, String, i32, i32, String, String)> = sqlx::query_as(
+        "SELECT id, formula_name, status, current_step, total_steps, started_by, created_at::text
+         FROM workflow_runs
+         ORDER BY created_at DESC
+         LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(&state.pg)
+    .await?;
+
+    let workflows: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(id, formula, status, step, total, by, ts)| {
+            serde_json::json!({
+                "id": id,
+                "formula_name": formula,
+                "status": status,
+                "current_step": step,
+                "total_steps": total,
+                "started_by": by,
+                "created_at": ts,
+            })
+        })
+        .collect();
+
+    Ok(ok_response(serde_json::json!({
+        "workflows": workflows,
+        "total": workflows.len(),
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/webhooks — list webhook endpoints
+// ---------------------------------------------------------------------------
+
+async fn handler_webhooks(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let rows: Vec<(String, String, String, Option<String>, serde_json::Value, bool, String, String)> = sqlx::query_as(
+        "SELECT id, platform, name, webhook_url, events, active, created_at::text, updated_at::text
+         FROM webhook_endpoints
+         ORDER BY created_at DESC",
+    )
+    .fetch_all(&state.pg)
+    .await?;
+
+    let endpoints: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(id, platform, name, url, events, active, created, updated)| {
+            serde_json::json!({
+                "id": id,
+                "platform": platform,
+                "name": name,
+                "webhook_url": url,
+                "events": events,
+                "active": active,
+                "created_at": created,
+                "updated_at": updated,
+            })
+        })
+        .collect();
+
+    Ok(ok_response(serde_json::json!({
+        "endpoints": endpoints,
+        "total": endpoints.len(),
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/webhooks — create webhook endpoint
+// ---------------------------------------------------------------------------
+
+async fn handler_webhook_create(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let platform = body.get("platform").and_then(|v| v.as_str()).unwrap_or("generic");
+    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
+    let webhook_url = body.get("webhook_url").and_then(|v| v.as_str());
+    let events = body.get("events").cloned().unwrap_or(serde_json::json!([]));
+    let id = Uuid::new_v4().to_string();
+
+    sqlx::query(
+        "INSERT INTO webhook_endpoints (id, platform, name, webhook_url, events, active)
+         VALUES ($1, $2, $3, $4, $5, true)",
+    )
+    .bind(&id)
+    .bind(platform)
+    .bind(name)
+    .bind(webhook_url)
+    .bind(&events)
+    .execute(&state.pg)
+    .await?;
+
+    Ok(ok_response(serde_json::json!({
+        "id": id,
+        "platform": platform,
+        "name": name,
+        "created": true,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/webhooks/:endpoint_id/toggle — toggle active
+// ---------------------------------------------------------------------------
+
+async fn handler_webhook_toggle(
+    State(state): State<Arc<AppState>>,
+    Path(endpoint_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let result = sqlx::query(
+        "UPDATE webhook_endpoints SET active = NOT active, updated_at = NOW() WHERE id = $1",
+    )
+    .bind(&endpoint_id)
+    .execute(&state.pg)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Ok(ok_response(serde_json::json!({"error": "endpoint not found"})));
+    }
+
+    let row: (bool,) = sqlx::query_as("SELECT active FROM webhook_endpoints WHERE id = $1")
+        .bind(&endpoint_id)
+        .fetch_one(&state.pg)
+        .await?;
+
+    Ok(ok_response(serde_json::json!({
+        "id": endpoint_id,
+        "active": row.0,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/webhooks/:endpoint_id/delete — delete endpoint
+// ---------------------------------------------------------------------------
+
+async fn handler_webhook_delete(
+    State(state): State<Arc<AppState>>,
+    Path(endpoint_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    // Delete log entries first (FK constraint)
+    sqlx::query("DELETE FROM webhook_log WHERE endpoint_id = $1")
+        .bind(&endpoint_id)
+        .execute(&state.pg)
+        .await?;
+
+    let result = sqlx::query("DELETE FROM webhook_endpoints WHERE id = $1")
+        .bind(&endpoint_id)
+        .execute(&state.pg)
+        .await?;
+
+    Ok(ok_response(serde_json::json!({
+        "id": endpoint_id,
+        "deleted": result.rows_affected() > 0,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/webhook-log — recent webhook deliveries
+// ---------------------------------------------------------------------------
+
+async fn handler_webhook_log(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let limit: i64 = params.get("limit").and_then(|l| l.parse().ok()).unwrap_or(50);
+
+    let rows: Vec<(i64, String, String, String, serde_json::Value, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT wl.id, wl.endpoint_id, wl.direction, wl.event_type, wl.payload, wl.status, wl.error_msg, wl.created_at::text
+         FROM webhook_log wl
+         ORDER BY wl.created_at DESC
+         LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(&state.pg)
+    .await?;
+
+    let entries: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(id, eid, dir, event, payload, status, err, ts)| {
+            serde_json::json!({
+                "id": id,
+                "endpoint_id": eid,
+                "direction": dir,
+                "event_type": event,
+                "payload": payload,
+                "status": status,
+                "error_msg": err,
+                "created_at": ts,
+            })
+        })
+        .collect();
+
+    Ok(ok_response(serde_json::json!({
+        "entries": entries,
+        "total": entries.len(),
     })))
 }
 
