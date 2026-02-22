@@ -78,8 +78,8 @@ async fn main() {
     let jwt_token = match std::fs::read_to_string(&jwt_path) {
         Ok(t) => t.trim().to_string(),
         Err(e) => {
-            warn!(path = %jwt_path, error = %e, "failed to read JWT token — bridge calls will fail");
-            String::new()
+            error!(path = %jwt_path, error = %e, "JWT token required but not found");
+            process::exit(1);
         }
     };
 
@@ -89,11 +89,11 @@ async fn main() {
     // Resolve status-api key from the env var named in config (e.g. BROODLINK_STATUS_API_KEY)
     let status_api_key = std::env::var(&config.status_api.api_key_name)
         .unwrap_or_else(|_| {
-            warn!(
+            error!(
                 key_name = %config.status_api.api_key_name,
-                "status API key env var not set — status-api requests will fail"
+                "status API key env var not set — exiting"
             );
-            String::new()
+            process::exit(1);
         });
 
     let client = BridgeClient::new(

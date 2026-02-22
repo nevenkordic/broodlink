@@ -260,16 +260,22 @@ async fn run_loop(state: Arc<AppState>) {
     // The first tick fires immediately; consume it and run a cycle right away.
     interval.tick().await;
 
+    let cycle_timeout = Duration::from_secs(state.config.heartbeat.cycle_timeout_secs);
+
     // Run the first cycle immediately on startup
-    if let Err(e) = run_cycle(&state).await {
-        error!(error = %e, "heartbeat cycle failed");
+    match tokio::time::timeout(cycle_timeout, run_cycle(&state)).await {
+        Ok(Err(e)) => error!(error = %e, "heartbeat cycle failed"),
+        Err(_) => error!("heartbeat cycle timed out"),
+        Ok(Ok(())) => {}
     }
 
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if let Err(e) = run_cycle(&state).await {
-                    error!(error = %e, "heartbeat cycle failed");
+                match tokio::time::timeout(cycle_timeout, run_cycle(&state)).await {
+                    Ok(Err(e)) => error!(error = %e, "heartbeat cycle failed"),
+                    Err(_) => error!("heartbeat cycle timed out"),
+                    Ok(Ok(())) => {}
                 }
             }
             () = shutdown_signal() => {
@@ -348,7 +354,7 @@ async fn run_cycle(state: &AppState) -> Result<(), BroodlinkError> {
     // -----------------------------------------------------------------------
     // 5b. Mark stale agents inactive
     // -----------------------------------------------------------------------
-    let agents_deactivated = match deactivate_stale_agents(&state.dolt).await {
+    let agents_deactivated = match deactivate_stale_agents(&state.dolt, state.config.heartbeat.stale_agent_minutes).await {
         Ok(n) => n,
         Err(e) => {
             warn!(error = %e, "agent deactivation failed");
@@ -811,13 +817,15 @@ async fn activate_recent_agents(dolt: &MySqlPool, pg: &PgPool) -> Result<u64, Br
 
 /// Mark agents as inactive if their `last_seen` timestamp is older than
 /// one hour.
-async fn deactivate_stale_agents(dolt: &MySqlPool) -> Result<u64, BroodlinkError> {
+async fn deactivate_stale_agents(dolt: &MySqlPool, stale_minutes: u32) -> Result<u64, BroodlinkError> {
     let result = sqlx::query(
-        "UPDATE agent_profiles
-         SET active = false
-         WHERE active = true
-           AND last_seen IS NOT NULL
-           AND last_seen < NOW() - INTERVAL 1 HOUR",
+        &format!(
+            "UPDATE agent_profiles
+             SET active = false
+             WHERE active = true
+               AND last_seen IS NOT NULL
+               AND last_seen < NOW() - INTERVAL {stale_minutes} MINUTE"
+        ),
     )
     .execute(dolt)
     .await?;

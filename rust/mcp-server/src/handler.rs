@@ -58,7 +58,10 @@ impl BridgeClient {
                     .map(|t| convert_tool_to_mcp(t))
                     .collect::<Vec<_>>()
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                tracing::warn!("bridge response missing 'tools' array, returning empty tool list");
+                Vec::new()
+            });
 
         Ok(json!({ "tools": tools }))
     }
@@ -83,10 +86,18 @@ impl BridgeClient {
             .map_err(|e| (protocol::INTERNAL_ERROR, format!("bridge request failed: {e}")))?;
 
         let status = resp.status();
+        let status_code = status.as_u16();
         let response_body: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| (protocol::INTERNAL_ERROR, format!("bridge response parse error: {e}")))?;
+            .map_err(|e| {
+                let code = match status_code {
+                    401 | 403 => protocol::INVALID_REQUEST,
+                    404 => protocol::METHOD_NOT_FOUND,
+                    _ => protocol::INTERNAL_ERROR,
+                };
+                (code, format!("bridge response parse error (HTTP {status_code}): {e}"))
+            })?;
 
         if !status.is_success() {
             let error_msg = response_body["error"]

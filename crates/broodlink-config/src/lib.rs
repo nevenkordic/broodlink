@@ -77,6 +77,8 @@ pub struct Config {
     pub chat: ChatConfig,
     #[serde(default)]
     pub dashboard_auth: DashboardAuthConfig,
+    #[serde(default)]
+    pub heartbeat: HeartbeatConfig,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -876,6 +878,33 @@ fn default_kg_min_mention_count() -> u32 {
     3
 }
 
+// --- Heartbeat config ---
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct HeartbeatConfig {
+    #[serde(default = "default_heartbeat_cycle_timeout_secs")]
+    pub cycle_timeout_secs: u64,
+    #[serde(default = "default_heartbeat_stale_agent_minutes")]
+    pub stale_agent_minutes: u32,
+}
+
+impl Default for HeartbeatConfig {
+    fn default() -> Self {
+        Self {
+            cycle_timeout_secs: default_heartbeat_cycle_timeout_secs(),
+            stale_agent_minutes: default_heartbeat_stale_agent_minutes(),
+        }
+    }
+}
+
+fn default_heartbeat_cycle_timeout_secs() -> u64 {
+    120
+}
+
+fn default_heartbeat_stale_agent_minutes() -> u32 {
+    60
+}
+
 /// Expand a leading `~` to the user's home directory.
 fn expand_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
@@ -913,6 +942,19 @@ impl Config {
         cfg.jwt.keys_dir = expand_tilde(&cfg.jwt.keys_dir);
         if let Some(ref p) = cfg.secrets.age_identity {
             cfg.secrets.age_identity = Some(expand_tilde(p));
+        }
+        if let Some(ref p) = cfg.secrets.sops_file {
+            cfg.secrets.sops_file = Some(expand_tilde(p));
+        }
+        cfg.beads.formulas_dir = expand_tilde(&cfg.beads.formulas_dir);
+        if let Some(ref p) = cfg.tls.cert_path {
+            cfg.tls.cert_path = Some(expand_tilde(p));
+        }
+        if let Some(ref p) = cfg.tls.key_path {
+            cfg.tls.key_path = Some(expand_tilde(p));
+        }
+        if let Some(ref p) = cfg.tls.ca_path {
+            cfg.tls.ca_path = Some(expand_tilde(p));
         }
 
         Ok(cfg)
