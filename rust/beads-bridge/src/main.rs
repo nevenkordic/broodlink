@@ -415,6 +415,7 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
 
     let mut jwt_validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
     jwt_validation.validate_exp = true;
+    jwt_validation.leeway = 300; // 5 minutes clock skew tolerance
     jwt_validation.set_required_spec_claims(&["sub", "agent_id", "exp", "iat"]);
 
     // Dolt (MySQL) pool
@@ -1059,6 +1060,7 @@ fn build_router(state: Arc<AppState>) -> Router {
                 auth_middleware,
             )),
         )
+        .layer(axum::extract::DefaultBodyLimit::max(10_485_760)) // 10 MiB
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -5446,7 +5448,10 @@ async fn check_guardrails(
     )
     .fetch_all(&state.pg)
     .await
-    .unwrap_or_default();
+    .unwrap_or_else(|e| {
+        warn!(error = %e, "failed to load guardrail policies, proceeding without guardrails");
+        Vec::new()
+    });
 
     for (policy_name, rule_type, config) in &policies {
         match rule_type.as_str() {

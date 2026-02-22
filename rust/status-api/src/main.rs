@@ -28,6 +28,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::process;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
@@ -194,6 +195,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub api_key: String,
     pub start_time: Instant,
+    pub login_attempts: RwLock<HashMap<String, (u32, Instant)>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +399,7 @@ async fn init_state() -> Result<AppState, StatusApiError> {
         config,
         api_key,
         start_time: Instant::now(),
+        login_attempts: RwLock::new(HashMap::new()),
     })
 }
 
@@ -485,8 +488,21 @@ fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .nest("/api/v1", api_routes)
         .nest("/api/v1", auth_routes)
+        .layer(middleware::from_fn(security_headers_middleware))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(cors)
+}
+
+async fn security_headers_middleware(
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    headers.insert("X-Frame-Options", header::HeaderValue::from_static("DENY"));
+    headers.insert("X-Content-Type-Options", header::HeaderValue::from_static("nosniff"));
+    headers.insert("Referrer-Policy", header::HeaderValue::from_static("strict-origin-when-cross-origin"));
+    resp
 }
 
 fn build_cors_layer(origins: &[String]) -> CorsLayer {
@@ -2803,6 +2819,18 @@ async fn handler_auth_login(
         ));
     }
 
+    // Rate limit: max 5 failed attempts per username per 5 minutes
+    {
+        let attempts = state.login_attempts.read().unwrap_or_else(|e| e.into_inner());
+        if let Some((count, since)) = attempts.get(&body.username) {
+            if since.elapsed() < Duration::from_secs(300) && *count >= 5 {
+                return Err(StatusApiError::BadRequest(
+                    "too many login attempts, try again later".to_string(),
+                ));
+            }
+        }
+    }
+
     let user: Option<(String, String, String, bool)> = sqlx::query_as(
         "SELECT id, password_hash, role, active FROM dashboard_users WHERE username = $1",
     )
@@ -2810,9 +2838,21 @@ async fn handler_auth_login(
     .fetch_optional(&state.pg)
     .await?;
 
-    let (user_id, password_hash, role, active) = user.ok_or_else(|| {
-        StatusApiError::Auth("invalid username or password".to_string())
-    })?;
+    let (user_id, password_hash, role, active) = match user {
+        Some(u) => u,
+        None => {
+            // Track failed attempt
+            if let Ok(mut attempts) = state.login_attempts.write() {
+                let entry = attempts.entry(body.username.clone()).or_insert((0, Instant::now()));
+                if entry.1.elapsed() >= Duration::from_secs(300) {
+                    *entry = (1, Instant::now());
+                } else {
+                    entry.0 += 1;
+                }
+            }
+            return Err(StatusApiError::Auth("invalid username or password".to_string()));
+        }
+    };
 
     if !active {
         return Err(StatusApiError::Auth("user account is deactivated".to_string()));
@@ -2822,7 +2862,21 @@ async fn handler_auth_login(
         .map_err(|e| StatusApiError::Internal(format!("bcrypt error: {e}")))?;
 
     if !valid {
+        // Track failed attempt
+        if let Ok(mut attempts) = state.login_attempts.write() {
+            let entry = attempts.entry(body.username.clone()).or_insert((0, Instant::now()));
+            if entry.1.elapsed() >= Duration::from_secs(300) {
+                *entry = (1, Instant::now());
+            } else {
+                entry.0 += 1;
+            }
+        }
         return Err(StatusApiError::Auth("invalid username or password".to_string()));
+    }
+
+    // Reset failed attempts on successful login
+    if let Ok(mut attempts) = state.login_attempts.write() {
+        attempts.remove(&body.username);
     }
 
     // Enforce max sessions per user

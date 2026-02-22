@@ -52,3 +52,5 @@ axum-server         = { version = "0.7", features = ["tls-rustls"] }
 futures             = "0.3"
 tokio-stream        = "0.1"
 toml                = "0.8"
+hmac                = "0.12"
+sha2                = "0.10"

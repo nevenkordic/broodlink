@@ -40,6 +40,9 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+
 const SERVICE_NAME: &str = "a2a-gateway";
 
 // ---------------------------------------------------------------------------
@@ -316,10 +319,22 @@ async fn main() {
         }
     }
 
-    let cors = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST])
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
-        .allow_origin(AllowOrigin::any());
+    let cors = if config.a2a.cors_origins.is_empty() {
+        CorsLayer::new()
+            .allow_methods([Method::GET, Method::POST])
+            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+    } else {
+        let parsed: Vec<header::HeaderValue> = config
+            .a2a
+            .cors_origins
+            .iter()
+            .filter_map(|o| o.parse().ok())
+            .collect();
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(parsed))
+            .allow_methods([Method::GET, Method::POST])
+            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+    };
 
     let app = Router::new()
         .route("/.well-known/agent.json", get(agent_card_handler))
@@ -1269,16 +1284,73 @@ async fn log_webhook(
 }
 
 // ---------------------------------------------------------------------------
+// Webhook signature verification helpers
+// ---------------------------------------------------------------------------
+
+fn verify_slack_signature(signing_secret: &str, timestamp: &str, body: &str, signature: &str) -> bool {
+    // Reject requests older than 5 minutes to prevent replay attacks
+    if let Ok(ts) = timestamp.parse::<i64>() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if (now - ts).abs() > 300 {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    let sig_basestring = format!("v0:{timestamp}:{body}");
+    let mut mac = match Hmac::<Sha256>::new_from_slice(signing_secret.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    mac.update(sig_basestring.as_bytes());
+    let result = mac.finalize();
+    let computed = format!("v0={}", hex_encode(result.into_bytes().as_slice()));
+    constant_time_eq(computed.as_bytes(), signature.as_bytes())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+// ---------------------------------------------------------------------------
 // POST /webhook/slack — receive Slack slash commands
 // ---------------------------------------------------------------------------
 
 async fn webhook_slack_handler(
     State(state): State<Arc<AppState>>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     body: String,
 ) -> Response {
     if !state.config.webhooks.enabled {
         return (StatusCode::NOT_FOUND, "webhooks disabled").into_response();
+    }
+
+    // Verify Slack request signature if signing secret is configured
+    if let Some(ref secret) = state.config.webhooks.slack_signing_secret {
+        let timestamp = headers
+            .get("X-Slack-Request-Timestamp")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let signature = headers
+            .get("X-Slack-Signature")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if !verify_slack_signature(secret, timestamp, &body, signature) {
+            warn!("Slack webhook signature verification failed");
+            return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
+        }
     }
 
     // Check if this is a Slack Events API payload (JSON)
@@ -1523,10 +1595,23 @@ async fn webhook_teams_handler(
 
 async fn webhook_telegram_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     body: String,
 ) -> Response {
     if !state.config.webhooks.enabled {
         return (StatusCode::NOT_FOUND, "webhooks disabled").into_response();
+    }
+
+    // Verify Telegram secret token if configured
+    if let Some(ref secret) = state.config.webhooks.telegram_secret_token {
+        let provided = headers
+            .get("X-Telegram-Bot-Api-Secret-Token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !constant_time_eq(secret.as_bytes(), provided.as_bytes()) {
+            warn!("Telegram webhook secret token verification failed");
+            return (StatusCode::UNAUTHORIZED, "invalid secret token").into_response();
+        }
     }
 
     let payload: serde_json::Value = match serde_json::from_str(&body) {

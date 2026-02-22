@@ -411,6 +411,8 @@ pub struct A2aConfig {
     pub bridge_url: String,
     #[serde(default)]
     pub bridge_jwt_path: Option<String>,
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
 }
 
 impl Default for A2aConfig {
@@ -421,6 +423,7 @@ impl Default for A2aConfig {
             api_key_name: default_a2a_api_key_name(),
             bridge_url: default_a2a_bridge_url(),
             bridge_jwt_path: None,
+            cors_origins: Vec::new(),
         }
     }
 }
@@ -718,6 +721,8 @@ pub struct WebhookConfig {
     pub teams_app_id: Option<String>,
     #[serde(default)]
     pub telegram_bot_token: Option<String>,
+    #[serde(default)]
+    pub telegram_secret_token: Option<String>,
     #[serde(default = "default_webhook_delivery_timeout_secs")]
     pub delivery_timeout_secs: u64,
     #[serde(default = "default_webhook_max_retries")]
@@ -732,6 +737,7 @@ impl Default for WebhookConfig {
             slack_bot_token: None,
             teams_app_id: None,
             telegram_bot_token: None,
+            telegram_secret_token: None,
             delivery_timeout_secs: default_webhook_delivery_timeout_secs(),
             max_retries: default_webhook_max_retries(),
         }

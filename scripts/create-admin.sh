@@ -104,7 +104,8 @@ fi
 
 # Method 3: Postgres pgcrypto (no Python dependency needed)
 if [[ -z "$HASH" ]]; then
-  HASH=$(run_sql "SELECT crypt('$PASSWORD', gen_salt('bf', $BCRYPT_COST));" "-tA") || true
+  SAFE_PW="${PASSWORD//\'/\'\'}"
+  HASH=$(run_sql "SELECT crypt('$SAFE_PW', gen_salt('bf', $BCRYPT_COST));" "-tA") || true
 fi
 
 if [[ -z "$HASH" ]]; then
@@ -117,9 +118,13 @@ USER_ID=$(python3 -c "import uuid; print(str(uuid.uuid4()))")
 
 echo "Creating dashboard user: $USERNAME (role=$ROLE)"
 
-DISPLAY_SQL=$([ -n "$DISPLAY_NAME" ] && echo "'$DISPLAY_NAME'" || echo "NULL")
+SAFE_USER="${USERNAME//\'/\'\'}"
+SAFE_HASH="${HASH//\'/\'\'}"
+SAFE_ROLE="${ROLE//\'/\'\'}"
+SAFE_DISPLAY="${DISPLAY_NAME//\'/\'\'}"
+DISPLAY_SQL=$([ -n "$DISPLAY_NAME" ] && echo "'$SAFE_DISPLAY'" || echo "NULL")
 run_sql "INSERT INTO dashboard_users (id, username, password_hash, role, display_name)
-    VALUES ('$USER_ID', '$USERNAME', '$HASH', '$ROLE', $DISPLAY_SQL)
+    VALUES ('$USER_ID', '$SAFE_USER', '$SAFE_HASH', '$SAFE_ROLE', $DISPLAY_SQL)
     ON CONFLICT (username) DO NOTHING;" "-q"
 
 echo "Done. User '$USERNAME' is ready (ON CONFLICT = no-op if exists)."
