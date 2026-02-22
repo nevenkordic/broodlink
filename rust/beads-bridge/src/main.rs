@@ -5059,7 +5059,7 @@ async fn tool_reply_to_chat(
     // Insert into reply queue
     sqlx::query(
         "INSERT INTO chat_reply_queue (session_id, task_id, content, platform, channel_id, thread_id)
-         VALUES ($1, '00000000-0000-0000-0000-000000000000', $2, $3, $4, $5)",
+         VALUES ($1, NULL, $2, $3, $4, $5)",
     )
     .bind(session_id)
     .bind(content)
