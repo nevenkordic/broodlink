@@ -6,7 +6,7 @@ Broodlink lets multiple AI agents work together. Instead of one AI working alone
 
 **Copyright (C) 2025-2026 Neven Kordic <neven@broodlink.ai>**
 
-![Broodlink Operations Dashboard](docs/dashboard-screenshot.png)
+![Broodlink Operations Dashboard](docs/dashboard.png)
 
 ## Quick Start
 
