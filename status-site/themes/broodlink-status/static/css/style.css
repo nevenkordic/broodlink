@@ -967,3 +967,295 @@ pre code {
     transform: none;
   }
 }
+
+/* --- Control Panel Tabs --- */
+.tab-bar {
+  display: flex;
+  gap: 0;
+  border-bottom: 2px solid var(--border, #333);
+  margin-bottom: 1.5rem;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+
+.tab-bar::-webkit-scrollbar { display: none; }
+
+.tab-bar .tab {
+  padding: 0.625rem 1.125rem;
+  border: none;
+  background: none;
+  color: var(--text-secondary, #94a3b8);
+  cursor: pointer;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -2px;
+  white-space: nowrap;
+  transition: color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.tab-bar .tab:hover {
+  color: var(--text-primary, #e2e8f0);
+}
+
+.tab-bar .tab:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-offset);
+}
+
+.tab-bar .tab.active {
+  color: var(--accent, #3a6ea5);
+  border-bottom-color: var(--accent, #3a6ea5);
+}
+
+/* --- Control Panel Section Headers --- */
+.ctrl-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+}
+
+.ctrl-section-header h3 {
+  margin: 0;
+}
+
+/* --- Control Panel Buttons --- */
+.btn-sm {
+  padding: 0.375rem 0.75rem;
+  font-size: 0.75rem;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: #fff;
+  border: 1px solid var(--accent);
+}
+
+.btn-primary:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.btn-danger {
+  color: var(--red);
+  border-color: color-mix(in srgb, var(--red) 40%, transparent);
+}
+
+.btn-danger:hover {
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  border-color: var(--red);
+}
+
+.btn-ghost {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+}
+
+.btn-ghost:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+/* Inline button groups in table cells */
+.ctrl-btn-group {
+  display: flex;
+  gap: 0.375rem;
+  flex-wrap: nowrap;
+}
+
+.ctrl-btn-group .btn {
+  padding: 0.25rem 0.625rem;
+  font-size: 0.6875rem;
+}
+
+/* --- Budget Cards --- */
+.ctrl-budget-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(18rem, 1fr));
+  gap: 1rem;
+}
+
+.ctrl-budget-card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-subtle);
+  border-radius: 0.5rem;
+  padding: 1.25rem;
+}
+
+.ctrl-budget-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.75rem;
+}
+
+.ctrl-budget-card-header .agent-name {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.ctrl-budget-card-header .cost-tier {
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 0.125rem 0.5rem;
+  border-radius: 999px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+}
+
+.ctrl-budget-bar {
+  height: 6px;
+  background: var(--bg-tertiary);
+  border-radius: 3px;
+  overflow: hidden;
+  margin-bottom: 0.5rem;
+}
+
+.ctrl-budget-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.4s ease;
+}
+
+.ctrl-budget-card-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.ctrl-budget-amount {
+  font-family: var(--font-mono);
+  font-size: 1.125rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.ctrl-budget-label {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+
+/* --- Status Badges --- */
+.ctrl-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.125rem 0.5rem;
+  font-size: 0.6875rem;
+  font-weight: 500;
+  border-radius: 999px;
+  text-transform: capitalize;
+}
+
+.ctrl-badge-ok      { background: var(--green-glow); color: var(--green); }
+.ctrl-badge-pending  { background: var(--amber-glow); color: var(--amber); }
+.ctrl-badge-failed   { background: var(--red-glow);   color: var(--red); }
+.ctrl-badge-claimed  { background: rgba(59,130,246,0.12); color: var(--blue); }
+.ctrl-badge-offline  { background: rgba(148,163,184,0.12); color: var(--text-secondary); }
+
+/* --- Workflow Progress --- */
+.ctrl-progress {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.ctrl-progress-bar {
+  flex: 1;
+  height: 4px;
+  background: var(--bg-tertiary);
+  border-radius: 2px;
+  overflow: hidden;
+  min-width: 3rem;
+}
+
+.ctrl-progress-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+.ctrl-progress-label {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+/* --- Empty States --- */
+.ctrl-empty {
+  text-align: center;
+  padding: 3rem 1rem;
+  color: var(--text-secondary);
+}
+
+.ctrl-empty svg {
+  display: block;
+  margin: 0 auto 0.75rem;
+  opacity: 0.4;
+}
+
+.ctrl-empty-title {
+  font-size: 0.9375rem;
+  color: var(--text-primary);
+  margin-bottom: 0.25rem;
+}
+
+.ctrl-empty-desc {
+  font-size: 0.8125rem;
+}
+
+/* --- Toast Notifications --- */
+.ctrl-toast-container {
+  position: fixed;
+  bottom: 1.5rem;
+  right: 1.5rem;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 0.5rem;
+  pointer-events: none;
+}
+
+.ctrl-toast {
+  pointer-events: auto;
+  padding: 0.625rem 1rem;
+  border-radius: 0.5rem;
+  font-size: 0.8125rem;
+  color: #fff;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  opacity: 0;
+  transform: translateY(0.5rem);
+  animation: ctrl-toast-in 0.2s ease forwards;
+}
+
+.ctrl-toast-success { background: color-mix(in srgb, var(--green) 85%, #000); }
+.ctrl-toast-error   { background: color-mix(in srgb, var(--red) 85%, #000); }
+.ctrl-toast-info    { background: color-mix(in srgb, var(--accent) 85%, #000); }
+
+@keyframes ctrl-toast-in {
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes ctrl-toast-out {
+  to { opacity: 0; transform: translateY(-0.5rem); }
+}
+
+/* --- Responsive tab bar --- */
+@media (max-width: 48rem) {
+  .ctrl-budget-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .ctrl-section-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.5rem;
+  }
+}

@@ -1,0 +1,204 @@
+{{ define "main" }}
+<h2>Control Panel</h2>
+<p class="page-desc">Manage agents, budgets, tasks, workflows, guardrails, webhooks, and the dead-letter queue.</p>
+
+<!-- Summary Metrics -->
+<section aria-labelledby="ctrl-metrics-heading">
+  <h3 id="ctrl-metrics-heading" class="visually-hidden">Control Panel Metrics</h3>
+  <div class="card-grid" id="ctrl-metrics-grid">
+    <div class="card metric-card">
+      <div class="value" id="ctrl-metric-agents">—</div>
+      <div class="label">Active Agents</div>
+    </div>
+    <div class="card metric-card">
+      <div class="value" id="ctrl-metric-budget">—</div>
+      <div class="label">Total Budget</div>
+    </div>
+    <div class="card metric-card">
+      <div class="value" id="ctrl-metric-tasks">—</div>
+      <div class="label">Pending Tasks</div>
+    </div>
+    <div class="card metric-card">
+      <div class="value" id="ctrl-metric-dlq">—</div>
+      <div class="label">DLQ Entries</div>
+    </div>
+  </div>
+</section>
+
+<nav class="tab-bar" role="tablist" aria-label="Control panel tabs">
+  <button role="tab" aria-selected="true" aria-controls="panel-agents" id="tab-agents" class="tab active" data-tab="agents">Agents</button>
+  <button role="tab" aria-selected="false" aria-controls="panel-budgets" id="tab-budgets" class="tab" data-tab="budgets">Budgets</button>
+  <button role="tab" aria-selected="false" aria-controls="panel-tasks" id="tab-tasks" class="tab" data-tab="tasks">Tasks</button>
+  <button role="tab" aria-selected="false" aria-controls="panel-workflows" id="tab-workflows" class="tab" data-tab="workflows">Workflows</button>
+  <button role="tab" aria-selected="false" aria-controls="panel-guardrails" id="tab-guardrails" class="tab" data-tab="guardrails">Guardrails</button>
+  <button role="tab" aria-selected="false" aria-controls="panel-webhooks" id="tab-webhooks" class="tab" data-tab="webhooks">Webhooks</button>
+  <button role="tab" aria-selected="false" aria-controls="panel-dlq" id="tab-dlq" class="tab" data-tab="dlq">DLQ</button>
+</nav>
+
+<!-- Toast container -->
+<div id="ctrl-toast-container" class="ctrl-toast-container" aria-live="polite" aria-atomic="false"></div>
+
+<!-- Agents Tab -->
+<section role="tabpanel" id="panel-agents" aria-labelledby="tab-agents">
+  <div class="ctrl-section-header">
+    <h3>Agent Roster</h3>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">Agent</th>
+        <th scope="col">Role</th>
+        <th scope="col">Cost Tier</th>
+        <th scope="col">Transport</th>
+        <th scope="col">Status</th>
+        <th scope="col">Actions</th>
+      </tr>
+    </thead>
+    <tbody id="ctrl-agents-tbody" aria-live="polite"></tbody>
+  </table>
+</section>
+
+<!-- Budgets Tab -->
+<section role="tabpanel" id="panel-budgets" aria-labelledby="tab-budgets" hidden>
+  <div class="ctrl-section-header">
+    <h3>Agent Budgets</h3>
+  </div>
+  <div id="ctrl-budgets-cards" class="ctrl-budget-grid" aria-live="polite"></div>
+</section>
+
+<!-- Tasks Tab -->
+<section role="tabpanel" id="panel-tasks" aria-labelledby="tab-tasks" hidden>
+  <div class="ctrl-section-header">
+    <h3>Active Tasks</h3>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">ID</th>
+        <th scope="col">Title</th>
+        <th scope="col">Status</th>
+        <th scope="col">Agent</th>
+        <th scope="col">Created</th>
+        <th scope="col">Actions</th>
+      </tr>
+    </thead>
+    <tbody id="ctrl-tasks-tbody" aria-live="polite"></tbody>
+  </table>
+</section>
+
+<!-- Workflows Tab -->
+<section role="tabpanel" id="panel-workflows" aria-labelledby="tab-workflows" hidden>
+  <div class="ctrl-section-header">
+    <h3>Workflow Runs</h3>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">ID</th>
+        <th scope="col">Formula</th>
+        <th scope="col">Status</th>
+        <th scope="col">Progress</th>
+        <th scope="col">Started By</th>
+        <th scope="col">Created</th>
+      </tr>
+    </thead>
+    <tbody id="ctrl-workflows-tbody" aria-live="polite"></tbody>
+  </table>
+</section>
+
+<!-- Guardrails Tab -->
+<section role="tabpanel" id="panel-guardrails" aria-labelledby="tab-guardrails" hidden>
+  <div class="ctrl-section-header">
+    <h3>Guardrail Policies</h3>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">Name</th>
+        <th scope="col">Type</th>
+        <th scope="col">Status</th>
+        <th scope="col">Violations</th>
+      </tr>
+    </thead>
+    <tbody id="ctrl-guardrails-tbody" aria-live="polite"></tbody>
+  </table>
+  <div class="ctrl-section-header" style="margin-top:2rem">
+    <h3>Recent Violations</h3>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">Agent</th>
+        <th scope="col">Policy</th>
+        <th scope="col">Tool</th>
+        <th scope="col">Time</th>
+      </tr>
+    </thead>
+    <tbody id="ctrl-violations-tbody" aria-live="polite"></tbody>
+  </table>
+</section>
+
+<!-- Webhooks Tab -->
+<section role="tabpanel" id="panel-webhooks" aria-labelledby="tab-webhooks" hidden>
+  <div class="ctrl-section-header">
+    <h3>Webhook Endpoints</h3>
+    <button class="btn btn-primary btn-sm" onclick="Ctrl.addWebhook()">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 2a1 1 0 011 1v4h4a1 1 0 110 2H9v4a1 1 0 11-2 0V9H3a1 1 0 010-2h4V3a1 1 0 011-1z"/></svg>
+      Add Endpoint
+    </button>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">Name</th>
+        <th scope="col">Platform</th>
+        <th scope="col">URL</th>
+        <th scope="col">Events</th>
+        <th scope="col">Status</th>
+        <th scope="col">Actions</th>
+      </tr>
+    </thead>
+    <tbody id="ctrl-webhooks-tbody" aria-live="polite"></tbody>
+  </table>
+  <div class="ctrl-section-header" style="margin-top:2rem">
+    <h3>Recent Deliveries</h3>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">ID</th>
+        <th scope="col">Direction</th>
+        <th scope="col">Event</th>
+        <th scope="col">Status</th>
+        <th scope="col">Time</th>
+      </tr>
+    </thead>
+    <tbody id="ctrl-webhook-log-tbody" aria-live="polite"></tbody>
+  </table>
+</section>
+
+<!-- DLQ Tab -->
+<section role="tabpanel" id="panel-dlq" aria-labelledby="tab-dlq" hidden>
+  <div class="ctrl-section-header">
+    <h3>Dead-Letter Queue</h3>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">ID</th>
+        <th scope="col">Task</th>
+        <th scope="col">Reason</th>
+        <th scope="col">Retries</th>
+        <th scope="col">Created</th>
+        <th scope="col">Actions</th>
+      </tr>
+    </thead>
+    <tbody id="ctrl-dlq-tbody" aria-live="polite"></tbody>
+  </table>
+</section>
+
+{{ end }}
+
+{{ define "scripts" }}
+<script src="/js/control.js"></script>
+{{ end }}
