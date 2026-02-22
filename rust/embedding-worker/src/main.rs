@@ -265,7 +265,7 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
             sc.sops_file.as_deref(),
             sc.age_identity.as_deref(),
             sc.infisical_url.as_deref(),
-            None,
+            sc.infisical_token.as_deref(),
         )?;
         Arc::from(provider)
     };

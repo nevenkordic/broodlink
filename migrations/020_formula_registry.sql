@@ -2,7 +2,7 @@
 -- Stores workflow formulas in Postgres for dashboard management.
 -- Coordinator reads from this table first, falls back to TOML files.
 
-CREATE TABLE formula_registry (
+CREATE TABLE IF NOT EXISTS formula_registry (
     id VARCHAR(36) PRIMARY KEY,
     name VARCHAR(100) NOT NULL UNIQUE,       -- e.g. "research", "build-feature"
     display_name VARCHAR(255) NOT NULL,

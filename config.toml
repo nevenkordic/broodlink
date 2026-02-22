@@ -54,10 +54,11 @@ embedding_model = "nomic-embed-text"
 timeout_seconds = 30
 
 [secrets]
-provider      = "sops"
-sops_file     = "./secrets.enc.json"
-age_identity  = "~/.broodlink/age-identity"
-infisical_url = "http://localhost:8080"
+provider        = "sops"
+sops_file       = "./secrets.enc.json"
+age_identity    = "~/.broodlink/age-identity"
+infisical_url   = "http://localhost:8080"
+# infisical_token = ""   # required when provider = "infisical"
 
 [status_api]
 port         = 3312

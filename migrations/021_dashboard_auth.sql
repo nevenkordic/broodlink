@@ -1,7 +1,7 @@
 -- Broodlink v0.7.0 — Dashboard Role-Based Access Control
 -- Adds dashboard_users and dashboard_sessions tables for session-based auth.
 
-CREATE TABLE dashboard_users (
+CREATE TABLE IF NOT EXISTS dashboard_users (
     id VARCHAR(36) PRIMARY KEY,
     username VARCHAR(100) NOT NULL UNIQUE,
     password_hash VARCHAR(255) NOT NULL,     -- bcrypt hash
@@ -13,7 +13,7 @@ CREATE TABLE dashboard_users (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE dashboard_sessions (
+CREATE TABLE IF NOT EXISTS dashboard_sessions (
     id VARCHAR(36) PRIMARY KEY,              -- session token
     user_id VARCHAR(36) NOT NULL REFERENCES dashboard_users(id),
     expires_at TIMESTAMPTZ NOT NULL,

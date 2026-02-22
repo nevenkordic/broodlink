@@ -367,7 +367,7 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
             sc.sops_file.as_deref(),
             sc.age_identity.as_deref(),
             sc.infisical_url.as_deref(),
-            None, // infisical token resolved from env at provider level
+            sc.infisical_token.as_deref(),
         )?;
         Arc::from(provider)
     };
@@ -388,8 +388,7 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
     info!(kid = %primary_kid, "loaded primary JWT key");
 
     // Scan keys_dir for additional public keys (for rotation)
-    let keys_dir = config.jwt.keys_dir.replace('~', &std::env::var("HOME").unwrap_or_default());
-    if let Ok(entries) = std::fs::read_dir(&keys_dir) {
+    if let Ok(entries) = std::fs::read_dir(&config.jwt.keys_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             let fname = entry.file_name().to_string_lossy().to_string();

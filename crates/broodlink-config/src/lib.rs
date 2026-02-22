@@ -199,6 +199,8 @@ pub struct SecretsConfig {
     pub age_identity: Option<String>,
     #[serde(default)]
     pub infisical_url: Option<String>,
+    #[serde(default)]
+    pub infisical_token: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -868,6 +870,16 @@ fn default_kg_min_mention_count() -> u32 {
     3
 }
 
+/// Expand a leading `~` to the user's home directory.
+fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{home}/{rest}");
+        }
+    }
+    path.to_string()
+}
+
 impl Config {
     /// Load configuration from file path specified by `BROODLINK_CONFIG` env var,
     /// with environment variable overrides.
@@ -889,7 +901,15 @@ impl Config {
             )
             .build()?;
 
-        settings.try_deserialize()
+        let mut cfg: Self = settings.try_deserialize()?;
+
+        // Expand tilde in paths that may contain ~/
+        cfg.jwt.keys_dir = expand_tilde(&cfg.jwt.keys_dir);
+        if let Some(ref p) = cfg.secrets.age_identity {
+            cfg.secrets.age_identity = Some(expand_tilde(p));
+        }
+
+        Ok(cfg)
     }
 }
 
