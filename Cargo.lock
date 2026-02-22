@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "a2a-gateway"
-version = "0.3.0"
+version = "0.7.0"
 dependencies = [
  "async-nats",
  "axum",
@@ -305,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "beads-bridge"
-version = "0.3.0"
+version = "0.7.0"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -371,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "broodlink-config"
-version = "0.3.0"
+version = "0.7.0"
 dependencies = [
  "config",
  "serde",
@@ -382,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "broodlink-runtime"
-version = "0.3.0"
+version = "0.7.0"
 dependencies = [
  "async-nats",
  "broodlink-config",
@@ -392,7 +392,7 @@ dependencies = [
 
 [[package]]
 name = "broodlink-secrets"
-version = "0.3.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -405,7 +405,7 @@ dependencies = [
 
 [[package]]
 name = "broodlink-telemetry"
-version = "0.3.0"
+version = "0.7.0"
 dependencies = [
  "broodlink-config",
  "http 1.4.0",
@@ -556,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator"
-version = "0.3.0"
+version = "0.7.0"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -778,7 +778,7 @@ dependencies = [
 
 [[package]]
 name = "embedding-worker"
-version = "0.3.0"
+version = "0.7.0"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -1155,7 +1155,7 @@ dependencies = [
 
 [[package]]
 name = "heartbeat"
-version = "0.3.0"
+version = "0.7.0"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -1697,7 +1697,7 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "mcp-server"
-version = "0.3.0"
+version = "0.7.0"
 dependencies = [
  "axum",
  "broodlink-config",
@@ -2994,7 +2994,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "status-api"
-version = "0.3.0"
+version = "0.7.0"
 dependencies = [
  "async-nats",
  "async-trait",

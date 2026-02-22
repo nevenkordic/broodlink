@@ -2239,15 +2239,19 @@ async fn main() {
 
     // Wait for tasks to complete with a timeout
     let shutdown_timeout = Duration::from_secs(10);
-    let _ = tokio::time::timeout(shutdown_timeout, async {
-        let _ = sub_handle.await;
-        let _ = wf_start_handle.await;
-        let _ = task_completed_handle.await;
-        let _ = task_failed_handle.await;
-        let _ = metrics_handle.await;
-        let _ = dlq_handle.await;
+    match tokio::time::timeout(shutdown_timeout, async {
+        if let Err(e) = sub_handle.await { warn!(error = %e, "subscription task panicked"); }
+        if let Err(e) = wf_start_handle.await { warn!(error = %e, "workflow start task panicked"); }
+        if let Err(e) = task_completed_handle.await { warn!(error = %e, "task completed handler panicked"); }
+        if let Err(e) = task_failed_handle.await { warn!(error = %e, "task failed handler panicked"); }
+        if let Err(e) = metrics_handle.await { warn!(error = %e, "metrics task panicked"); }
+        if let Err(e) = dlq_handle.await { warn!(error = %e, "DLQ retry task panicked"); }
     })
-    .await;
+    .await
+    {
+        Ok(()) => info!("all background tasks stopped"),
+        Err(_) => warn!("shutdown timed out after {shutdown_timeout:?}, forcing exit"),
+    }
 
     // Close database pools
     state.pg.close().await;
