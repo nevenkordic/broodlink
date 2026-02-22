@@ -548,13 +548,16 @@ async fn publish_dead_letter(
     state.tasks_dead_lettered.fetch_add(1, Ordering::Relaxed);
 
     // Also mark the task as 'failed' in Postgres so it is not picked up again
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "UPDATE task_queue SET status = 'failed', updated_at = NOW()
          WHERE id = $1 AND status = 'pending'",
     )
     .bind(task_id)
     .execute(&state.pg)
-    .await;
+    .await
+    {
+        warn!(task_id = %task_id, error = %e, "failed to mark task as failed in DB");
+    }
 
     // Persist to dead_letter_queue for inspection and auto-retry
     let max_retries = state.config.dlq.max_retries as i32;
@@ -566,7 +569,7 @@ async fn publish_dead_letter(
         None
     };
 
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "INSERT INTO dead_letter_queue (task_id, reason, source_service, max_retries, next_retry_at)
          VALUES ($1, $2, $3, $4, $5)",
     )
@@ -576,7 +579,10 @@ async fn publish_dead_letter(
     .bind(max_retries)
     .bind(next_retry)
     .execute(&state.pg)
-    .await;
+    .await
+    {
+        warn!(task_id = %task_id, error = %e, "failed to insert into dead_letter_queue");
+    }
 
     Ok(())
 }
@@ -659,13 +665,16 @@ async fn load_formula_from_registry(
 
     if let Some((definition,)) = row {
         // Increment usage_count and update last_used_at
-        let _ = sqlx::query(
+        if let Err(e) = sqlx::query(
             "UPDATE formula_registry SET usage_count = usage_count + 1, last_used_at = NOW(), updated_at = NOW()
              WHERE name = $1",
         )
         .bind(formula_name)
         .execute(pg)
-        .await;
+        .await
+        {
+            warn!(formula = %formula_name, error = %e, "failed to update formula usage count");
+        }
 
         // Parse JSONB definition into FormulaFile
         let formula: FormulaFile = serde_json::from_value(definition).map_err(|e| {
@@ -688,6 +697,16 @@ async fn load_formula_from_registry(
 }
 
 fn load_formula(config: &Config, formula_name: &str) -> Result<FormulaFile, BroodlinkError> {
+    // Validate formula name to prevent path traversal
+    if !formula_name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(BroodlinkError::Internal(format!(
+            "invalid formula name: {formula_name}"
+        )));
+    }
+
     let path = std::path::Path::new(&config.beads.workspace)
         .join(&config.beads.formulas_dir)
         .join(format!("{formula_name}.formula.toml"));
@@ -1262,7 +1281,9 @@ async fn handle_task_failed(
                 "retry_count": new_count,
             });
             if let Ok(bytes) = serde_json::to_vec(&nats_payload) {
-                let _ = state.nats.publish(subject, bytes.into()).await;
+                if let Err(e) = state.nats.publish(subject, bytes.into()).await {
+                    warn!(task_id = %payload.task_id, error = %e, "failed to re-publish task_available after retry");
+                }
             }
 
             return Ok(());
@@ -1325,7 +1346,9 @@ async fn handle_task_failed(
             "role": error_handler.agent_role,
         });
         if let Ok(bytes) = serde_json::to_vec(&nats_payload) {
-            let _ = state.nats.publish(subject, bytes.into()).await;
+            if let Err(e) = state.nats.publish(subject, bytes.into()).await {
+                warn!(task_id = %handler_task_id, error = %e, "failed to publish error handler task_available");
+            }
         }
 
         return Ok(());
@@ -1992,13 +2015,16 @@ async fn check_dlq_retries(state: &AppState) -> Result<u64, BroodlinkError> {
 
         if updated.rows_affected() == 0 {
             // Task no longer in 'failed' state — mark DLQ entry resolved
-            let _ = sqlx::query(
+            if let Err(e) = sqlx::query(
                 "UPDATE dead_letter_queue SET resolved = TRUE, resolved_by = 'auto-skip', updated_at = NOW()
                  WHERE id = $1",
             )
             .bind(dlq_id)
             .execute(&state.pg)
-            .await;
+            .await
+            {
+                warn!(dlq_id = %dlq_id, error = %e, "failed to mark DLQ entry as auto-skipped");
+            }
             continue;
         }
 
@@ -2011,7 +2037,7 @@ async fn check_dlq_retries(state: &AppState) -> Result<u64, BroodlinkError> {
         };
 
         // Update DLQ entry
-        let _ = sqlx::query(
+        if let Err(e) = sqlx::query(
             "UPDATE dead_letter_queue SET retry_count = $1, next_retry_at = $2, updated_at = NOW()
              WHERE id = $3",
         )
@@ -2019,7 +2045,10 @@ async fn check_dlq_retries(state: &AppState) -> Result<u64, BroodlinkError> {
         .bind(next_retry)
         .bind(dlq_id)
         .execute(&state.pg)
-        .await;
+        .await
+        {
+            warn!(dlq_id = %dlq_id, error = %e, "failed to update DLQ retry state");
+        }
 
         // Publish task_available event for re-routing
         let subject = format!(

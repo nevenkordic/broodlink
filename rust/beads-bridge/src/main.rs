@@ -107,26 +107,27 @@ impl From<async_nats::PublishError> for BroodlinkError {
 
 impl IntoResponse for BroodlinkError {
     fn into_response(self) -> Response {
+        // Log full details server-side, return generic messages to clients
         let (status, body) = match &self {
             Self::Database(e) => {
                 error!(error = %e, "database error");
-                (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
             }
             Self::Nats(e) => {
                 error!(error = %e, "nats error");
-                (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
             }
             Self::Config(e) => {
                 error!(error = %e, "config error");
-                (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
             }
             Self::Secrets(e) => {
                 error!(error = %e, "secrets error");
-                (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
             }
             Self::Auth(msg) => {
                 warn!(msg = %msg, "auth failure");
-                (StatusCode::UNAUTHORIZED, self.to_string())
+                (StatusCode::UNAUTHORIZED, "authentication required".to_string())
             }
             Self::Validation { field, message } => {
                 warn!(field = %field, message = %message, "validation error");
@@ -134,27 +135,27 @@ impl IntoResponse for BroodlinkError {
             }
             Self::NotFound(what) => {
                 info!(entity = %what, "not found");
-                (StatusCode::NOT_FOUND, self.to_string())
+                (StatusCode::NOT_FOUND, "not found".to_string())
             }
             Self::RateLimited(agent) => {
                 warn!(agent = %agent, "rate limited");
-                (StatusCode::TOO_MANY_REQUESTS, self.to_string())
+                (StatusCode::TOO_MANY_REQUESTS, "rate limited".to_string())
             }
             Self::CircuitOpen(svc) => {
                 warn!(service = %svc, "circuit open");
-                (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
+                (StatusCode::SERVICE_UNAVAILABLE, "service temporarily unavailable".to_string())
             }
             Self::Guardrail { ref policy, ref message } => {
                 warn!(policy = %policy, message = %message, "guardrail blocked");
-                (StatusCode::FORBIDDEN, self.to_string())
+                (StatusCode::FORBIDDEN, "blocked by guardrail policy".to_string())
             }
             Self::BudgetExhausted { ref agent_id, balance, cost } => {
                 warn!(agent = %agent_id, balance = balance, cost = cost, "budget exhausted");
-                (StatusCode::PAYMENT_REQUIRED, self.to_string())
+                (StatusCode::PAYMENT_REQUIRED, "budget exhausted".to_string())
             }
             Self::Internal(msg) => {
                 error!(msg = %msg, "internal error");
-                (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
             }
         };
         let json = serde_json::json!({ "error": body });
@@ -1544,6 +1545,11 @@ fn param_i64_opt(params: &serde_json::Value, field: &str) -> Option<i64> {
     params.get(field).and_then(serde_json::Value::as_i64)
 }
 
+/// Clamp a user-supplied limit to a safe range [1, 1000].
+fn clamp_limit(limit: i64) -> i64 {
+    limit.max(1).min(1000)
+}
+
 fn param_f64_opt(params: &serde_json::Value, field: &str) -> Option<f64> {
     let val = params.get(field)?;
     if let Some(n) = val.as_f64() {
@@ -1767,7 +1773,7 @@ async fn tool_semantic_search(
     state.ollama_breaker.check().map_err(BroodlinkError::CircuitOpen)?;
 
     let query = param_str(params, "query")?;
-    let limit = param_i64_opt(params, "limit").unwrap_or(5);
+    let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(5));
 
     // Step 1: get embedding from Ollama
     let ollama_url = format!("{}/api/embeddings", state.config.ollama.url);
@@ -2084,7 +2090,7 @@ async fn tool_hybrid_search(
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
     let query = param_str(params, "query")?;
-    let limit = param_i64_opt(params, "limit").unwrap_or(10);
+    let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(10));
     let agent_filter = param_str_opt(params, "agent_id");
     let semantic_weight = param_f64_opt(params, "semantic_weight").unwrap_or(0.6);
     let keyword_weight = param_f64_opt(params, "keyword_weight").unwrap_or(0.4);
@@ -2423,7 +2429,7 @@ async fn tool_graph_search(
     let query = param_str(params, "query")?;
     let entity_type = param_str_opt(params, "entity_type");
     let include_edges = param_bool_opt(params, "include_edges").unwrap_or(true);
-    let limit = param_i64_opt(params, "limit").unwrap_or(10);
+    let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(10));
 
     // 1. Text search via ILIKE
     let text_rows: Vec<(String, String, String, Option<String>, serde_json::Value, i32, String, String)> =
@@ -3000,7 +3006,7 @@ async fn tool_get_work_log(
     _agent_id: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
-    let limit = param_i64_opt(params, "limit").unwrap_or(20);
+    let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(20));
     let agent_filter = param_str_opt(params, "agent_id");
 
     let rows = if let Some(agent) = agent_filter {
@@ -3284,7 +3290,7 @@ async fn tool_beads_list_issues(
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
     let status_filter = param_str_opt(params, "status");
-    let limit = param_i64_opt(params, "limit").unwrap_or(50);
+    let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(50));
 
     let rows = if let Some(status) = status_filter {
         sqlx::query_as::<_, (String, String, Option<String>, Option<String>, Option<String>, String, String)>(
@@ -3539,7 +3545,7 @@ async fn tool_read_messages(
     agent_id: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
-    let limit = param_i64_opt(params, "limit").unwrap_or(20);
+    let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(20));
     let unread_only = params
         .get("unread_only")
         .and_then(serde_json::Value::as_bool)
@@ -3640,7 +3646,7 @@ async fn tool_get_decisions(
     _agent_id: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
-    let limit = param_i64_opt(params, "limit").unwrap_or(20);
+    let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(20));
     let agent_filter = param_str_opt(params, "agent_id");
 
     let rows = if let Some(agent) = agent_filter {
@@ -3998,7 +4004,7 @@ async fn tool_get_audit_log(
     state: &AppState,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
-    let limit = param_i64_opt(params, "limit").unwrap_or(50);
+    let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(50));
     let agent_filter = param_str_opt(params, "agent_id");
 
     let rows = if let Some(agent) = agent_filter {
@@ -4071,7 +4077,7 @@ async fn tool_list_tasks(
     state: &AppState,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
-    let limit = param_i64_opt(params, "limit").unwrap_or(50);
+    let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(50));
     let status_filter = param_str_opt(params, "status");
 
     let rows = if let Some(status) = status_filter {
@@ -4171,7 +4177,7 @@ async fn tool_get_daily_summary(
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
     let date = param_str_opt(params, "date");
-    let limit = param_i64_opt(params, "limit").unwrap_or(7);
+    let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(7));
 
     let rows = if let Some(d) = date {
         sqlx::query_as::<_, (i64, String, Option<String>, Option<i32>, Option<i32>, Option<i32>, String)>(
@@ -4214,7 +4220,7 @@ async fn tool_get_commits(
     state: &AppState,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
-    let limit = param_i64_opt(params, "limit").unwrap_or(20);
+    let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(20));
 
     let rows = sqlx::query_as::<_, (String, String, String, String)>(
         "SELECT commit_hash, committer, message, CAST(date AS CHAR)
@@ -4435,7 +4441,7 @@ async fn tool_get_budget(
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
     let target = param_str_opt(params, "agent_id").unwrap_or(agent_id);
-    let limit = param_i64_opt(params, "limit").unwrap_or(10);
+    let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(10));
 
     // Current balance from Dolt
     let balance: i64 = sqlx::query_as::<_, (i64,)>(
@@ -4564,7 +4570,7 @@ async fn tool_inspect_dlq(
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
     let include_resolved = param_bool_opt(params, "resolved").unwrap_or(false);
-    let limit = param_i64_opt(params, "limit").unwrap_or(20);
+    let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(20));
 
     let rows = if include_resolved {
         sqlx::query_as::<_, (i64, String, String, String, i32, i32, bool, String, String)>(
@@ -5448,10 +5454,10 @@ async fn check_guardrails(
     )
     .fetch_all(&state.pg)
     .await
-    .unwrap_or_else(|e| {
-        warn!(error = %e, "failed to load guardrail policies, proceeding without guardrails");
-        Vec::new()
-    });
+    .map_err(|e| {
+        error!(error = %e, "failed to load guardrail policies — denying request");
+        BroodlinkError::Internal("guardrail check unavailable".to_string())
+    })?;
 
     for (policy_name, rule_type, config) in &policies {
         match rule_type.as_str() {
@@ -5756,7 +5762,7 @@ async fn tool_get_guardrail_violations(
     state: &AppState,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
-    let limit = param_i64_opt(params, "limit").unwrap_or(50);
+    let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(50));
     let agent_filter = param_str_opt(params, "agent_id");
 
     let violations: Vec<(i64, String, String, String, Option<String>, Option<String>, String)> = if let Some(aid) = agent_filter {
@@ -6208,7 +6214,7 @@ async fn tool_list_approvals(
     state: &AppState,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
-    let limit = param_i64_opt(params, "limit").unwrap_or(50);
+    let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(50));
     let status_filter = param_str_opt(params, "status");
 
     let approvals: Vec<(String, String, String, serde_json::Value, Option<String>, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> =
@@ -6627,7 +6633,7 @@ async fn tool_list_delegations(
     state: &AppState,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
-    let limit = param_i64_opt(params, "limit").unwrap_or(50);
+    let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(50));
     let from_agent = param_str_opt(params, "from_agent");
     let to_agent = param_str_opt(params, "to_agent");
     let status_filter = param_str_opt(params, "status");

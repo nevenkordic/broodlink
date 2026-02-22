@@ -1323,6 +1323,56 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// Verify Teams webhook using HMAC-SHA256 shared secret.
+/// Teams sends the signature in the `Authorization` header as `HMAC <base64-signature>`.
+fn verify_teams_signature(shared_secret: &str, body: &str, auth_header: &str) -> bool {
+    let sig_b64 = match auth_header.strip_prefix("HMAC ") {
+        Some(s) => s,
+        None => return false,
+    };
+
+    let expected_sig = match base64_decode(sig_b64) {
+        Some(b) => b,
+        None => return false,
+    };
+
+    let key_bytes = match base64_decode(shared_secret) {
+        Some(b) => b,
+        None => return false,
+    };
+
+    let mut mac = match Hmac::<Sha256>::new_from_slice(&key_bytes) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    mac.update(body.as_bytes());
+    let computed = mac.finalize().into_bytes();
+    constant_time_eq(&computed, &expected_sig)
+}
+
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    // Simple base64 decode (standard alphabet with padding)
+    use std::collections::HashMap;
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let table: HashMap<u8, u8> = alphabet.iter().enumerate().map(|(i, &c)| (c, i as u8)).collect();
+
+    let input = input.trim_end_matches('=');
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+    for &b in input.as_bytes() {
+        let val = *table.get(&b)?;
+        buf = (buf << 6) | u32::from(val);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
 // ---------------------------------------------------------------------------
 // POST /webhook/slack — receive Slack slash commands
 // ---------------------------------------------------------------------------
@@ -1495,10 +1545,23 @@ async fn handle_slack_event(state: &AppState, body: &str) -> Response {
 
 async fn webhook_teams_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     body: String,
 ) -> Response {
     if !state.config.webhooks.enabled {
         return (StatusCode::NOT_FOUND, "webhooks disabled").into_response();
+    }
+
+    // Verify Teams shared secret if configured
+    if let Some(ref secret) = state.config.webhooks.teams_shared_secret {
+        let auth = headers
+            .get("Authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !verify_teams_signature(secret, &body, auth) {
+            warn!(platform = "teams", "webhook signature verification failed");
+            return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
+        }
     }
 
     let payload: serde_json::Value = match serde_json::from_str(&body) {

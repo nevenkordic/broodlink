@@ -722,6 +722,8 @@ pub struct WebhookConfig {
     #[serde(default)]
     pub teams_app_id: Option<String>,
     #[serde(default)]
+    pub teams_shared_secret: Option<String>,
+    #[serde(default)]
     pub telegram_bot_token: Option<String>,
     #[serde(default)]
     pub telegram_secret_token: Option<String>,
@@ -738,6 +740,7 @@ impl Default for WebhookConfig {
             slack_signing_secret: None,
             slack_bot_token: None,
             teams_app_id: None,
+            teams_shared_secret: None,
             telegram_bot_token: None,
             telegram_secret_token: None,
             delivery_timeout_secs: default_webhook_delivery_timeout_secs(),
