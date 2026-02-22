@@ -745,7 +745,7 @@ async fn resolve_entity(
         .execute(&state.pg)
         .await?;
 
-        let _ = sqlx::query(
+        if let Err(e) = sqlx::query(
             "INSERT INTO kg_entity_memories (entity_id, memory_id, agent_id)
              VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
         )
@@ -753,7 +753,10 @@ async fn resolve_entity(
         .bind(mem_id)
         .bind(agent_id)
         .execute(&state.pg)
-        .await;
+        .await
+        {
+            warn!(entity_id = %entity_id, memory_id = mem_id, error = %e, "failed to link entity to memory (exact match)");
+        }
 
         return Ok(entity_id);
     }
@@ -772,7 +775,7 @@ async fn resolve_entity(
             "with_payload": true,
         });
 
-        if let Ok(resp) = state
+        match state
             .http_client
             .post(&qdrant_url)
             .json(&qdrant_body)
@@ -780,47 +783,62 @@ async fn resolve_entity(
             .send()
             .await
         {
-            if resp.status().is_success() {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    if let Some(results) = json.get("result").and_then(|r| r.as_array()) {
-                        if let Some(top) = results.first() {
-                            let score = top.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
-                            if score
-                                >= state
-                                    .config
-                                    .memory_search
-                                    .kg_entity_similarity_threshold
-                            {
-                                if let Some(matched_id) = top
-                                    .get("payload")
-                                    .and_then(|p| p.get("entity_id"))
-                                    .and_then(|e| e.as_str())
-                                {
-                                    if !matched_id.is_empty() {
-                                        sqlx::query(
-                                            "UPDATE kg_entities SET mention_count = mention_count + 1, last_seen = NOW(), updated_at = NOW() WHERE entity_id = $1",
-                                        )
-                                        .bind(matched_id)
-                                        .execute(&state.pg)
-                                        .await?;
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    match resp.json::<serde_json::Value>().await {
+                        Ok(json) => {
+                            if let Some(results) = json.get("result").and_then(|r| r.as_array()) {
+                                if let Some(top) = results.first() {
+                                    let score = top.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
+                                    if score
+                                        >= state
+                                            .config
+                                            .memory_search
+                                            .kg_entity_similarity_threshold
+                                    {
+                                        if let Some(matched_id) = top
+                                            .get("payload")
+                                            .and_then(|p| p.get("entity_id"))
+                                            .and_then(|e| e.as_str())
+                                        {
+                                            if !matched_id.is_empty() {
+                                                sqlx::query(
+                                                    "UPDATE kg_entities SET mention_count = mention_count + 1, last_seen = NOW(), updated_at = NOW() WHERE entity_id = $1",
+                                                )
+                                                .bind(matched_id)
+                                                .execute(&state.pg)
+                                                .await?;
 
-                                        let _ = sqlx::query(
-                                            "INSERT INTO kg_entity_memories (entity_id, memory_id, agent_id)
-                                             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-                                        )
-                                        .bind(matched_id)
-                                        .bind(mem_id)
-                                        .bind(agent_id)
-                                        .execute(&state.pg)
-                                        .await;
+                                                if let Err(e) = sqlx::query(
+                                                    "INSERT INTO kg_entity_memories (entity_id, memory_id, agent_id)
+                                                     VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                                                )
+                                                .bind(matched_id)
+                                                .bind(mem_id)
+                                                .bind(agent_id)
+                                                .execute(&state.pg)
+                                                .await
+                                                {
+                                                    warn!(entity_id = %matched_id, memory_id = mem_id, error = %e, "failed to link entity to memory (fuzzy match)");
+                                                }
 
-                                        return Ok(matched_id.to_string());
+                                                return Ok(matched_id.to_string());
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
+                        Err(e) => {
+                            warn!(error = %e, entity = %entity.name, "failed to parse Qdrant search response");
+                        }
                     }
+                } else {
+                    warn!(status = %resp.status(), entity = %entity.name, "Qdrant entity search returned non-success status");
                 }
+            }
+            Err(e) => {
+                warn!(error = %e, entity = %entity.name, "Qdrant entity search request failed");
             }
         }
     }
@@ -1118,8 +1136,19 @@ async fn handle_failure(
                 error!(
                     error = %e,
                     subject = %subject,
-                    "failed to publish dead letter to NATS"
+                    "failed to publish dead letter to NATS, falling back to DB"
                 );
+                // Fallback: persist dead letter directly to Postgres
+                if let Err(db_e) = sqlx::query(
+                    "INSERT INTO dead_letter_queue (task_id, reason, source_service) VALUES ($1, $2, 'embedding-worker')",
+                )
+                .bind(&row.trace_id)
+                .bind(error_msg)
+                .execute(&state.pg)
+                .await
+                {
+                    error!(error = %db_e, outbox_id = %row.id, "dead letter DB fallback also failed");
+                }
             } else {
                 info!(outbox_id = %row.id, subject = %subject, "dead letter published");
             }

@@ -125,14 +125,15 @@ pub async fn shutdown_signal() {
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .unwrap_or_else(|e| {
-                error!(error = %e, "SIGTERM handler failed");
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .unwrap_or_else(|_| panic!("double fault creating signal handler"))
-            })
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                error!(error = %e, "SIGTERM handler unavailable, relying on ctrl-c");
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(not(unix))]

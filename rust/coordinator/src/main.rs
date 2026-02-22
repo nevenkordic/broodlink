@@ -978,7 +978,12 @@ async fn handle_task_completed(
 
     // Load formula to get step's output name
     let formula = load_formula(&state.config, &formula_name)?;
-    let step_def = &formula.steps[step_index];
+    let step_def = formula.steps.get(step_index).ok_or_else(|| {
+        BroodlinkError::Internal(format!(
+            "step index {step_index} out of bounds (formula has {} steps)",
+            formula.steps.len()
+        ))
+    })?;
 
     // Accumulate result into step_results
     if let Some(ref result_data) = payload.result_data {
@@ -1037,7 +1042,7 @@ async fn handle_task_completed(
     let mut advance_to = next_step;
     if let Some(grp) = current_group {
         while advance_to < formula.steps.len() {
-            if formula.steps[advance_to].group == Some(grp) {
+            if formula.steps.get(advance_to).and_then(|s| s.group) == Some(grp) {
                 advance_to += 1;
             } else {
                 break;
@@ -1047,13 +1052,18 @@ async fn handle_task_completed(
 
     if advance_to < total_steps as usize {
         // Check if next step(s) form a parallel group
-        let next_def = &formula.steps[advance_to];
+        let next_def = formula.steps.get(advance_to).ok_or_else(|| {
+            BroodlinkError::Internal(format!(
+                "advance_to {advance_to} out of bounds (formula has {} steps)",
+                formula.steps.len()
+            ))
+        })?;
         let next_group = next_def.group;
 
         if let Some(grp) = next_group {
             // Collect all steps in this parallel group
             let group_steps: Vec<usize> = (advance_to..formula.steps.len())
-                .take_while(|&i| formula.steps[i].group == Some(grp))
+                .take_while(|&i| formula.steps.get(i).and_then(|s| s.group) == Some(grp))
                 .collect();
 
             let group_size = group_steps.len() as i32;
@@ -1214,7 +1224,7 @@ async fn handle_task_failed(
         if retry_count < max_retries {
             let new_count = retry_count + 1;
             let backoff_ms = match step.backoff.as_deref() {
-                Some("exponential") => 1000i64 * 2i64.pow(new_count as u32),
+                Some("exponential") => (1000i64 * 2i64.pow(new_count as u32)).min(60_000),
                 _ => 1000,
             };
 
