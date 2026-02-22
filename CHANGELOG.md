@@ -32,10 +32,9 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 - `scripts/create-admin.sh` for bootstrapping dashboard admin users with
   pgcrypto fallback (no Python bcrypt dependency required).
 - Heartbeat: chat session expiry and dashboard session cleanup cycles.
-- 9 new beads-bridge tools (75 -> 84): `list_chat_sessions`, `reply_to_chat`,
-  `close_chat_session`, `assign_chat_agent`, `create_formula`, `get_formula`,
-  `update_formula`, `delete_formula`, `list_formulas`.
-- 3 new status-api endpoint groups: `/api/v1/chat/*`, `/api/v1/formulas/*`,
+- 6 new beads-bridge tools (78 -> 84): `list_chat_sessions`, `reply_to_chat`,
+  `create_formula`, `get_formula`, `update_formula`, `list_formulas`.
+- 4 new status-api endpoint groups: `/api/v1/chat/*`, `/api/v1/formulas/*`,
   `/api/v1/users/*`, `/api/v1/auth/*`.
 - Integration test suites: `tests/chat-integration.sh` (9 tests),
   `tests/formula-registry.sh` (11 tests), `tests/dashboard-auth.sh` (19 tests).
@@ -80,7 +79,7 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 - **Dashboard Control Panel** (`/control/`): Tabbed admin interface with Agents,
   Guardrails, Budgets, Tasks, Workflows, DLQ, Chat, Formulas, Webhooks tabs.
   Agent toggle, budget set, task cancel, webhook CRUD, guardrail management.
-- 9 new beads-bridge tools (66 -> 75).
+- 12 new beads-bridge tools (66 -> 78).
 - 5 new Postgres migrations (014-018).
 - v0.6.0 regression test suite (105 tests).
 - DOM cross-check test suite for HTML/JS ID consistency.

@@ -41,7 +41,7 @@ psql -h 127.0.0.1 -U postgres \
   -c "CREATE DATABASE broodlink_hot
       OWNER broodlink_agent;" 2>/dev/null || true
 
-# Run all Postgres migrations (002, 003, 004, 005, 006, 007, 008, 009)
+# Run all Postgres migrations (002-021)
 for migration in \
   002_postgres_hotpaths \
   003_postgres_functions \

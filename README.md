@@ -138,8 +138,8 @@ All configuration lives in `config.toml`. Every field can be overridden with env
 ```bash
 cargo test --workspace                    # 249 unit tests
 bash tests/run-all.sh                     # 22 integration test suites
-bash tests/e2e.sh                         # 95+ end-to-end tests (requires running services)
-bash tests/v060-regression.sh             # 105 v0.6.0 regression tests
+bash tests/e2e.sh                         # 124 end-to-end tests (requires running services)
+bash tests/v060-regression.sh             # 164 v0.6.0 regression tests
 ```
 
 The E2E suite covers: service health, JWT/API key auth, all tool categories, status API endpoints, background service verification, SSE streaming, NATS integration, error handling, database round-trips, semantic search, hybrid memory search, knowledge graph tools, chat sessions, and login page. The v0.6.0 regression suite covers: budget enforcement, DLQ tooling, OTLP telemetry, KG expiry, JWT rotation, workflow branching, dashboard control panel, multi-agent collaboration, and webhooks. v0.7.0 adds chat integration, formula registry, and dashboard auth test suites.
@@ -165,7 +165,7 @@ The E2E suite covers: service health, JWT/API key auth, all tool categories, sta
 | `scripts/start-services.sh` | Start/stop all 7 Rust services + Hugo (`--stop` to stop) |
 | `scripts/build.sh` | cargo deny + tests + release build + Hugo |
 | `scripts/secrets-init.sh` | Generate JWT keypair, create `.secrets/env`, scaffold `secrets.skeleton.json` |
-| `scripts/db-setup.sh` | Create databases, run all 21 migrations, create Qdrant collections |
+| `scripts/db-setup.sh` | Create databases, run all 23 migrations, create Qdrant collections |
 | `scripts/rotate-jwt-keys.sh` | Generate new JWT keypair with kid fingerprint, retire old keys after grace period |
 | `scripts/backfill-search-index.sh` | One-time backfill of Postgres memory_search_index from Dolt agent_memory |
 | `scripts/backfill-knowledge-graph.sh` | One-time backfill of knowledge graph entities from existing memories |
