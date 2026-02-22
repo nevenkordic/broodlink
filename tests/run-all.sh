@@ -105,6 +105,12 @@ if [ -f "status-site/tests/dom-crosscheck.sh" ]; then
     "bash status-site/tests/dom-crosscheck.sh"
 fi
 
+# Control panel tests (HTML, CSS, JS, API endpoints, design elements)
+if [ -f "status-site/tests/control-panel.sh" ] && curl -sf http://127.0.0.1:1313/ > /dev/null 2>&1; then
+  run_suite "Control panel tests" \
+    "bash status-site/tests/control-panel.sh"
+fi
+
 # Agent regression tests
 if [ -f "tests/agent-regression.sh" ]; then
   run_suite "Agent regression tests" \
@@ -140,6 +146,13 @@ if [ -f "tests/knowledge-graph.sh" ]; then
   sleep 10  # let rate-limit bucket refill before KG tests
   run_suite "Knowledge Graph tests" \
     "bash tests/knowledge-graph.sh"
+fi
+
+# v0.6.0 regression tests
+if [ -f "tests/v060-regression.sh" ]; then
+  sleep 15  # let rate-limit bucket refill before v0.6.0 tests
+  run_suite "v0.6.0 regression tests" \
+    "bash tests/v060-regression.sh"
 fi
 
 # v0.3.0 deployment tests

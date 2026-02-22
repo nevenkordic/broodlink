@@ -38,6 +38,7 @@ declare -a JS_LAYOUT_MAP=(
   "guardrails.js:${LAYOUT_DIR}/guardrails/list.html"
   "knowledge-graph.js:${LAYOUT_DIR}/knowledge-graph/list.html"
   "a2a.js:${LAYOUT_DIR}/a2a/list.html"
+  "control.js:${LAYOUT_DIR}/control/list.html"
 )
 
 page_fail=0
@@ -100,7 +101,7 @@ DYNAMIC_SUFFIXES="tbody|list|table|feed|roster|grid|card|filter"
 
 # Layout-only containers: CSS wrappers whose children are individually populated
 # by JS — the container ID itself is not referenced and that's intentional.
-LAYOUT_EXCEPTIONS="metrics-grid"
+LAYOUT_EXCEPTIONS="metrics-grid ctrl-metrics-grid"
 
 for mapping in "${JS_LAYOUT_MAP[@]}"; do
   js_name="${mapping%%:*}"
