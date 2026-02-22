@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 set -euo pipefail
 AGENTS=(beads-bridge coordinator heartbeat
-        embedding-worker status-api mcp-server a2a-gateway hugo-status)
+        embedding-worker status-api mcp-server a2a-gateway)
 PLIST_DIR="$HOME/Library/LaunchAgents"
 BROOD_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOG_DIR="$HOME/logs/broodlink"
