@@ -15,7 +15,7 @@
 #![deny(clippy::expect_used)]
 #![warn(clippy::pedantic)]
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{error, info};
 
@@ -32,6 +32,7 @@ pub struct CircuitBreaker {
     name: String,
     failure_count: AtomicU32,
     last_failure_epoch_ms: AtomicU64,
+    half_open_probe_in_flight: AtomicBool,
     threshold: u32,
     half_open_secs: u64,
 }
@@ -48,12 +49,17 @@ impl CircuitBreaker {
             name: name.to_string(),
             failure_count: AtomicU32::new(0),
             last_failure_epoch_ms: AtomicU64::new(0),
+            half_open_probe_in_flight: AtomicBool::new(false),
             threshold,
             half_open_secs,
         }
     }
 
     /// Returns `true` if the circuit is open (all calls should be rejected).
+    ///
+    /// When the half-open window is reached, exactly one probe is allowed
+    /// through via an atomic compare-exchange. All other concurrent callers
+    /// still see the circuit as open until the probe succeeds or fails.
     #[must_use]
     pub fn is_open(&self) -> bool {
         let failures = self.failure_count.load(Ordering::Relaxed);
@@ -64,21 +70,32 @@ impl CircuitBreaker {
         let now_ms = now_epoch_ms();
         let elapsed_secs = (now_ms.saturating_sub(last_ms)) / 1000;
         if elapsed_secs >= self.half_open_secs {
-            return false; // half-open: allow one attempt
+            // Half-open window: allow exactly one probe through
+            if self
+                .half_open_probe_in_flight
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return false; // this caller is the probe
+            }
+            // Another probe is already in flight — remain open
         }
         true
     }
 
-    /// Record a successful operation — resets the failure counter.
+    /// Record a successful operation — resets the failure counter and probe flag.
     pub fn record_success(&self) {
         self.failure_count.store(0, Ordering::Relaxed);
+        self.half_open_probe_in_flight.store(false, Ordering::Release);
     }
 
-    /// Record a failed operation — increments counter and updates timestamp.
+    /// Record a failed operation — increments counter, updates timestamp,
+    /// and resets the probe flag so the next half-open window can try again.
     pub fn record_failure(&self) {
         self.failure_count.fetch_add(1, Ordering::Relaxed);
         self.last_failure_epoch_ms
             .store(now_epoch_ms(), Ordering::Relaxed);
+        self.half_open_probe_in_flight.store(false, Ordering::Release);
     }
 
     /// Returns `Ok(())` if the circuit is closed/half-open, or `Err(name)` if open.

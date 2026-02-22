@@ -516,7 +516,12 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
     ];
 
     if origins.is_empty() {
+        warn!("status_api.cors_origins is empty — defaulting to http://localhost:1313 for dev");
+        let localhost = "http://localhost:1313"
+            .parse::<header::HeaderValue>()
+            .unwrap_or_else(|_| header::HeaderValue::from_static("http://localhost:1313"));
         return CorsLayer::new()
+            .allow_origin(AllowOrigin::list([localhost]))
             .allow_methods([Method::GET, Method::POST])
             .allow_headers(allowed_headers);
     }
