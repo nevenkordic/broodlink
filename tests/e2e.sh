@@ -668,7 +668,7 @@ echo ""
 # -----------------------------------------------
 echo "--- 13. Dashboard Page Completeness ---"
 
-for page in "" "agents/" "decisions/" "memory/" "commits/" "audit/" "beads/" "approvals/" "guardrails/" "delegations/" "a2a/"; do
+for page in "" "agents/" "decisions/" "memory/" "commits/" "audit/" "beads/" "approvals/" "guardrails/" "delegations/" "a2a/" "chat/" "login/"; do
     PAGE_NAME="${page:-index}"
     PAGE_NAME="${PAGE_NAME%/}"
     HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" "http://localhost:1313/${page}" 2>/dev/null || echo "000")

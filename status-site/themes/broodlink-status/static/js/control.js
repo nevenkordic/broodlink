@@ -92,12 +92,18 @@
   // API helpers
   // -----------------------------------------------------------------------
   function postApi(path, body) {
+    var hdrs = {
+      'Content-Type': 'application/json',
+      'X-Broodlink-Api-Key': BL.STATUS_API_KEY
+    };
+    var sessionToken = typeof sessionStorage !== 'undefined'
+      ? sessionStorage.getItem('broodlink_session_token')
+      : null;
+    if (sessionToken) hdrs['X-Broodlink-Session'] = sessionToken;
+
     return fetch(BL.STATUS_API_URL + path, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Broodlink-Api-Key': BL.STATUS_API_KEY
-      },
+      headers: hdrs,
       body: body ? JSON.stringify(body) : undefined
     }).then(function (res) {
       if (!res.ok) return res.json().then(function (e) { throw new Error(e.error || 'request failed'); });
@@ -498,6 +504,250 @@
   // -----------------------------------------------------------------------
   // Tab loader dispatcher
   // -----------------------------------------------------------------------
+  // Chat sessions (v0.7.0)
+  // -----------------------------------------------------------------------
+  function loadChat() {
+    var tbody = document.getElementById('ctrl-chat-tbody');
+    if (!tbody) return;
+    BL.fetchApi('/api/v1/chat/sessions?status=active').then(function (data) {
+      var sessions = data.sessions || [];
+      if (sessions.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="7">No active chat sessions.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = sessions.map(function (s) {
+        var name = BL.escapeHtml(s.user_display_name || s.user_id || '?');
+        var agent = s.assigned_agent ? BL.escapeHtml(s.assigned_agent) : '<em>auto</em>';
+        var lastMsg = s.last_message_at ? BL.formatRelativeTime(s.last_message_at) : '—';
+        return '<tr>' +
+          '<td>' + BL.escapeHtml(s.platform) + '</td>' +
+          '<td>' + name + '</td>' +
+          '<td>' + s.message_count + '</td>' +
+          '<td>' + agent + '</td>' +
+          '<td>' + lastMsg + '</td>' +
+          '<td>' + badge(s.status === 'active' ? 'ok' : 'offline', s.status) + '</td>' +
+          '<td>' +
+            (s.status === 'active' ? '<button class="btn btn-sm btn-danger" onclick="Ctrl.closeChat(\'' + BL.escapeHtml(s.id) + '\')">Close</button>' : '') +
+          '</td>' +
+        '</tr>';
+      }).join('');
+    }).catch(function () {
+      tbody.innerHTML = '<tr><td colspan="7">Failed to load chat sessions.</td></tr>';
+    });
+  }
+
+  function closeChat(sessionId) {
+    BL.fetchApi('/api/v1/chat/sessions/' + sessionId + '/close', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}'
+    }).then(function () {
+      toast('Session closed', 'ok');
+      loadChat();
+    }).catch(function (e) {
+      toast('Failed to close session: ' + e, 'error');
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // Formulas tab
+  // -----------------------------------------------------------------------
+  function loadFormulas() {
+    BL.fetchApi('/api/v1/formulas').then(function (data) {
+      var tbody = document.getElementById('ctrl-formulas-tbody');
+      if (!tbody) return;
+      var formulas = data.formulas || [];
+      if (formulas.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="7">No formulas registered.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = formulas.map(function (f) {
+        var statusCls = f.enabled ? 'ok' : 'offline';
+        var statusLabel = f.enabled ? 'Enabled' : 'Disabled';
+        var systemBadge = f.is_system ? '<span class="badge badge-info">system</span>' : '';
+        return '<tr>' +
+          '<td><strong>' + BL.escapeHtml(f.display_name || f.name) + '</strong><br><code>' + BL.escapeHtml(f.name) + '</code></td>' +
+          '<td>' + BL.escapeHtml(f.description || '—') + '</td>' +
+          '<td>v' + f.version + '</td>' +
+          '<td>' + f.usage_count + '</td>' +
+          '<td>' + systemBadge + '</td>' +
+          '<td><span class="badge badge-' + statusCls + '">' + statusLabel + '</span></td>' +
+          '<td>' +
+            '<button class="btn btn-sm" onclick="Ctrl.toggleFormula(\'' + BL.escapeHtml(f.name) + '\')">' + (f.enabled ? 'Disable' : 'Enable') + '</button> ' +
+            '<button class="btn btn-sm" onclick="Ctrl.viewFormula(\'' + BL.escapeHtml(f.name) + '\')">View</button>' +
+          '</td>' +
+        '</tr>';
+      }).join('');
+    }).catch(function () {});
+  }
+
+  function toggleFormula(name) {
+    BL.fetchApi('/api/v1/formulas/' + name + '/toggle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}'
+    }).then(function (data) {
+      toast('Formula ' + name + ' ' + (data.enabled ? 'enabled' : 'disabled'), 'ok');
+      loadFormulas();
+    }).catch(function (e) {
+      toast('Failed to toggle formula: ' + e, 'error');
+    });
+  }
+
+  function viewFormula(name) {
+    BL.fetchApi('/api/v1/formulas/' + name).then(function (data) {
+      var defStr = JSON.stringify(data.definition, null, 2);
+      alert('Formula: ' + name + '\n\nDefinition:\n' + defStr);
+    }).catch(function (e) {
+      toast('Failed to load formula: ' + e, 'error');
+    });
+  }
+
+  function createFormula() {
+    var name = prompt('Formula name (slug, e.g. my-workflow):');
+    if (!name) return;
+    var displayName = prompt('Display name:');
+    if (!displayName) return;
+    var description = prompt('Description (optional):') || '';
+
+    var defTemplate = JSON.stringify({
+      formula: { name: name, description: description, version: '1' },
+      parameters: [],
+      steps: [{ name: 'step_1', agent_role: 'worker', tools: [], prompt: 'Describe what to do...', output: 'result' }],
+      on_failure: null
+    }, null, 2);
+
+    var defStr = prompt('Definition JSON (edit as needed):', defTemplate);
+    if (!defStr) return;
+
+    var definition;
+    try { definition = JSON.parse(defStr); }
+    catch (e) { toast('Invalid JSON: ' + e.message, 'error'); return; }
+
+    BL.fetchApi('/api/v1/formulas', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name, display_name: displayName, description: description, definition: definition })
+    }).then(function () {
+      toast('Formula created: ' + name, 'ok');
+      loadFormulas();
+    }).catch(function (e) {
+      toast('Failed to create formula: ' + e, 'error');
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // Users tab (admin only)
+  // -----------------------------------------------------------------------
+  function loadUsers() {
+    BL.fetchApi('/api/v1/users').then(function (data) {
+      var tbody = document.getElementById('ctrl-users-tbody');
+      if (!tbody) return;
+      var users = data.users || [];
+      if (users.length === 0) {
+        tbody.innerHTML = emptyState('agents', 'No dashboard users', 'Create an admin user with scripts/create-admin.sh.', 7);
+        return;
+      }
+      tbody.innerHTML = users.map(function (u) {
+        var statusBadge = badge(u.active ? 'active' : 'offline');
+        var lastLogin = u.last_login ? BL.formatRelativeTime(u.last_login) : 'never';
+        return '<tr>' +
+          '<td><strong>' + BL.escapeHtml(u.username) + '</strong>' +
+          (u.display_name ? '<br><small style="color:var(--text-secondary)">' + BL.escapeHtml(u.display_name) + '</small>' : '') + '</td>' +
+          '<td>' + badge(u.role) + '</td>' +
+          '<td>' + statusBadge + '</td>' +
+          '<td>' + lastLogin + '</td>' +
+          '<td>' + BL.escapeHtml(u.created_at || '') + '</td>' +
+          '<td><div class="ctrl-btn-group">' +
+          '<button class="btn btn-sm btn-ghost" onclick="Ctrl.changeRole(\'' + BL.escapeHtml(u.id) + '\', \'' + BL.escapeHtml(u.role) + '\')">Role</button>' +
+          '<button class="btn btn-sm ' + (u.active ? 'btn-danger' : 'btn-primary') + '" onclick="Ctrl.toggleUser(\'' + BL.escapeHtml(u.id) + '\')">' +
+          (u.active ? 'Deactivate' : 'Activate') + '</button>' +
+          '<button class="btn btn-sm btn-ghost" onclick="Ctrl.resetPassword(\'' + BL.escapeHtml(u.id) + '\')">Reset PW</button>' +
+          '</div></td>' +
+          '</tr>';
+      }).join('');
+    }).catch(function () {
+      var el = document.getElementById('ctrl-users-tbody');
+      if (el) el.innerHTML = '<tr><td colspan="6" style="color:var(--red)">Failed to load users.</td></tr>';
+    });
+  }
+
+  function createUser() {
+    var username = prompt('Username:');
+    if (!username) return;
+    var password = prompt('Password:');
+    if (!password) return;
+    var role = prompt('Role (viewer, operator, admin):', 'viewer');
+    if (!role) return;
+    var displayName = prompt('Display name (optional):') || null;
+
+    postApi('/api/v1/users', {
+      username: username,
+      password: password,
+      role: role,
+      display_name: displayName
+    }).then(function () {
+      toast('User "' + username + '" created', 'success');
+      loadUsers();
+    }).catch(function (err) {
+      toast('Create failed: ' + err.message, 'error');
+    });
+  }
+
+  function changeRole(userId, currentRole) {
+    var newRole = prompt('New role (viewer, operator, admin). Current: ' + currentRole, currentRole);
+    if (!newRole || newRole === currentRole) return;
+    postApi('/api/v1/users/' + userId + '/role', { role: newRole })
+      .then(function () {
+        toast('Role updated to ' + newRole, 'success');
+        loadUsers();
+      })
+      .catch(function (err) { toast('Role change failed: ' + err.message, 'error'); });
+  }
+
+  function toggleUser(userId) {
+    if (!confirm('Toggle active state for this user?')) return;
+    postApi('/api/v1/users/' + userId + '/toggle')
+      .then(function () {
+        toast('User toggled', 'success');
+        loadUsers();
+      })
+      .catch(function (err) { toast('Toggle failed: ' + err.message, 'error'); });
+  }
+
+  function resetPassword(userId) {
+    var newPw = prompt('New password:');
+    if (!newPw) return;
+    postApi('/api/v1/users/' + userId + '/reset-password', { password: newPw })
+      .then(function () {
+        toast('Password reset', 'success');
+      })
+      .catch(function (err) { toast('Reset failed: ' + err.message, 'error'); });
+  }
+
+  // -----------------------------------------------------------------------
+  // Role-based UI enforcement
+  // -----------------------------------------------------------------------
+  function enforceRoles() {
+    var Auth = window.BLAuth;
+    if (!Auth) return;
+
+    // Hide Users tab if not admin
+    var usersTab = document.querySelector('[data-tab="users"]');
+    if (usersTab && !Auth.isAdmin()) {
+      usersTab.style.display = 'none';
+    }
+
+    // Hide write buttons if viewer-only
+    if (!Auth.canWrite()) {
+      var writeButtons = document.querySelectorAll('.ctrl-write-action');
+      writeButtons.forEach(function (btn) {
+        btn.style.display = 'none';
+      });
+    }
+  }
+
+  // -----------------------------------------------------------------------
   function loadTab(name) {
     switch (name) {
       case 'agents': loadAgents(); break;
@@ -507,6 +757,9 @@
       case 'guardrails': loadGuardrails(); break;
       case 'webhooks': loadWebhooks(); break;
       case 'dlq': loadDlq(); break;
+      case 'chat': loadChat(); break;
+      case 'formulas': loadFormulas(); break;
+      case 'users': loadUsers(); break;
     }
   }
 
@@ -520,10 +773,21 @@
     retryDlq: retryDlq,
     addWebhook: addWebhook,
     toggleWebhook: toggleWebhook,
-    deleteWebhook: deleteWebhook
+    deleteWebhook: deleteWebhook,
+    closeChat: closeChat,
+    loadFormulas: loadFormulas,
+    toggleFormula: toggleFormula,
+    viewFormula: viewFormula,
+    createFormula: createFormula,
+    loadUsers: loadUsers,
+    createUser: createUser,
+    changeRole: changeRole,
+    toggleUser: toggleUser,
+    resetPassword: resetPassword
   };
 
   // Initial load
+  enforceRoles();
   loadMetrics();
   loadAgents();
   setInterval(function () {

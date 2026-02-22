@@ -72,6 +72,11 @@ pub struct Config {
     pub collaboration: CollaborationConfig,
     #[serde(default)]
     pub webhooks: WebhookConfig,
+    // --- v0.7.0 additions ---
+    #[serde(default)]
+    pub chat: ChatConfig,
+    #[serde(default)]
+    pub dashboard_auth: DashboardAuthConfig,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -706,6 +711,8 @@ pub struct WebhookConfig {
     #[serde(default)]
     pub slack_signing_secret: Option<String>,
     #[serde(default)]
+    pub slack_bot_token: Option<String>,
+    #[serde(default)]
     pub teams_app_id: Option<String>,
     #[serde(default)]
     pub telegram_bot_token: Option<String>,
@@ -720,6 +727,7 @@ impl Default for WebhookConfig {
         Self {
             enabled: false,
             slack_signing_secret: None,
+            slack_bot_token: None,
             teams_app_id: None,
             telegram_bot_token: None,
             delivery_timeout_secs: default_webhook_delivery_timeout_secs(),
@@ -734,6 +742,114 @@ fn default_webhook_delivery_timeout_secs() -> u64 {
 
 fn default_webhook_max_retries() -> u32 {
     3
+}
+
+// --- v0.7.0: Conversational agent gateway ---
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct ChatConfig {
+    #[serde(default = "default_chat_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_chat_max_context_messages")]
+    pub max_context_messages: u32,
+    #[serde(default = "default_chat_session_timeout_hours")]
+    pub session_timeout_hours: u32,
+    #[serde(default = "default_chat_reply_timeout_seconds")]
+    pub reply_timeout_seconds: u64,
+    #[serde(default = "default_chat_reply_retry_attempts")]
+    pub reply_retry_attempts: u32,
+    #[serde(default = "default_chat_default_agent_role")]
+    pub default_agent_role: String,
+    #[serde(default = "default_chat_greeting_enabled")]
+    pub greeting_enabled: bool,
+    #[serde(default = "default_chat_greeting_message")]
+    pub greeting_message: String,
+}
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_chat_enabled(),
+            max_context_messages: default_chat_max_context_messages(),
+            session_timeout_hours: default_chat_session_timeout_hours(),
+            reply_timeout_seconds: default_chat_reply_timeout_seconds(),
+            reply_retry_attempts: default_chat_reply_retry_attempts(),
+            default_agent_role: default_chat_default_agent_role(),
+            greeting_enabled: default_chat_greeting_enabled(),
+            greeting_message: default_chat_greeting_message(),
+        }
+    }
+}
+
+fn default_chat_enabled() -> bool {
+    true
+}
+
+fn default_chat_max_context_messages() -> u32 {
+    10
+}
+
+fn default_chat_session_timeout_hours() -> u32 {
+    24
+}
+
+fn default_chat_reply_timeout_seconds() -> u64 {
+    300
+}
+
+fn default_chat_reply_retry_attempts() -> u32 {
+    3
+}
+
+fn default_chat_default_agent_role() -> String {
+    "worker".to_string()
+}
+
+fn default_chat_greeting_enabled() -> bool {
+    true
+}
+
+fn default_chat_greeting_message() -> String {
+    "Hello! I'm a Broodlink agent. How can I help?".to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard Auth (v0.7.0)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct DashboardAuthConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_session_ttl_hours")]
+    pub session_ttl_hours: u32,
+    #[serde(default = "default_bcrypt_cost")]
+    pub bcrypt_cost: u32,
+    #[serde(default = "default_max_sessions_per_user")]
+    pub max_sessions_per_user: u32,
+}
+
+impl Default for DashboardAuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            session_ttl_hours: default_session_ttl_hours(),
+            bcrypt_cost: default_bcrypt_cost(),
+            max_sessions_per_user: default_max_sessions_per_user(),
+        }
+    }
+}
+
+fn default_session_ttl_hours() -> u32 {
+    8
+}
+
+fn default_bcrypt_cost() -> u32 {
+    12
+}
+
+fn default_max_sessions_per_user() -> u32 {
+    5
 }
 
 fn default_kg_entity_ttl_days() -> u32 {

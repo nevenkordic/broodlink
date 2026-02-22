@@ -94,7 +94,7 @@ check_page "/" "Sidebar nav links" \
   'href="/guardrails/"'
 
 check_page "/" "Version badge" \
-  "v0.6.0"
+  "v0.7.0"
 
 check_page "/" "Logo" \
   "broodlink-logo.svg"

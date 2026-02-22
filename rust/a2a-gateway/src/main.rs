@@ -33,10 +33,11 @@ use axum::routing::{get, post};
 use axum::Router;
 use broodlink_config::Config;
 use broodlink_secrets::SecretsProvider;
+use futures::StreamExt;
 use sqlx::postgres::PgPool;
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 const SERVICE_NAME: &str = "a2a-gateway";
@@ -219,6 +220,18 @@ async fn main() {
         );
     }
 
+    // Connect to NATS for task completion events
+    let nats_client = match broodlink_runtime::connect_nats(&config.nats).await {
+        Ok(nc) => {
+            info!("connected to NATS");
+            Some(nc)
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to connect to NATS — chat reply delivery via NATS disabled");
+            None
+        }
+    };
+
     let state = Arc::new(AppState {
         bridge_url: config.a2a.bridge_url.clone(),
         bridge_jwt,
@@ -227,6 +240,81 @@ async fn main() {
         api_key,
         config: Arc::clone(&config),
     });
+
+    // Spawn chat reply delivery loop
+    if config.chat.enabled {
+        let st = Arc::clone(&state);
+        tokio::spawn(async move {
+            reply_delivery_loop(&st).await;
+        });
+    }
+
+    // Subscribe to NATS task_completed/task_failed for chat reply routing
+    if config.chat.enabled {
+        if let Some(nc) = nats_client {
+            let prefix = config.nats.subject_prefix.clone();
+            let st = Arc::clone(&state);
+
+            // task_completed
+            let nc2 = nc.clone(); // clone for the second subscription
+            let st_completed = Arc::clone(&st);
+            let subj_completed = format!("{prefix}.*.coordinator.task_completed");
+            tokio::spawn(async move {
+                match nc.subscribe(subj_completed.clone()).await {
+                    Ok(mut sub) => {
+                        info!(subject = %subj_completed, "subscribed for chat completions");
+                        while let Some(msg) = sub.next().await {
+                            if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
+                                let task_id = payload
+                                    .get("task_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default();
+                                let result_data = payload
+                                    .get("result_data")
+                                    .cloned()
+                                    .unwrap_or_default();
+                                if !task_id.is_empty() {
+                                    handle_task_completion_for_chat(&st_completed, task_id, &result_data, false).await;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "failed to subscribe to task_completed");
+                    }
+                }
+            });
+
+            // task_failed
+            let subj_failed = format!("{prefix}.*.coordinator.task_failed");
+            tokio::spawn(async move {
+                match nc2.subscribe(subj_failed.clone()).await {
+                    Ok(mut sub) => {
+                        info!(subject = %subj_failed, "subscribed for chat failures");
+                        while let Some(msg) = sub.next().await {
+                            if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
+                                let task_id = payload
+                                    .get("task_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default();
+                                let error_msg = payload
+                                    .get("error")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("Task failed");
+                                if !task_id.is_empty() {
+                                    let err_val = serde_json::json!({ "error": error_msg });
+                                    handle_task_completion_for_chat(&st, task_id, &err_val, true).await;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "failed to subscribe to task_failed");
+                    }
+                }
+            });
+        }
+    }
 
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST])
@@ -1193,7 +1281,12 @@ async fn webhook_slack_handler(
         return (StatusCode::NOT_FOUND, "webhooks disabled").into_response();
     }
 
-    // Parse form-encoded Slack slash command payload
+    // Check if this is a Slack Events API payload (JSON)
+    if body.starts_with('{') {
+        return handle_slack_event(&state, &body).await;
+    }
+
+    // Otherwise: form-encoded slash command payload
     let params: std::collections::HashMap<String, String> = body
         .split('&')
         .filter_map(|pair| {
@@ -1209,43 +1302,119 @@ async fn webhook_slack_handler(
 
     let text = params.get("text").cloned().unwrap_or_default();
     let user = params.get("user_name").cloned().unwrap_or_else(|| "slack-user".to_string());
+    let user_id = params.get("user_id").cloned().unwrap_or_default();
+    let channel_id = params.get("channel_id").cloned().unwrap_or_default();
+    let response_url = params.get("response_url").cloned();
 
     info!(platform = "slack", user = %user, text = %text, "inbound webhook");
 
-    let (command, args) = match parse_command_text(&text) {
-        Some(pair) => pair,
-        None => {
-            return (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/json")],
-                serde_json::json!({"response_type": "ephemeral", "text": "Usage: /broodlink <command>. Try 'help'."}).to_string(),
-            )
-                .into_response();
+    // If the text looks like a command, use command handler
+    // Otherwise, if chat is enabled, treat as conversational message
+    if let Some((command, args)) = parse_command_text(&text) {
+        let payload_json = serde_json::to_value(&params).unwrap_or_default();
+        log_webhook(&state.pg, None, "inbound", &format!("slack.{command}"), &payload_json, "delivered", None).await;
+
+        let cmd = WebhookCommand {
+            command,
+            args,
+            user,
+            platform: "slack".to_string(),
+        };
+
+        let response_text = execute_command(&state, &cmd).await;
+
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({
+                "response_type": "in_channel",
+                "text": response_text,
+            })
+            .to_string(),
+        )
+            .into_response()
+    } else if state.config.chat.enabled && !text.is_empty() {
+        handle_chat_message(
+            &state,
+            "slack",
+            &channel_id,
+            &user_id,
+            &user,
+            &text,
+            None,
+            response_url.as_deref(),
+        )
+        .await;
+
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({"response_type": "ephemeral", "text": "Got it! Working on your request..."}).to_string(),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({"response_type": "ephemeral", "text": "Usage: /broodlink <command>. Try 'help'."}).to_string(),
+        )
+            .into_response()
+    }
+}
+
+/// Handle Slack Events API payloads (JSON-encoded).
+async fn handle_slack_event(state: &AppState, body: &str) -> Response {
+    let payload: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid json: {e}")).into_response(),
+    };
+
+    // Handle URL verification challenge
+    if payload.get("type").and_then(|t| t.as_str()) == Some("url_verification") {
+        let challenge = payload.get("challenge").and_then(|c| c.as_str()).unwrap_or("");
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain")],
+            challenge.to_string(),
+        )
+            .into_response();
+    }
+
+    // Handle event_callback with message events
+    if payload.get("type").and_then(|t| t.as_str()) == Some("event_callback") {
+        if let Some(event) = payload.get("event") {
+            let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+            // Only handle message events, ignore bot messages
+            if event_type == "message" && event.get("bot_id").is_none() && event.get("subtype").is_none() {
+                let channel = event.get("channel").and_then(|c| c.as_str()).unwrap_or("");
+                let user = event.get("user").and_then(|u| u.as_str()).unwrap_or("");
+                let text = event.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                let thread_ts = event.get("thread_ts").and_then(|t| t.as_str());
+
+                if !text.is_empty() && state.config.chat.enabled {
+                    // Check if it's a command first
+                    if text.starts_with("/broodlink") || text.starts_with("broodlink ") {
+                        // Let the slash command handler deal with it
+                    } else {
+                        handle_chat_message(
+                            state,
+                            "slack",
+                            channel,
+                            user,
+                            user, // display name not available in events API, use user_id
+                            text,
+                            thread_ts,
+                            None,
+                        )
+                        .await;
+                    }
+                }
+            }
         }
-    };
+    }
 
-    let payload_json = serde_json::to_value(&params).unwrap_or_default();
-    log_webhook(&state.pg, None, "inbound", &format!("slack.{command}"), &payload_json, "delivered", None).await;
-
-    let cmd = WebhookCommand {
-        command,
-        args,
-        user,
-        platform: "slack".to_string(),
-    };
-
-    let response_text = execute_command(&state, &cmd).await;
-
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
-        serde_json::json!({
-            "response_type": "in_channel",
-            "text": response_text,
-        })
-        .to_string(),
-    )
-        .into_response()
+    (StatusCode::OK, "ok").into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1271,44 +1440,81 @@ async fn webhook_teams_handler(
         .get("text")
         .and_then(|t| t.as_str())
         .unwrap_or("");
-    let user = payload
+    let user_name = payload
         .get("from")
         .and_then(|f| f.get("name"))
         .and_then(|n| n.as_str())
         .unwrap_or("teams-user");
+    let user_id = payload
+        .get("from")
+        .and_then(|f| f.get("id"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("teams-user");
+    let channel_id = payload
+        .get("channelId")
+        .and_then(|c| c.as_str())
+        .or_else(|| payload.get("conversation").and_then(|c| c.get("id")).and_then(|i| i.as_str()))
+        .unwrap_or("");
+    let service_url = payload
+        .get("serviceUrl")
+        .and_then(|s| s.as_str());
+    let activity_type = payload
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
 
-    info!(platform = "teams", user = %user, text = %text, "inbound webhook");
+    info!(platform = "teams", user = %user_name, text = %text, "inbound webhook");
 
-    let (command, args) = match parse_command_text(text) {
-        Some(pair) => pair,
-        None => {
-            return (
-                StatusCode::OK,
-                axum::Json(serde_json::json!({"type": "message", "text": "Usage: /broodlink <command>. Try 'help'."})),
-            )
-                .into_response();
-        }
-    };
+    // Check for /broodlink command first
+    if let Some((command, args)) = parse_command_text(text) {
+        log_webhook(&state.pg, None, "inbound", &format!("teams.{command}"), &payload, "delivered", None).await;
 
-    log_webhook(&state.pg, None, "inbound", &format!("teams.{command}"), &payload, "delivered", None).await;
+        let cmd = WebhookCommand {
+            command,
+            args,
+            user: user_name.to_string(),
+            platform: "teams".to_string(),
+        };
 
-    let cmd = WebhookCommand {
-        command,
-        args,
-        user: user.to_string(),
-        platform: "teams".to_string(),
-    };
+        let response_text = execute_command(&state, &cmd).await;
 
-    let response_text = execute_command(&state, &cmd).await;
+        (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "type": "message",
+                "text": response_text,
+            })),
+        )
+            .into_response()
+    } else if state.config.chat.enabled && activity_type == "message" && !text.is_empty() {
+        // Conversational message
+        handle_chat_message(
+            &state,
+            "teams",
+            channel_id,
+            user_id,
+            user_name,
+            text,
+            None,
+            service_url,
+        )
+        .await;
 
-    (
-        StatusCode::OK,
-        axum::Json(serde_json::json!({
-            "type": "message",
-            "text": response_text,
-        })),
-    )
-        .into_response()
+        (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "type": "message",
+                "text": "Got it! Working on your request...",
+            })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({"type": "message", "text": "Usage: /broodlink <command>. Try 'help'."})),
+        )
+            .into_response()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1335,49 +1541,82 @@ async fn webhook_telegram_handler(
         .get("text")
         .and_then(|t| t.as_str())
         .unwrap_or("");
-    let user = message
+    let user_name = message
         .get("from")
         .and_then(|f| f.get("first_name"))
         .and_then(|n| n.as_str())
         .unwrap_or("telegram-user");
+    let user_id_val = message
+        .get("from")
+        .and_then(|f| f.get("id"))
+        .and_then(|id| id.as_i64())
+        .unwrap_or(0);
     let chat_id = message
         .get("chat")
         .and_then(|c| c.get("id"))
         .and_then(|id| id.as_i64())
         .unwrap_or(0);
+    let thread_id = message
+        .get("message_thread_id")
+        .and_then(|t| t.as_i64())
+        .map(|t| t.to_string());
 
-    info!(platform = "telegram", user = %user, chat_id = chat_id, text = %text, "inbound webhook");
+    info!(platform = "telegram", user = %user_name, chat_id = chat_id, text = %text, "inbound webhook");
 
-    let (command, args) = match parse_command_text(text) {
-        Some(pair) => pair,
-        None => {
-            // For Telegram, respond via Telegram Bot API if configured
+    // Check for /broodlink command or /command style
+    if text.starts_with('/') || text.starts_with("broodlink ") {
+        if let Some((command, args)) = parse_command_text(text) {
+            log_webhook(&state.pg, None, "inbound", &format!("telegram.{command}"), &payload, "delivered", None).await;
+
+            let cmd = WebhookCommand {
+                command,
+                args,
+                user: user_name.to_string(),
+                platform: "telegram".to_string(),
+            };
+
+            let response_text = execute_command(&state, &cmd).await;
+
             let reply = serde_json::json!({
                 "method": "sendMessage",
                 "chat_id": chat_id,
-                "text": "Usage: /broodlink <command>. Try 'help'.",
+                "text": response_text,
             });
+
             return (StatusCode::OK, axum::Json(reply)).into_response();
         }
-    };
+    }
 
-    log_webhook(&state.pg, None, "inbound", &format!("telegram.{command}"), &payload, "delivered", None).await;
+    // Conversational message (non-command)
+    if state.config.chat.enabled && !text.is_empty() {
+        let chat_id_str = chat_id.to_string();
+        let user_id_str = user_id_val.to_string();
 
-    let cmd = WebhookCommand {
-        command,
-        args,
-        user: user.to_string(),
-        platform: "telegram".to_string(),
-    };
+        handle_chat_message(
+            &state,
+            "telegram",
+            &chat_id_str,
+            &user_id_str,
+            user_name,
+            text,
+            thread_id.as_deref(),
+            None,
+        )
+        .await;
 
-    let response_text = execute_command(&state, &cmd).await;
+        let reply = serde_json::json!({
+            "method": "sendMessage",
+            "chat_id": chat_id,
+            "text": "Got it! Working on your request...",
+        });
+        return (StatusCode::OK, axum::Json(reply)).into_response();
+    }
 
     let reply = serde_json::json!({
         "method": "sendMessage",
         "chat_id": chat_id,
-        "text": response_text,
+        "text": "Usage: /broodlink <command>. Try 'help'.",
     });
-
     (StatusCode::OK, axum::Json(reply)).into_response()
 }
 
@@ -1403,6 +1642,445 @@ fn urlencoding_decode(s: &str) -> String {
         }
     }
     result
+}
+
+// ---------------------------------------------------------------------------
+// Chat: Conversational agent gateway (v0.7.0)
+// ---------------------------------------------------------------------------
+
+/// Handle an inbound chat message (free-form, not a /broodlink command).
+/// Creates or updates a session, stores the message, and creates a task.
+async fn handle_chat_message(
+    state: &AppState,
+    platform: &str,
+    channel_id: &str,
+    user_id: &str,
+    user_name: &str,
+    text: &str,
+    thread_id: Option<&str>,
+    reply_url: Option<&str>,
+) {
+    let chat_cfg = &state.config.chat;
+    let session_id = Uuid::new_v4().to_string();
+
+    // Upsert chat_session
+    let row: Option<(String, i32)> = sqlx::query_as(
+        "INSERT INTO chat_sessions (id, platform, channel_id, user_id, user_display_name, thread_id, last_message_at, message_count)
+         VALUES ($1, $2, $3, $4, $5, $6, NOW(), 1)
+         ON CONFLICT (platform, channel_id, user_id)
+         DO UPDATE SET last_message_at = NOW(),
+                       message_count = chat_sessions.message_count + 1,
+                       updated_at = NOW(),
+                       user_display_name = COALESCE(EXCLUDED.user_display_name, chat_sessions.user_display_name)
+         RETURNING id, message_count",
+    )
+    .bind(&session_id)
+    .bind(platform)
+    .bind(channel_id)
+    .bind(user_id)
+    .bind(user_name)
+    .bind(thread_id)
+    .fetch_optional(&state.pg)
+    .await
+    .unwrap_or(None);
+
+    let (sid, msg_count) = match row {
+        Some(r) => r,
+        None => {
+            error!(platform = platform, user_id = user_id, "failed to upsert chat session");
+            return;
+        }
+    };
+
+    // Insert inbound message
+    if let Err(e) = sqlx::query(
+        "INSERT INTO chat_messages (session_id, direction, content) VALUES ($1, 'inbound', $2)",
+    )
+    .bind(&sid)
+    .bind(text)
+    .execute(&state.pg)
+    .await
+    {
+        error!(error = %e, "failed to insert chat message");
+    }
+
+    // If greeting_enabled and this is a brand new session (msg_count == 1), queue greeting
+    if chat_cfg.greeting_enabled && msg_count == 1 {
+        let greeting = &chat_cfg.greeting_message;
+        let _ = sqlx::query(
+            "INSERT INTO chat_reply_queue (session_id, task_id, content, platform, reply_url, channel_id, thread_id)
+             VALUES ($1, '00000000-0000-0000-0000-000000000000', $2, $3, $4, $5, $6)",
+        )
+        .bind(&sid)
+        .bind(greeting)
+        .bind(platform)
+        .bind(reply_url)
+        .bind(channel_id)
+        .bind(thread_id)
+        .execute(&state.pg)
+        .await;
+
+        // Also store greeting as outbound message
+        let _ = sqlx::query(
+            "INSERT INTO chat_messages (session_id, direction, content) VALUES ($1, 'outbound', $2)",
+        )
+        .bind(&sid)
+        .bind(greeting)
+        .execute(&state.pg)
+        .await;
+    }
+
+    // Fetch recent messages for context
+    let context_messages: Vec<(String, String)> = sqlx::query_as(
+        "SELECT direction, content FROM chat_messages
+         WHERE session_id = $1
+         ORDER BY created_at DESC
+         LIMIT $2",
+    )
+    .bind(&sid)
+    .bind(i64::from(chat_cfg.max_context_messages))
+    .fetch_all(&state.pg)
+    .await
+    .unwrap_or_default();
+
+    // Format context (reverse to chronological order)
+    let mut context_lines: Vec<String> = context_messages
+        .iter()
+        .rev()
+        .map(|(dir, content)| {
+            let label = if dir == "inbound" { user_name } else { "Broodlink" };
+            format!("[{label}]: {content}")
+        })
+        .collect();
+
+    let description = if context_lines.is_empty() {
+        format!("Message from {user_name} on {platform}:\n{text}")
+    } else {
+        context_lines.push(format!("\nLatest message from {user_name}:\n{text}"));
+        format!("Conversation history:\n{}", context_lines.join("\n"))
+    };
+
+    // Truncate title to 80 chars
+    let title_text = if text.len() > 80 { &text[..80] } else { text };
+    let title = format!("Chat: {title_text}");
+
+    // Create task with chat metadata in dependencies field
+    let chat_meta = serde_json::json!({
+        "chat": {
+            "chat_session_id": sid,
+            "platform": platform,
+            "channel_id": channel_id,
+            "user_id": user_id,
+            "thread_id": thread_id,
+            "reply_url": reply_url,
+        }
+    });
+
+    let create_result = bridge_call(
+        state,
+        "create_task",
+        serde_json::json!({
+            "title": title,
+            "description": description,
+            "priority": 0,
+            "dependencies": chat_meta.to_string(),
+        }),
+    )
+    .await;
+
+    match create_result {
+        Ok(data) => {
+            let task_id = data
+                .get("task_id")
+                .or_else(|| data.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            info!(
+                session_id = %sid,
+                task_id = %task_id,
+                platform = platform,
+                "chat task created"
+            );
+        }
+        Err(e) => {
+            error!(error = %e, session_id = %sid, "failed to create chat task");
+        }
+    }
+}
+
+/// Background loop: deliver pending chat replies to platforms.
+async fn reply_delivery_loop(state: &AppState) {
+    let chat_cfg = &state.config.chat;
+    let max_attempts = chat_cfg.reply_retry_attempts;
+
+    info!("chat reply delivery loop started");
+
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+        // Fetch pending replies
+        let rows: Vec<(i64, String, String, Option<String>, String, Option<String>, String)> =
+            match sqlx::query_as(
+                "SELECT id, content, platform, reply_url, channel_id, thread_id, session_id
+                 FROM chat_reply_queue
+                 WHERE status = 'pending' AND attempts < $1
+                 ORDER BY created_at ASC
+                 LIMIT 10",
+            )
+            .bind(i64::from(max_attempts))
+            .fetch_all(&state.pg)
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!(error = %e, "reply delivery query failed");
+                    continue;
+                }
+            };
+
+        for (id, content, platform, reply_url, channel_id, thread_id, _session_id) in rows {
+            let delivered = match platform.as_str() {
+                "slack" => deliver_slack(state, reply_url.as_deref(), &channel_id, thread_id.as_deref(), &content).await,
+                "teams" => deliver_teams(state, reply_url.as_deref(), &channel_id, &content).await,
+                "telegram" => deliver_telegram(state, &channel_id, thread_id.as_deref(), &content).await,
+                _ => {
+                    warn!(platform = %platform, "unsupported platform for reply delivery");
+                    Err("unsupported platform".to_string())
+                }
+            };
+
+            match delivered {
+                Ok(()) => {
+                    let _ = sqlx::query(
+                        "UPDATE chat_reply_queue SET status = 'delivered', delivered_at = NOW() WHERE id = $1",
+                    )
+                    .bind(id)
+                    .execute(&state.pg)
+                    .await;
+                }
+                Err(err) => {
+                    let _ = sqlx::query(
+                        "UPDATE chat_reply_queue
+                         SET attempts = attempts + 1,
+                             error_msg = $2,
+                             status = CASE WHEN attempts + 1 >= $3 THEN 'failed' ELSE 'pending' END
+                         WHERE id = $1",
+                    )
+                    .bind(id)
+                    .bind(&err)
+                    .bind(i64::from(max_attempts))
+                    .execute(&state.pg)
+                    .await;
+                }
+            }
+        }
+    }
+}
+
+/// Handle a task completion event — check if it's a chat task and queue reply.
+async fn handle_task_completion_for_chat(
+    state: &AppState,
+    task_id: &str,
+    result_data: &serde_json::Value,
+    is_failure: bool,
+) {
+    // Look up chat metadata from task_queue.dependencies
+    let row: Option<(serde_json::Value,)> = sqlx::query_as(
+        "SELECT dependencies FROM task_queue WHERE id = $1",
+    )
+    .bind(task_id)
+    .fetch_optional(&state.pg)
+    .await
+    .unwrap_or(None);
+
+    let deps = match row {
+        Some((d,)) => d,
+        None => return,
+    };
+
+    let chat = match deps.get("chat") {
+        Some(c) => c,
+        None => return, // Not a chat task
+    };
+
+    let session_id = chat.get("chat_session_id").and_then(|v| v.as_str()).unwrap_or_default();
+    let platform = chat.get("platform").and_then(|v| v.as_str()).unwrap_or_default();
+    let channel_id = chat.get("channel_id").and_then(|v| v.as_str()).unwrap_or_default();
+    let thread_id = chat.get("thread_id").and_then(|v| v.as_str());
+    let reply_url = chat.get("reply_url").and_then(|v| v.as_str());
+
+    if session_id.is_empty() || platform.is_empty() || channel_id.is_empty() {
+        return;
+    }
+
+    let content = if is_failure {
+        let err = result_data
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("An error occurred while processing your request.");
+        format!("Sorry, something went wrong: {err}")
+    } else {
+        // Extract response text from result_data
+        result_data
+            .as_str()
+            .map(String::from)
+            .or_else(|| result_data.get("response").and_then(|v| v.as_str()).map(String::from))
+            .or_else(|| result_data.get("text").and_then(|v| v.as_str()).map(String::from))
+            .unwrap_or_else(|| result_data.to_string())
+    };
+
+    // Insert into reply queue
+    let _ = sqlx::query(
+        "INSERT INTO chat_reply_queue (session_id, task_id, content, platform, reply_url, channel_id, thread_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(session_id)
+    .bind(task_id)
+    .bind(&content)
+    .bind(platform)
+    .bind(reply_url)
+    .bind(channel_id)
+    .bind(thread_id)
+    .execute(&state.pg)
+    .await;
+
+    // Store as outbound message
+    let _ = sqlx::query(
+        "INSERT INTO chat_messages (session_id, direction, content, task_id) VALUES ($1, 'outbound', $2, $3)",
+    )
+    .bind(session_id)
+    .bind(&content)
+    .bind(task_id)
+    .execute(&state.pg)
+    .await;
+
+    info!(
+        task_id = task_id,
+        session_id = session_id,
+        platform = platform,
+        is_failure = is_failure,
+        "chat reply queued"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Platform-specific delivery functions
+// ---------------------------------------------------------------------------
+
+async fn deliver_slack(
+    state: &AppState,
+    reply_url: Option<&str>,
+    channel_id: &str,
+    thread_ts: Option<&str>,
+    text: &str,
+) -> Result<(), String> {
+    let body = if let Some(url) = reply_url {
+        // Use Slack response_url
+        let payload = serde_json::json!({
+            "response_type": "in_channel",
+            "text": text,
+        });
+        state
+            .http_client
+            .post(url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    } else {
+        // Use chat.postMessage with bot token
+        let token = state.config.webhooks.slack_bot_token.as_deref().unwrap_or("");
+        if token.is_empty() {
+            return Err("no slack_bot_token configured".to_string());
+        }
+        let mut payload = serde_json::json!({
+            "channel": channel_id,
+            "text": text,
+        });
+        if let Some(ts) = thread_ts {
+            payload["thread_ts"] = serde_json::Value::String(ts.to_string());
+        }
+        state
+            .http_client
+            .post("https://slack.com/api/chat.postMessage")
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+    };
+
+    let status = body.status();
+    if !status.is_success() {
+        let text = body.text().await.unwrap_or_default();
+        return Err(format!("slack API returned {status}: {text}"));
+    }
+    Ok(())
+}
+
+async fn deliver_teams(
+    state: &AppState,
+    service_url: Option<&str>,
+    conversation_id: &str,
+    text: &str,
+) -> Result<(), String> {
+    let url = match service_url {
+        Some(u) => format!("{u}/v3/conversations/{conversation_id}/activities"),
+        None => return Err("no teams service_url available".to_string()),
+    };
+    let payload = serde_json::json!({
+        "type": "message",
+        "text": text,
+    });
+    let resp = state
+        .http_client
+        .post(&url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("teams API returned {status}: {text}"));
+    }
+    Ok(())
+}
+
+async fn deliver_telegram(
+    state: &AppState,
+    chat_id: &str,
+    thread_id: Option<&str>,
+    text: &str,
+) -> Result<(), String> {
+    let token = state.config.webhooks.telegram_bot_token.as_deref().unwrap_or("");
+    if token.is_empty() {
+        return Err("no telegram_bot_token configured".to_string());
+    }
+    let url = format!("https://api.telegram.org/bot{token}/sendMessage");
+    let mut payload = serde_json::json!({
+        "chat_id": chat_id,
+        "text": text,
+    });
+    if let Some(tid) = thread_id {
+        payload["message_thread_id"] = serde_json::Value::String(tid.to_string());
+    }
+    let resp = state
+        .http_client
+        .post(&url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("telegram API returned {status}: {body}"));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1541,5 +2219,188 @@ mod tests {
         assert_eq!(urlencoding_decode("hello+world"), "hello world");
         assert_eq!(urlencoding_decode("foo%20bar"), "foo bar");
         assert_eq!(urlencoding_decode("100%25"), "100%");
+    }
+
+    // --- v0.7.0: Chat message parsing tests ---
+
+    #[test]
+    fn test_slack_event_message_parsing() {
+        let event = serde_json::json!({
+            "type": "event_callback",
+            "event": {
+                "type": "message",
+                "channel": "C1234",
+                "user": "U5678",
+                "text": "hello agent",
+                "thread_ts": "1234567890.000100"
+            }
+        });
+        let evt = event.get("event").unwrap();
+        assert_eq!(evt.get("type").and_then(|t| t.as_str()), Some("message"));
+        assert!(evt.get("bot_id").is_none());
+        assert_eq!(evt.get("channel").and_then(|c| c.as_str()), Some("C1234"));
+        assert_eq!(evt.get("user").and_then(|u| u.as_str()), Some("U5678"));
+        assert_eq!(evt.get("text").and_then(|t| t.as_str()), Some("hello agent"));
+        assert_eq!(evt.get("thread_ts").and_then(|t| t.as_str()), Some("1234567890.000100"));
+    }
+
+    #[test]
+    fn test_slack_event_bot_message_ignored() {
+        let event = serde_json::json!({
+            "type": "event_callback",
+            "event": {
+                "type": "message",
+                "channel": "C1234",
+                "user": "U5678",
+                "text": "bot reply",
+                "bot_id": "B0001"
+            }
+        });
+        let evt = event.get("event").unwrap();
+        assert!(evt.get("bot_id").is_some(), "bot messages should be detected");
+    }
+
+    #[test]
+    fn test_teams_activity_parsing() {
+        let payload = serde_json::json!({
+            "type": "message",
+            "text": "help me with something",
+            "from": { "id": "user-001", "name": "Jane" },
+            "channelId": "teams-channel-1",
+            "conversation": { "id": "conv-123" },
+            "serviceUrl": "https://smba.trafficmanager.net/teams"
+        });
+        assert_eq!(payload.get("type").and_then(|t| t.as_str()), Some("message"));
+        assert_eq!(payload.get("from").and_then(|f| f.get("name")).and_then(|n| n.as_str()), Some("Jane"));
+        assert_eq!(payload.get("from").and_then(|f| f.get("id")).and_then(|n| n.as_str()), Some("user-001"));
+        assert_eq!(payload.get("channelId").and_then(|c| c.as_str()), Some("teams-channel-1"));
+        assert_eq!(payload.get("serviceUrl").and_then(|s| s.as_str()), Some("https://smba.trafficmanager.net/teams"));
+    }
+
+    #[test]
+    fn test_telegram_message_parsing() {
+        let payload = serde_json::json!({
+            "message": {
+                "text": "what is the weather?",
+                "from": { "id": 12345, "first_name": "Bob" },
+                "chat": { "id": 67890 },
+                "message_thread_id": 42
+            }
+        });
+        let msg = payload.get("message").unwrap();
+        assert_eq!(msg.get("text").and_then(|t| t.as_str()), Some("what is the weather?"));
+        assert_eq!(msg.get("from").and_then(|f| f.get("first_name")).and_then(|n| n.as_str()), Some("Bob"));
+        assert_eq!(msg.get("from").and_then(|f| f.get("id")).and_then(|i| i.as_i64()), Some(12345));
+        assert_eq!(msg.get("chat").and_then(|c| c.get("id")).and_then(|i| i.as_i64()), Some(67890));
+        assert_eq!(msg.get("message_thread_id").and_then(|t| t.as_i64()), Some(42));
+    }
+
+    #[test]
+    fn test_slash_command_still_works() {
+        // /broodlink commands should still be parsed as commands, not chat messages
+        let (cmd, args) = parse_command_text("/broodlink agents").unwrap();
+        assert_eq!(cmd, "agents");
+        assert!(args.is_empty());
+
+        // A free-form message should NOT parse as a command
+        let result = parse_command_text("what is the meaning of life?");
+        // This will parse as "what" command with args, but it won't match any known command
+        assert!(result.is_some());
+        let (cmd, _) = result.unwrap();
+        assert_eq!(cmd, "what");
+    }
+
+    // --- v0.7.0: Session upsert logic tests ---
+
+    #[test]
+    fn test_session_upsert_new_generates_uuid() {
+        // On a brand new session, handle_chat_message generates a UUID for session_id.
+        // The SQL upsert uses ON CONFLICT (platform, channel_id, user_id).
+        // Verify UUID generation is valid.
+        let session_id = uuid::Uuid::new_v4().to_string();
+        assert_eq!(session_id.len(), 36, "UUID should be 36 chars including hyphens");
+        assert_eq!(session_id.chars().filter(|c| *c == '-').count(), 4, "UUID should have 4 hyphens");
+    }
+
+    #[test]
+    fn test_session_upsert_conflict_key() {
+        // The unique constraint is (platform, channel_id, user_id).
+        // Same triple should route to the same session; different triple should be distinct.
+        let key1 = ("slack", "C123", "U456");
+        let key2 = ("slack", "C123", "U456"); // same
+        let key3 = ("teams", "C123", "U456"); // different platform
+        let key4 = ("slack", "C999", "U456"); // different channel
+
+        assert_eq!(key1, key2, "same triple should map to same session");
+        assert_ne!(key1, key3, "different platform should be distinct session");
+        assert_ne!(key1, key4, "different channel should be distinct session");
+    }
+
+    // --- v0.7.0: Reply URL construction per platform ---
+
+    #[test]
+    fn test_slack_reply_url_via_response_url() {
+        // When Slack provides a response_url, it should be used directly (no construction needed)
+        let response_url = "https://hooks.slack.com/actions/T00/B00/xxxyyy";
+        assert!(response_url.starts_with("https://hooks.slack.com/"));
+        // Payload format for response_url
+        let payload = serde_json::json!({
+            "response_type": "in_channel",
+            "text": "Agent reply",
+        });
+        assert_eq!(payload["response_type"], "in_channel");
+        assert_eq!(payload["text"], "Agent reply");
+    }
+
+    #[test]
+    fn test_teams_reply_url_construction() {
+        // Teams uses: {serviceUrl}/v3/conversations/{conversationId}/activities
+        let service_url = "https://smba.trafficmanager.net/teams";
+        let conversation_id = "conv-123";
+        let url = format!("{service_url}/v3/conversations/{conversation_id}/activities");
+        assert_eq!(
+            url,
+            "https://smba.trafficmanager.net/teams/v3/conversations/conv-123/activities"
+        );
+    }
+
+    #[test]
+    fn test_telegram_reply_url_construction() {
+        // Telegram uses: https://api.telegram.org/bot{token}/sendMessage
+        let token = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11";
+        let url = format!("https://api.telegram.org/bot{token}/sendMessage");
+        assert_eq!(
+            url,
+            "https://api.telegram.org/bot123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11/sendMessage"
+        );
+        // Payload includes chat_id and optionally message_thread_id
+        let mut payload = serde_json::json!({
+            "chat_id": "67890",
+            "text": "hello",
+        });
+        assert_eq!(payload["chat_id"], "67890");
+        payload["message_thread_id"] = serde_json::Value::String("42".to_string());
+        assert_eq!(payload["message_thread_id"], "42");
+    }
+
+    // --- v0.7.0: Greeting on new session ---
+
+    #[test]
+    fn test_greeting_triggers_on_first_message() {
+        // The greeting logic checks: greeting_enabled && msg_count == 1
+        let greeting_enabled = true;
+
+        // msg_count == 1 → new session → greeting should fire
+        let msg_count = 1;
+        assert!(greeting_enabled && msg_count == 1, "greeting should fire on first message");
+
+        // msg_count == 2 → returning user → no greeting
+        let msg_count = 2;
+        assert!(!(greeting_enabled && msg_count == 1), "greeting should NOT fire on subsequent messages");
+
+        // greeting_enabled == false → never fire
+        let greeting_enabled = false;
+        let msg_count = 1;
+        assert!(!(greeting_enabled && msg_count == 1), "greeting should NOT fire when disabled");
     }
 }

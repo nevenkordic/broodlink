@@ -73,6 +73,12 @@ pub enum StatusApiError {
     Secrets(#[from] broodlink_secrets::SecretsError),
     #[error("auth error: {0}")]
     Auth(String),
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("bad request: {0}")]
+    BadRequest(String),
+    #[error("forbidden: {0}")]
+    Forbidden(String),
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -100,6 +106,18 @@ impl IntoResponse for StatusApiError {
             Self::Auth(msg) => {
                 warn!(msg = %msg, trace_id = %trace_id, "auth failure");
                 (StatusCode::UNAUTHORIZED, "authentication required")
+            }
+            Self::NotFound(msg) => {
+                warn!(msg = %msg, trace_id = %trace_id, "not found");
+                (StatusCode::NOT_FOUND, "not found")
+            }
+            Self::BadRequest(msg) => {
+                warn!(msg = %msg, trace_id = %trace_id, "bad request");
+                (StatusCode::BAD_REQUEST, "bad request")
+            }
+            Self::Forbidden(msg) => {
+                warn!(msg = %msg, trace_id = %trace_id, "forbidden");
+                (StatusCode::FORBIDDEN, "insufficient permissions")
             }
             Self::Internal(msg) => {
                 error!(msg = %msg, trace_id = %trace_id, "internal error");
@@ -176,6 +194,56 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub api_key: String,
     pub start_time: Instant,
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard role-based access
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UserRole {
+    Viewer,
+    Operator,
+    Admin,
+}
+
+impl UserRole {
+    fn from_str_loose(s: &str) -> Self {
+        match s {
+            "admin" => Self::Admin,
+            "operator" => Self::Operator,
+            _ => Self::Viewer,
+        }
+    }
+}
+
+impl std::fmt::Display for UserRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Viewer => write!(f, "viewer"),
+            Self::Operator => write!(f, "operator"),
+            Self::Admin => write!(f, "admin"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthContext {
+    pub role: UserRole,
+    pub user_id: Option<String>,
+    pub username: Option<String>,
+}
+
+fn require_role(ctx: &AuthContext, minimum: UserRole) -> Result<(), StatusApiError> {
+    if ctx.role >= minimum {
+        Ok(())
+    } else {
+        Err(StatusApiError::Forbidden(format!(
+            "requires {} role, you have {}",
+            minimum, ctx.role
+        )))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -385,24 +453,50 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/webhooks/:endpoint_id/toggle", post(handler_webhook_toggle))
         .route("/webhooks/:endpoint_id/delete", post(handler_webhook_delete))
         .route("/webhook-log", get(handler_webhook_log))
+        // v0.7.0 chat sessions
+        .route("/chat/sessions", get(handler_chat_sessions))
+        .route("/chat/sessions/:session_id/messages", get(handler_chat_messages))
+        .route("/chat/sessions/:session_id/close", post(handler_chat_close))
+        .route("/chat/sessions/:session_id/assign", post(handler_chat_assign))
+        .route("/chat/stats", get(handler_chat_stats))
+        // v0.7.0 formula registry
+        .route("/formulas", get(handler_list_formulas).post(handler_create_formula))
+        .route("/formulas/:name", get(handler_get_formula))
+        .route("/formulas/:name/update", post(handler_update_formula))
+        .route("/formulas/:name/toggle", post(handler_toggle_formula))
+        // v0.7.0 user management (admin-only, checked in handlers)
+        .route("/users", get(handler_list_users).post(handler_create_user))
+        .route("/users/:id/role", post(handler_change_role))
+        .route("/users/:id/toggle", post(handler_toggle_user))
+        .route("/users/:id/reset-password", post(handler_reset_password))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
         ))
         .with_state(Arc::clone(&state));
 
+    // Auth routes: no auth middleware (login/logout/me)
+    let auth_routes = Router::new()
+        .route("/auth/login", post(handler_auth_login))
+        .route("/auth/logout", post(handler_auth_logout))
+        .route("/auth/me", get(handler_auth_me))
+        .with_state(Arc::clone(&state));
+
     Router::new()
         .nest("/api/v1", api_routes)
+        .nest("/api/v1", auth_routes)
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(cors)
 }
 
 fn build_cors_layer(origins: &[String]) -> CorsLayer {
     let api_key_header = HeaderName::from_static("x-broodlink-api-key");
+    let session_header = HeaderName::from_static("x-broodlink-session");
     let allowed_headers = [
         header::CONTENT_TYPE,
         header::AUTHORIZATION,
         api_key_header,
+        session_header,
     ];
 
     if origins.is_empty() {
@@ -423,27 +517,85 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
 }
 
 // ---------------------------------------------------------------------------
-// Auth middleware: X-Broodlink-Api-Key header
+// Auth middleware: session-based or API-key auth
 // ---------------------------------------------------------------------------
 
 async fn auth_middleware(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    req: Request<axum::body::Body>,
+    mut req: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, StatusApiError> {
-    let provided_key = headers
-        .get("X-Broodlink-Api-Key")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            StatusApiError::Auth("missing X-Broodlink-Api-Key header".to_string())
-        })?;
+    let auth_enabled = state.config.dashboard_auth.enabled;
 
-    if provided_key != state.api_key {
-        return Err(StatusApiError::Auth("invalid API key".to_string()));
+    if !auth_enabled {
+        // Legacy mode: API key only, treated as admin
+        let provided_key = headers
+            .get("X-Broodlink-Api-Key")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| {
+                StatusApiError::Auth("missing X-Broodlink-Api-Key header".to_string())
+            })?;
+
+        if provided_key != state.api_key {
+            return Err(StatusApiError::Auth("invalid API key".to_string()));
+        }
+
+        req.extensions_mut().insert(AuthContext {
+            role: UserRole::Admin,
+            user_id: None,
+            username: None,
+        });
+        return Ok(next.run(req).await);
     }
 
-    Ok(next.run(req).await)
+    // Dashboard auth enabled: try session first, then API key fallback
+    if let Some(session_token) = headers
+        .get("X-Broodlink-Session")
+        .and_then(|v| v.to_str().ok())
+    {
+        let session: Option<(String, String, String, bool)> = sqlx::query_as(
+            "SELECT u.id, u.username, u.role, u.active
+             FROM dashboard_sessions s
+             JOIN dashboard_users u ON u.id = s.user_id
+             WHERE s.id = $1 AND s.expires_at > NOW()",
+        )
+        .bind(session_token)
+        .fetch_optional(&state.pg)
+        .await?;
+
+        if let Some((user_id, username, role, active)) = session {
+            if !active {
+                return Err(StatusApiError::Auth("user account is deactivated".to_string()));
+            }
+            req.extensions_mut().insert(AuthContext {
+                role: UserRole::from_str_loose(&role),
+                user_id: Some(user_id),
+                username: Some(username),
+            });
+            return Ok(next.run(req).await);
+        }
+        // Invalid/expired session — fall through to API key check
+    }
+
+    // API key fallback (always treated as admin)
+    if let Some(provided_key) = headers
+        .get("X-Broodlink-Api-Key")
+        .and_then(|v| v.to_str().ok())
+    {
+        if provided_key == state.api_key {
+            req.extensions_mut().insert(AuthContext {
+                role: UserRole::Admin,
+                user_id: None,
+                username: None,
+            });
+            return Ok(next.run(req).await);
+        }
+    }
+
+    Err(StatusApiError::Auth(
+        "valid X-Broodlink-Session or X-Broodlink-Api-Key required".to_string(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2222,6 +2374,838 @@ async fn handler_a2a_card(
 }
 
 // ===========================================================================
+// v0.7.0: Chat session endpoints
+// ===========================================================================
+
+async fn handler_chat_sessions(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let platform = params.get("platform");
+    let status = params.get("status").map(String::as_str).unwrap_or("active");
+    let limit: i64 = params
+        .get("limit")
+        .and_then(|l| l.parse().ok())
+        .unwrap_or(50);
+
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        i32,
+        Option<String>,
+        String,
+        String,
+    )> = if let Some(plat) = platform {
+        sqlx::query_as(
+            "SELECT id, platform, channel_id, user_id, user_display_name,
+                    thread_id, assigned_agent, message_count,
+                    last_message_at::text, status, created_at::text
+             FROM chat_sessions
+             WHERE platform = $1 AND status = $2
+             ORDER BY last_message_at DESC NULLS LAST
+             LIMIT $3",
+        )
+        .bind(plat)
+        .bind(status)
+        .bind(limit)
+        .fetch_all(&state.pg)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT id, platform, channel_id, user_id, user_display_name,
+                    thread_id, assigned_agent, message_count,
+                    last_message_at::text, status, created_at::text
+             FROM chat_sessions
+             WHERE status = $1
+             ORDER BY last_message_at DESC NULLS LAST
+             LIMIT $2",
+        )
+        .bind(status)
+        .bind(limit)
+        .fetch_all(&state.pg)
+        .await?
+    };
+
+    let sessions: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(id, platform, channel_id, user_id, display_name, thread_id, agent, msg_count, last_msg, status, created)| {
+            serde_json::json!({
+                "id": id,
+                "platform": platform,
+                "channel_id": channel_id,
+                "user_id": user_id,
+                "user_display_name": display_name,
+                "thread_id": thread_id,
+                "assigned_agent": agent,
+                "message_count": msg_count,
+                "last_message_at": last_msg,
+                "status": status,
+                "created_at": created,
+            })
+        })
+        .collect();
+
+    Ok(ok_response(serde_json::json!({
+        "sessions": sessions,
+        "total": sessions.len(),
+    })))
+}
+
+async fn handler_chat_messages(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let limit: i64 = params
+        .get("limit")
+        .and_then(|l| l.parse().ok())
+        .unwrap_or(50);
+
+    let rows: Vec<(i64, String, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT id, direction, content, task_id, created_at::text
+         FROM chat_messages
+         WHERE session_id = $1
+         ORDER BY created_at DESC
+         LIMIT $2",
+    )
+    .bind(&session_id)
+    .bind(limit)
+    .fetch_all(&state.pg)
+    .await?;
+
+    let messages: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(id, direction, content, task_id, created)| {
+            serde_json::json!({
+                "id": id,
+                "direction": direction,
+                "content": content,
+                "task_id": task_id,
+                "created_at": created,
+            })
+        })
+        .collect();
+
+    Ok(ok_response(serde_json::json!({
+        "messages": messages,
+        "session_id": session_id,
+        "total": messages.len(),
+    })))
+}
+
+async fn handler_chat_stats(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let total_sessions: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM chat_sessions WHERE status = 'active'",
+    )
+    .fetch_one(&state.pg)
+    .await?;
+
+    let messages_today: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM chat_messages WHERE created_at >= CURRENT_DATE",
+    )
+    .fetch_one(&state.pg)
+    .await?;
+
+    let platforms: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT platform, COUNT(*) as cnt FROM chat_sessions
+         WHERE status = 'active'
+         GROUP BY platform
+         ORDER BY cnt DESC",
+    )
+    .fetch_all(&state.pg)
+    .await?;
+
+    let pending_replies: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM chat_reply_queue WHERE status = 'pending'",
+    )
+    .fetch_one(&state.pg)
+    .await?;
+
+    let platform_map: serde_json::Value = platforms
+        .iter()
+        .map(|(p, c)| (p.clone(), serde_json::json!(c)))
+        .collect::<serde_json::Map<String, serde_json::Value>>()
+        .into();
+
+    Ok(ok_response(serde_json::json!({
+        "active_sessions": total_sessions.0,
+        "messages_today": messages_today.0,
+        "pending_replies": pending_replies.0,
+        "platforms": platform_map,
+    })))
+}
+
+async fn handler_chat_close(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    sqlx::query(
+        "UPDATE chat_sessions SET status = 'closed', updated_at = NOW() WHERE id = $1",
+    )
+    .bind(&session_id)
+    .execute(&state.pg)
+    .await?;
+
+    Ok(ok_response(serde_json::json!({
+        "session_id": session_id,
+        "status": "closed",
+    })))
+}
+
+async fn handler_chat_assign(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let agent = body
+        .get("agent")
+        .and_then(|a| a.as_str())
+        .unwrap_or("");
+
+    sqlx::query(
+        "UPDATE chat_sessions SET assigned_agent = $2, updated_at = NOW() WHERE id = $1",
+    )
+    .bind(&session_id)
+    .bind(agent)
+    .execute(&state.pg)
+    .await?;
+
+    Ok(ok_response(serde_json::json!({
+        "session_id": session_id,
+        "assigned_agent": agent,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Formula Registry handlers (v0.7.0)
+// ---------------------------------------------------------------------------
+
+async fn handler_list_formulas(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let rows: Vec<(String, String, String, Option<String>, i32, serde_json::Value, bool, bool, i32, Option<String>, Option<String>)> =
+        sqlx::query_as(
+            "SELECT id, name, display_name, description, version, tags,
+                    is_system, enabled, usage_count, last_used_at::text, created_at::text
+             FROM formula_registry
+             ORDER BY name",
+        )
+        .fetch_all(&state.pg)
+        .await?;
+
+    let formulas: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(id, name, display, desc, ver, tags, system, enabled, usage, last_used, created)| {
+            serde_json::json!({
+                "id": id,
+                "name": name,
+                "display_name": display,
+                "description": desc,
+                "version": ver,
+                "tags": tags,
+                "is_system": system,
+                "enabled": enabled,
+                "usage_count": usage,
+                "last_used_at": last_used,
+                "created_at": created,
+            })
+        })
+        .collect();
+
+    Ok(ok_response(serde_json::json!({
+        "formulas": formulas,
+        "total": formulas.len(),
+    })))
+}
+
+async fn handler_get_formula(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let row: Option<(String, String, String, Option<String>, i32, serde_json::Value, Option<String>, serde_json::Value, bool, bool, i32, Option<String>, Option<String>, Option<String>)> =
+        sqlx::query_as(
+            "SELECT id, name, display_name, description, version, definition, author,
+                    tags, is_system, enabled, usage_count, last_used_at::text,
+                    created_at::text, updated_at::text
+             FROM formula_registry
+             WHERE name = $1",
+        )
+        .bind(&name)
+        .fetch_optional(&state.pg)
+        .await?;
+
+    let (id, nm, display, desc, ver, def, author, tags, system, enabled, usage, last_used, created, updated) =
+        row.ok_or_else(|| StatusApiError::NotFound(format!("formula not found: {name}")))?;
+
+    Ok(ok_response(serde_json::json!({
+        "id": id,
+        "name": nm,
+        "display_name": display,
+        "description": desc,
+        "version": ver,
+        "definition": def,
+        "author": author,
+        "tags": tags,
+        "is_system": system,
+        "enabled": enabled,
+        "usage_count": usage,
+        "last_used_at": last_used,
+        "created_at": created,
+        "updated_at": updated,
+    })))
+}
+
+async fn handler_create_formula(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let name = body.get("name").and_then(|n| n.as_str()).unwrap_or("");
+    let display_name = body.get("display_name").and_then(|n| n.as_str()).unwrap_or("");
+    let description = body.get("description").and_then(|n| n.as_str());
+    let definition = body.get("definition").ok_or_else(|| {
+        StatusApiError::BadRequest("missing 'definition' field".to_string())
+    })?;
+
+    if name.is_empty() || display_name.is_empty() {
+        return Err(StatusApiError::BadRequest("name and display_name are required".to_string()));
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let tags = body.get("tags").cloned().unwrap_or(serde_json::json!([]));
+
+    sqlx::query(
+        "INSERT INTO formula_registry (id, name, display_name, description, definition, tags, author)
+         VALUES ($1, $2, $3, $4, $5, $6, 'dashboard')",
+    )
+    .bind(&id)
+    .bind(name)
+    .bind(display_name)
+    .bind(description)
+    .bind(definition)
+    .bind(&tags)
+    .execute(&state.pg)
+    .await?;
+
+    Ok(ok_response(serde_json::json!({
+        "id": id,
+        "name": name,
+        "status": "created",
+    })))
+}
+
+async fn handler_update_formula(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let mut updates = Vec::new();
+
+    if let Some(def) = body.get("definition") {
+        sqlx::query("UPDATE formula_registry SET definition = $1, version = version + 1 WHERE name = $2")
+            .bind(def)
+            .bind(&name)
+            .execute(&state.pg)
+            .await?;
+        updates.push("definition");
+    }
+
+    if let Some(dn) = body.get("display_name").and_then(|v| v.as_str()) {
+        sqlx::query("UPDATE formula_registry SET display_name = $1 WHERE name = $2")
+            .bind(dn)
+            .bind(&name)
+            .execute(&state.pg)
+            .await?;
+        updates.push("display_name");
+    }
+
+    if let Some(desc) = body.get("description").and_then(|v| v.as_str()) {
+        sqlx::query("UPDATE formula_registry SET description = $1 WHERE name = $2")
+            .bind(desc)
+            .bind(&name)
+            .execute(&state.pg)
+            .await?;
+        updates.push("description");
+    }
+
+    if let Some(en) = body.get("enabled").and_then(|v| v.as_bool()) {
+        sqlx::query("UPDATE formula_registry SET enabled = $1 WHERE name = $2")
+            .bind(en)
+            .bind(&name)
+            .execute(&state.pg)
+            .await?;
+        updates.push("enabled");
+    }
+
+    sqlx::query("UPDATE formula_registry SET updated_at = NOW() WHERE name = $1")
+        .bind(&name)
+        .execute(&state.pg)
+        .await?;
+
+    Ok(ok_response(serde_json::json!({
+        "name": name,
+        "status": "updated",
+        "updated_fields": updates,
+    })))
+}
+
+async fn handler_toggle_formula(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let row: Option<(bool,)> = sqlx::query_as(
+        "SELECT enabled FROM formula_registry WHERE name = $1",
+    )
+    .bind(&name)
+    .fetch_optional(&state.pg)
+    .await?;
+
+    let (currently_enabled,) = row.ok_or_else(|| {
+        StatusApiError::NotFound(format!("formula not found: {name}"))
+    })?;
+
+    let new_enabled = !currently_enabled;
+    sqlx::query("UPDATE formula_registry SET enabled = $1, updated_at = NOW() WHERE name = $2")
+        .bind(new_enabled)
+        .bind(&name)
+        .execute(&state.pg)
+        .await?;
+
+    Ok(ok_response(serde_json::json!({
+        "name": name,
+        "enabled": new_enabled,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// v0.7.0 Auth endpoints (no auth middleware)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+async fn handler_auth_login(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<LoginRequest>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    if !state.config.dashboard_auth.enabled {
+        return Err(StatusApiError::BadRequest(
+            "dashboard auth is not enabled".to_string(),
+        ));
+    }
+
+    let user: Option<(String, String, String, bool)> = sqlx::query_as(
+        "SELECT id, password_hash, role, active FROM dashboard_users WHERE username = $1",
+    )
+    .bind(&body.username)
+    .fetch_optional(&state.pg)
+    .await?;
+
+    let (user_id, password_hash, role, active) = user.ok_or_else(|| {
+        StatusApiError::Auth("invalid username or password".to_string())
+    })?;
+
+    if !active {
+        return Err(StatusApiError::Auth("user account is deactivated".to_string()));
+    }
+
+    let valid = bcrypt::verify(&body.password, &password_hash)
+        .map_err(|e| StatusApiError::Internal(format!("bcrypt error: {e}")))?;
+
+    if !valid {
+        return Err(StatusApiError::Auth("invalid username or password".to_string()));
+    }
+
+    // Enforce max sessions per user
+    let max_sessions = i64::from(state.config.dashboard_auth.max_sessions_per_user);
+    let session_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM dashboard_sessions WHERE user_id = $1 AND expires_at > NOW()",
+    )
+    .bind(&user_id)
+    .fetch_one(&state.pg)
+    .await?;
+
+    if session_count.0 >= max_sessions {
+        // Delete oldest sessions to make room
+        sqlx::query(
+            "DELETE FROM dashboard_sessions WHERE user_id = $1
+             AND id NOT IN (
+                SELECT id FROM dashboard_sessions
+                WHERE user_id = $1 AND expires_at > NOW()
+                ORDER BY created_at DESC
+                LIMIT $2
+             )",
+        )
+        .bind(&user_id)
+        .bind(max_sessions - 1)
+        .execute(&state.pg)
+        .await?;
+    }
+
+    let session_id = Uuid::new_v4().to_string();
+    let ttl_hours = i64::from(state.config.dashboard_auth.session_ttl_hours);
+
+    sqlx::query(
+        "INSERT INTO dashboard_sessions (id, user_id, expires_at)
+         VALUES ($1, $2, NOW() + ($3 || ' hours')::interval)",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .bind(ttl_hours.to_string())
+    .execute(&state.pg)
+    .await?;
+
+    // Update last_login
+    sqlx::query("UPDATE dashboard_users SET last_login = NOW() WHERE id = $1")
+        .bind(&user_id)
+        .execute(&state.pg)
+        .await?;
+
+    let expires_at: (String,) = sqlx::query_as(
+        "SELECT expires_at::text FROM dashboard_sessions WHERE id = $1",
+    )
+    .bind(&session_id)
+    .fetch_one(&state.pg)
+    .await?;
+
+    Ok(ok_response(serde_json::json!({
+        "token": session_id,
+        "role": role,
+        "expires_at": expires_at.0,
+    })))
+}
+
+async fn handler_auth_logout(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let session_token = headers
+        .get("X-Broodlink-Session")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            StatusApiError::Auth("missing X-Broodlink-Session header".to_string())
+        })?;
+
+    sqlx::query("DELETE FROM dashboard_sessions WHERE id = $1")
+        .bind(session_token)
+        .execute(&state.pg)
+        .await?;
+
+    Ok(ok_response(serde_json::json!({"logged_out": true})))
+}
+
+async fn handler_auth_me(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let session_token = headers
+        .get("X-Broodlink-Session")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            StatusApiError::Auth("missing X-Broodlink-Session header".to_string())
+        })?;
+
+    let user: Option<(String, String, String, Option<String>, bool, Option<String>)> =
+        sqlx::query_as(
+            "SELECT u.id, u.username, u.role, u.display_name, u.active, u.last_login::text
+             FROM dashboard_sessions s
+             JOIN dashboard_users u ON u.id = s.user_id
+             WHERE s.id = $1 AND s.expires_at > NOW()",
+        )
+        .bind(session_token)
+        .fetch_optional(&state.pg)
+        .await?;
+
+    let (user_id, username, role, display_name, active, last_login) = user.ok_or_else(|| {
+        StatusApiError::Auth("invalid or expired session".to_string())
+    })?;
+
+    if !active {
+        return Err(StatusApiError::Auth("user account is deactivated".to_string()));
+    }
+
+    Ok(ok_response(serde_json::json!({
+        "id": user_id,
+        "username": username,
+        "role": role,
+        "display_name": display_name,
+        "active": active,
+        "last_login": last_login,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// v0.7.0 User management (admin-only)
+// ---------------------------------------------------------------------------
+
+async fn handler_list_users(
+    State(state): State<Arc<AppState>>,
+    req: Request<axum::body::Body>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned().ok_or_else(|| {
+        StatusApiError::Internal("missing auth context".to_string())
+    })?;
+    require_role(&ctx, UserRole::Admin)?;
+
+    let users = sqlx::query_as::<_, (String, String, String, Option<String>, bool, Option<String>, Option<String>)>(
+        "SELECT id, username, role, display_name, active, last_login::text, created_at::text
+         FROM dashboard_users ORDER BY username",
+    )
+    .fetch_all(&state.pg)
+    .await?;
+
+    let user_list: Vec<serde_json::Value> = users
+        .into_iter()
+        .map(|(id, username, role, display_name, active, last_login, created_at)| {
+            serde_json::json!({
+                "id": id,
+                "username": username,
+                "role": role,
+                "display_name": display_name,
+                "active": active,
+                "last_login": last_login,
+                "created_at": created_at,
+            })
+        })
+        .collect();
+
+    Ok(ok_response(serde_json::json!({
+        "users": user_list,
+        "total": user_list.len(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct CreateUserRequest {
+    username: String,
+    password: String,
+    role: Option<String>,
+    display_name: Option<String>,
+}
+
+async fn handler_create_user(
+    State(state): State<Arc<AppState>>,
+    req: Request<axum::body::Body>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned().ok_or_else(|| {
+        StatusApiError::Internal("missing auth context".to_string())
+    })?;
+    require_role(&ctx, UserRole::Admin)?;
+
+    let body: CreateUserRequest = serde_json::from_slice(
+        &axum::body::to_bytes(req.into_body(), 1024 * 64)
+            .await
+            .map_err(|e| StatusApiError::BadRequest(format!("invalid body: {e}")))?,
+    )
+    .map_err(|e| StatusApiError::BadRequest(format!("invalid JSON: {e}")))?;
+
+    if body.username.is_empty() || body.password.is_empty() {
+        return Err(StatusApiError::BadRequest(
+            "username and password are required".to_string(),
+        ));
+    }
+
+    let role_str = body.role.as_deref().unwrap_or("viewer");
+    if !["viewer", "operator", "admin"].contains(&role_str) {
+        return Err(StatusApiError::BadRequest(format!(
+            "invalid role: {role_str}, must be viewer/operator/admin"
+        )));
+    }
+
+    let cost = state.config.dashboard_auth.bcrypt_cost;
+    let password_hash = bcrypt::hash(&body.password, cost)
+        .map_err(|e| StatusApiError::Internal(format!("bcrypt error: {e}")))?;
+
+    let user_id = Uuid::new_v4().to_string();
+
+    let result = sqlx::query(
+        "INSERT INTO dashboard_users (id, username, password_hash, role, display_name)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(&user_id)
+    .bind(&body.username)
+    .bind(&password_hash)
+    .bind(role_str)
+    .bind(&body.display_name)
+    .execute(&state.pg)
+    .await;
+
+    match result {
+        Ok(_) => Ok(ok_response(serde_json::json!({
+            "id": user_id,
+            "username": body.username,
+            "role": role_str,
+            "display_name": body.display_name,
+        }))),
+        Err(sqlx::Error::Database(db_err)) if db_err.message().contains("duplicate") || db_err.message().contains("unique") => {
+            Err(StatusApiError::BadRequest(format!(
+                "username already exists: {}",
+                body.username
+            )))
+        }
+        Err(e) => Err(StatusApiError::Database(e)),
+    }
+}
+
+#[derive(Deserialize)]
+struct ChangeRoleRequest {
+    role: String,
+}
+
+async fn handler_change_role(
+    State(state): State<Arc<AppState>>,
+    Path(user_id): Path<String>,
+    req: Request<axum::body::Body>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned().ok_or_else(|| {
+        StatusApiError::Internal("missing auth context".to_string())
+    })?;
+    require_role(&ctx, UserRole::Admin)?;
+
+    let body: ChangeRoleRequest = serde_json::from_slice(
+        &axum::body::to_bytes(req.into_body(), 1024 * 64)
+            .await
+            .map_err(|e| StatusApiError::BadRequest(format!("invalid body: {e}")))?,
+    )
+    .map_err(|e| StatusApiError::BadRequest(format!("invalid JSON: {e}")))?;
+
+    if !["viewer", "operator", "admin"].contains(&body.role.as_str()) {
+        return Err(StatusApiError::BadRequest(format!(
+            "invalid role: {}, must be viewer/operator/admin",
+            body.role
+        )));
+    }
+
+    let result = sqlx::query(
+        "UPDATE dashboard_users SET role = $1, updated_at = NOW() WHERE id = $2",
+    )
+    .bind(&body.role)
+    .bind(&user_id)
+    .execute(&state.pg)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(StatusApiError::NotFound(format!("user not found: {user_id}")));
+    }
+
+    Ok(ok_response(serde_json::json!({
+        "id": user_id,
+        "role": body.role,
+    })))
+}
+
+async fn handler_toggle_user(
+    State(state): State<Arc<AppState>>,
+    Path(user_id): Path<String>,
+    req: Request<axum::body::Body>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned().ok_or_else(|| {
+        StatusApiError::Internal("missing auth context".to_string())
+    })?;
+    require_role(&ctx, UserRole::Admin)?;
+
+    let row: Option<(bool,)> = sqlx::query_as(
+        "SELECT active FROM dashboard_users WHERE id = $1",
+    )
+    .bind(&user_id)
+    .fetch_optional(&state.pg)
+    .await?;
+
+    let (currently_active,) = row.ok_or_else(|| {
+        StatusApiError::NotFound(format!("user not found: {user_id}"))
+    })?;
+
+    let new_active = !currently_active;
+    sqlx::query("UPDATE dashboard_users SET active = $1, updated_at = NOW() WHERE id = $2")
+        .bind(new_active)
+        .bind(&user_id)
+        .execute(&state.pg)
+        .await?;
+
+    // If deactivating, also invalidate all their sessions
+    if !new_active {
+        sqlx::query("DELETE FROM dashboard_sessions WHERE user_id = $1")
+            .bind(&user_id)
+            .execute(&state.pg)
+            .await?;
+    }
+
+    Ok(ok_response(serde_json::json!({
+        "id": user_id,
+        "active": new_active,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ResetPasswordRequest {
+    password: String,
+}
+
+async fn handler_reset_password(
+    State(state): State<Arc<AppState>>,
+    Path(user_id): Path<String>,
+    req: Request<axum::body::Body>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned().ok_or_else(|| {
+        StatusApiError::Internal("missing auth context".to_string())
+    })?;
+    require_role(&ctx, UserRole::Admin)?;
+
+    let body: ResetPasswordRequest = serde_json::from_slice(
+        &axum::body::to_bytes(req.into_body(), 1024 * 64)
+            .await
+            .map_err(|e| StatusApiError::BadRequest(format!("invalid body: {e}")))?,
+    )
+    .map_err(|e| StatusApiError::BadRequest(format!("invalid JSON: {e}")))?;
+
+    if body.password.is_empty() {
+        return Err(StatusApiError::BadRequest("password is required".to_string()));
+    }
+
+    // Verify user exists
+    let exists: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM dashboard_users WHERE id = $1",
+    )
+    .bind(&user_id)
+    .fetch_optional(&state.pg)
+    .await?;
+
+    if exists.is_none() {
+        return Err(StatusApiError::NotFound(format!("user not found: {user_id}")));
+    }
+
+    let cost = state.config.dashboard_auth.bcrypt_cost;
+    let password_hash = bcrypt::hash(&body.password, cost)
+        .map_err(|e| StatusApiError::Internal(format!("bcrypt error: {e}")))?;
+
+    sqlx::query("UPDATE dashboard_users SET password_hash = $1, updated_at = NOW() WHERE id = $2")
+        .bind(&password_hash)
+        .bind(&user_id)
+        .execute(&state.pg)
+        .await?;
+
+    // Invalidate all sessions (force re-login with new password)
+    sqlx::query("DELETE FROM dashboard_sessions WHERE user_id = $1")
+        .bind(&user_id)
+        .execute(&state.pg)
+        .await?;
+
+    Ok(ok_response(serde_json::json!({
+        "id": user_id,
+        "password_reset": true,
+    })))
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -2385,5 +3369,177 @@ mod tests {
         for route in &routes {
             assert!(route.starts_with("/kg/"), "KG route should be under /kg/ prefix: {route}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.7.0: Dashboard auth tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_user_role_ordering() {
+        assert!(UserRole::Admin > UserRole::Operator);
+        assert!(UserRole::Operator > UserRole::Viewer);
+        assert!(UserRole::Viewer < UserRole::Admin);
+    }
+
+    #[test]
+    fn test_user_role_from_str_loose() {
+        assert_eq!(UserRole::from_str_loose("admin"), UserRole::Admin);
+        assert_eq!(UserRole::from_str_loose("operator"), UserRole::Operator);
+        assert_eq!(UserRole::from_str_loose("viewer"), UserRole::Viewer);
+        assert_eq!(UserRole::from_str_loose("unknown"), UserRole::Viewer);
+        assert_eq!(UserRole::from_str_loose(""), UserRole::Viewer);
+    }
+
+    #[test]
+    fn test_user_role_display() {
+        assert_eq!(UserRole::Admin.to_string(), "admin");
+        assert_eq!(UserRole::Operator.to_string(), "operator");
+        assert_eq!(UserRole::Viewer.to_string(), "viewer");
+    }
+
+    #[test]
+    fn test_require_role_admin_has_all() {
+        let ctx = AuthContext {
+            role: UserRole::Admin,
+            user_id: Some("u1".into()),
+            username: Some("admin".into()),
+        };
+        assert!(require_role(&ctx, UserRole::Viewer).is_ok());
+        assert!(require_role(&ctx, UserRole::Operator).is_ok());
+        assert!(require_role(&ctx, UserRole::Admin).is_ok());
+    }
+
+    #[test]
+    fn test_require_role_operator_restricted() {
+        let ctx = AuthContext {
+            role: UserRole::Operator,
+            user_id: Some("u2".into()),
+            username: Some("ops".into()),
+        };
+        assert!(require_role(&ctx, UserRole::Viewer).is_ok());
+        assert!(require_role(&ctx, UserRole::Operator).is_ok());
+        assert!(require_role(&ctx, UserRole::Admin).is_err());
+    }
+
+    #[test]
+    fn test_require_role_viewer_read_only() {
+        let ctx = AuthContext {
+            role: UserRole::Viewer,
+            user_id: Some("u3".into()),
+            username: Some("view".into()),
+        };
+        assert!(require_role(&ctx, UserRole::Viewer).is_ok());
+        assert!(require_role(&ctx, UserRole::Operator).is_err());
+        assert!(require_role(&ctx, UserRole::Admin).is_err());
+    }
+
+    #[test]
+    fn test_forbidden_error_returns_403() {
+        let err = StatusApiError::Forbidden("need admin".to_string());
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_user_role_serde_roundtrip() {
+        let role = UserRole::Operator;
+        let serialized = serde_json::to_string(&role).unwrap();
+        assert_eq!(serialized, "\"operator\"");
+        let deserialized: UserRole = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized, UserRole::Operator);
+    }
+
+    #[test]
+    fn test_auth_context_api_key_is_admin() {
+        // When no user_id/username, it's an API key auth → admin
+        let ctx = AuthContext {
+            role: UserRole::Admin,
+            user_id: None,
+            username: None,
+        };
+        assert!(require_role(&ctx, UserRole::Admin).is_ok());
+        assert!(ctx.user_id.is_none());
+    }
+
+    #[test]
+    fn test_login_request_deserialization() {
+        let json = r#"{"username":"admin","password":"secret123"}"#;
+        let req: LoginRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.username, "admin");
+        assert_eq!(req.password, "secret123");
+    }
+
+    #[test]
+    fn test_create_user_request_deserialization() {
+        let json = r#"{"username":"newuser","password":"pw","role":"operator","display_name":"New User"}"#;
+        let req: CreateUserRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.username, "newuser");
+        assert_eq!(req.role, Some("operator".to_string()));
+        assert_eq!(req.display_name, Some("New User".to_string()));
+    }
+
+    #[test]
+    fn test_create_user_request_defaults() {
+        let json = r#"{"username":"u","password":"p"}"#;
+        let req: CreateUserRequest = serde_json::from_str(json).unwrap();
+        assert!(req.role.is_none());
+        assert!(req.display_name.is_none());
+    }
+
+    #[test]
+    fn test_bcrypt_hash_verify_roundtrip() {
+        let password = "test-password-42";
+        let hash = bcrypt::hash(password, 4).unwrap(); // low cost for test speed
+        assert!(bcrypt::verify(password, &hash).unwrap());
+        assert!(!bcrypt::verify("wrong-password", &hash).unwrap());
+    }
+
+    #[test]
+    fn test_change_role_request_deserialization() {
+        let json = r#"{"role":"operator"}"#;
+        let req: ChangeRoleRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.role, "operator");
+    }
+
+    #[test]
+    fn test_reset_password_request_deserialization() {
+        let json = r#"{"password":"newpw123"}"#;
+        let req: ResetPasswordRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.password, "newpw123");
+    }
+
+    #[test]
+    fn test_forbidden_error_body_structure() {
+        let err = StatusApiError::Forbidden("requires admin role, you have viewer".to_string());
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_user_role_all_variants_from_str() {
+        let roles = vec![
+            ("admin", UserRole::Admin),
+            ("operator", UserRole::Operator),
+            ("viewer", UserRole::Viewer),
+            ("ADMIN", UserRole::Viewer), // case-sensitive: non-matching → viewer
+            ("root", UserRole::Viewer),
+        ];
+        for (s, expected) in roles {
+            assert_eq!(UserRole::from_str_loose(s), expected, "from_str_loose({s})");
+        }
+    }
+
+    #[test]
+    fn test_require_role_error_message() {
+        let ctx = AuthContext {
+            role: UserRole::Viewer,
+            user_id: Some("u1".into()),
+            username: Some("test".into()),
+        };
+        let err = require_role(&ctx, UserRole::Admin).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("admin"), "error should mention required role: {msg}");
+        assert!(msg.contains("viewer"), "error should mention current role: {msg}");
     }
 }

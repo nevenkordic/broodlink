@@ -1,0 +1,58 @@
+{{ define "main" }}
+<h2>Chat Sessions</h2>
+<p class="page-desc">Live conversational agent sessions across Slack, Teams, and Telegram.</p>
+
+<div class="metric-bar" aria-label="Chat metrics">
+  <div class="metric" data-tooltip="Currently active chat sessions">
+    <span class="metric-value" id="chat-active-sessions">—</span>
+    <span class="metric-label">Active Sessions</span>
+  </div>
+  <div class="metric" data-tooltip="Messages received and sent today">
+    <span class="metric-value" id="chat-messages-today">—</span>
+    <span class="metric-label">Messages Today</span>
+  </div>
+  <div class="metric" data-tooltip="Replies waiting to be delivered">
+    <span class="metric-value" id="chat-pending-replies">—</span>
+    <span class="metric-label">Pending Replies</span>
+  </div>
+  <div class="metric" data-tooltip="Connected chat platforms">
+    <span class="metric-value" id="chat-platforms">—</span>
+    <span class="metric-label">Platforms</span>
+  </div>
+</div>
+
+<div class="filter-bar">
+  <label for="chat-platform-filter">Platform:</label>
+  <select id="chat-platform-filter">
+    <option value="">All</option>
+    <option value="slack">Slack</option>
+    <option value="teams">Teams</option>
+    <option value="telegram">Telegram</option>
+  </select>
+  <label for="chat-status-filter">Status:</label>
+  <select id="chat-status-filter">
+    <option value="active">Active</option>
+    <option value="closed">Closed</option>
+  </select>
+</div>
+
+<div class="card-grid" id="chat-sessions" aria-live="polite">
+  <!-- Populated by JS -->
+</div>
+
+<div id="chat-message-modal" class="modal" style="display:none;" role="dialog" aria-modal="true" aria-label="Message history">
+  <div class="modal-content">
+    <div class="modal-header">
+      <h3 id="chat-modal-title">Messages</h3>
+      <button class="btn-close" id="chat-modal-close" aria-label="Close">&times;</button>
+    </div>
+    <div id="chat-message-list" class="chat-messages">
+      <!-- Populated by JS -->
+    </div>
+  </div>
+</div>
+{{ end }}
+
+{{ define "scripts" }}
+<script src="/js/chat.js"></script>
+{{ end }}

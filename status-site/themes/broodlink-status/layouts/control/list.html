@@ -33,6 +33,9 @@
   <button role="tab" aria-selected="false" aria-controls="panel-guardrails" id="tab-guardrails" class="tab" data-tab="guardrails">Guardrails</button>
   <button role="tab" aria-selected="false" aria-controls="panel-webhooks" id="tab-webhooks" class="tab" data-tab="webhooks">Webhooks</button>
   <button role="tab" aria-selected="false" aria-controls="panel-dlq" id="tab-dlq" class="tab" data-tab="dlq">DLQ</button>
+  <button role="tab" aria-selected="false" aria-controls="panel-chat" id="tab-chat" class="tab" data-tab="chat">Chat</button>
+  <button role="tab" aria-selected="false" aria-controls="panel-formulas" id="tab-formulas" class="tab" data-tab="formulas">Formulas</button>
+  <button role="tab" aria-selected="false" aria-controls="panel-users" id="tab-users" class="tab" data-tab="users">Users</button>
 </nav>
 
 <!-- Toast container -->
@@ -197,8 +200,79 @@
   </table>
 </section>
 
+<!-- Chat Tab -->
+<section role="tabpanel" id="panel-chat" aria-labelledby="tab-chat" hidden>
+  <div class="ctrl-section-header">
+    <h3>Chat Sessions</h3>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">Platform</th>
+        <th scope="col">User</th>
+        <th scope="col">Messages</th>
+        <th scope="col">Agent</th>
+        <th scope="col">Last Message</th>
+        <th scope="col">Status</th>
+        <th scope="col">Actions</th>
+      </tr>
+    </thead>
+    <tbody id="ctrl-chat-tbody" aria-live="polite"></tbody>
+  </table>
+</section>
+
+<!-- Formulas Tab -->
+<section role="tabpanel" id="panel-formulas" aria-labelledby="tab-formulas" hidden>
+  <div class="ctrl-section-header">
+    <h3>Formula Registry</h3>
+    <button class="btn btn-primary btn-sm" onclick="Ctrl.createFormula()">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 2a1 1 0 011 1v4h4a1 1 0 110 2H9v4a1 1 0 11-2 0V9H3a1 1 0 010-2h4V3a1 1 0 011-1z"/></svg>
+      Create Formula
+    </button>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">Name</th>
+        <th scope="col">Description</th>
+        <th scope="col">Version</th>
+        <th scope="col">Usage</th>
+        <th scope="col">System</th>
+        <th scope="col">Status</th>
+        <th scope="col">Actions</th>
+      </tr>
+    </thead>
+    <tbody id="ctrl-formulas-tbody" aria-live="polite"></tbody>
+  </table>
+</section>
+
+<!-- Users Tab (admin only) -->
+<section role="tabpanel" id="panel-users" aria-labelledby="tab-users" hidden>
+  <div class="ctrl-section-header">
+    <h3>Dashboard Users</h3>
+    <button class="btn btn-primary ctrl-write-action" onclick="Ctrl.createUser()">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+      Create User
+    </button>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">Username</th>
+        <th scope="col">Role</th>
+        <th scope="col">Status</th>
+        <th scope="col">Last Login</th>
+        <th scope="col">Created</th>
+        <th scope="col">Actions</th>
+      </tr>
+    </thead>
+    <tbody id="ctrl-users-tbody" aria-live="polite"></tbody>
+  </table>
+</section>
+
 {{ end }}
 
 {{ define "scripts" }}
+<script src="/js/auth.js"></script>
 <script src="/js/control.js"></script>
 {{ end }}

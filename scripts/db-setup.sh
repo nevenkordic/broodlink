@@ -54,7 +54,15 @@ for migration in \
   010_task_result \
   011_workflow_orchestration \
   012_memory_fulltext \
-  013_knowledge_graph; do
+  013_knowledge_graph \
+  014_budget_enforcement \
+  015_dead_letter_queue \
+  016_workflow_branching \
+  017_multi_agent_collab \
+  018_webhooks \
+  019_chat_sessions \
+  020_formula_registry \
+  021_dashboard_auth; do
   echo "  Applying ${migration}..."
   PGPASSWORD=$PGPASSWORD psql \
     -h 127.0.0.1 -U broodlink_agent \

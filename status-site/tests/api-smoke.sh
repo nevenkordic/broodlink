@@ -100,6 +100,16 @@ check_endpoint "/api/v1/kg/stats"            "KG stats"               "total_ent
 check_endpoint "/api/v1/kg/entities"         "KG entities"            "entities"
 check_endpoint "/api/v1/kg/edges"            "KG edges"               "edges"
 
+# v0.7.0 chat endpoints
+check_endpoint "/api/v1/chat/sessions"       "Chat sessions"          "sessions"
+check_endpoint "/api/v1/chat/stats"          "Chat stats"             "active_sessions"
+
+# v0.7.0 formula registry endpoints
+check_endpoint "/api/v1/formulas"            "Formula list"           "formulas"
+
+# v0.7.0 user management endpoints (API key = admin)
+check_endpoint "/api/v1/users"               "User list"              "users"
+
 echo ""
 echo "=== API Response Structure Tests ==="
 
@@ -158,6 +168,33 @@ if [ "$has_content_length" = "yes" ]; then
   pass "Memory: top_topics use content_length (not raw content)"
 else
   fail "Memory: top_topics should have content_length and NOT send raw content blob"
+fi
+
+# Chat stats must return required fields
+chat_stats_response=$(curl -sf -H "X-Broodlink-Api-Key: $API_KEY" "$API_URL/api/v1/chat/stats" 2>&1) || true
+has_chat_fields=$(echo "$chat_stats_response" | python3 -c "
+import sys, json
+d = json.load(sys.stdin).get('data', {})
+fields = ['active_sessions', 'messages_today', 'pending_replies', 'platforms']
+print('yes' if all(k in d for k in fields) else 'no')
+" 2>/dev/null)
+if [ "$has_chat_fields" = "yes" ]; then
+  pass "Chat stats: has all required fields (active_sessions, messages_today, pending_replies, platforms)"
+else
+  fail "Chat stats: missing required fields"
+fi
+
+# Chat sessions must return sessions array
+chat_sessions_response=$(curl -sf -H "X-Broodlink-Api-Key: $API_KEY" "$API_URL/api/v1/chat/sessions" 2>&1) || true
+has_sessions_key=$(echo "$chat_sessions_response" | python3 -c "
+import sys, json
+d = json.load(sys.stdin).get('data', {})
+print('yes' if 'sessions' in d and isinstance(d['sessions'], list) else 'no')
+" 2>/dev/null)
+if [ "$has_sessions_key" = "yes" ]; then
+  pass "Chat sessions: returns sessions array"
+else
+  fail "Chat sessions: missing sessions array in response"
 fi
 
 echo ""

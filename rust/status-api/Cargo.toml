@@ -28,3 +28,4 @@ async-trait = { workspace = true }
 futures = "0.3"
 tokio-stream = "0.1"
 axum-server = { workspace = true }
+bcrypt = "0.15"

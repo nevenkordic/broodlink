@@ -990,6 +990,41 @@ static TOOL_REGISTRY: std::sync::LazyLock<Vec<serde_json::Value>> =
             tool_def("merge_results", "Merge results from completed sub-tasks of a decomposed task.", serde_json::json!({
                 "parent_task_id": p_str("Parent task ID whose sub-tasks to merge"),
             }), &["parent_task_id"]),
+
+            // --- Chat Sessions (v0.7.0) ---
+            tool_def("list_chat_sessions", "List chat sessions from the conversational agent gateway.", serde_json::json!({
+                "platform": p_str("Filter by platform: slack, teams, telegram (optional)"),
+                "status": p_str("Filter by status: active, paused, closed (default active)"),
+                "limit": p_int("Max sessions to return (default 20)"),
+            }), &[]),
+            tool_def("reply_to_chat", "Send a proactive message to a chat session. Queues reply for delivery to the originating platform.", serde_json::json!({
+                "session_id": p_str("Chat session ID to reply to"),
+                "content": p_str("Message content to send"),
+            }), &["session_id", "content"]),
+
+            // --- Formula Registry (v0.7.0) ---
+            tool_def("list_formulas", "List workflow formulas from the registry.", serde_json::json!({
+                "enabled_only": p_bool("Only return enabled formulas (default true)"),
+                "tag": p_str("Filter by tag (optional)"),
+            }), &[]),
+            tool_def("get_formula", "Get a workflow formula definition from the registry.", serde_json::json!({
+                "name": p_str("Formula name (e.g. 'research', 'build-feature')"),
+            }), &["name"]),
+            tool_def("create_formula", "Create a new workflow formula in the registry.", serde_json::json!({
+                "name": p_str("Formula name slug (e.g. 'my-workflow')"),
+                "display_name": p_str("Human-readable name"),
+                "description": p_str("Description of what this formula does"),
+                "definition": p_str("Formula definition as JSON string (steps, parameters, on_failure)"),
+                "tags": p_str("Tags as JSON array string (optional)"),
+            }), &["name", "display_name", "definition"]),
+            tool_def("update_formula", "Update an existing workflow formula in the registry.", serde_json::json!({
+                "name": p_str("Formula name to update"),
+                "definition": p_str("New formula definition as JSON string (optional, triggers version bump)"),
+                "display_name": p_str("New display name (optional)"),
+                "description": p_str("New description (optional)"),
+                "enabled": p_bool("Enable/disable formula (optional)"),
+                "tags": p_str("New tags as JSON array string (optional)"),
+            }), &["name"]),
         ]
     });
 
@@ -1321,6 +1356,16 @@ async fn tool_dispatch(
         "workspace_read" => tool_workspace_read(&state, params).await,
         "workspace_write" => tool_workspace_write(&state, agent_id, params).await,
         "merge_results" => tool_merge_results(&state, params).await,
+
+        // --- Chat Sessions (v0.7.0) ---
+        "list_chat_sessions" => tool_list_chat_sessions(&state, params).await,
+        "reply_to_chat" => tool_reply_to_chat(&state, params).await,
+
+        // --- Formula Registry (v0.7.0) ---
+        "list_formulas" => tool_list_formulas(&state, params).await,
+        "get_formula" => tool_get_formula(&state, params).await,
+        "create_formula" => tool_create_formula(&state, params).await,
+        "update_formula" => tool_update_formula(&state, params).await,
 
         "ping" => Ok(serde_json::json!({ "pong": true })),
 
@@ -4280,6 +4325,8 @@ fn is_readonly_tool(tool: &str) -> bool {
             | "beads_get_convoy" | "read_messages" | "list_projects"
             | "list_skills" | "ping"
             | "graph_search" | "graph_traverse" | "graph_stats"
+            | "list_chat_sessions"
+            | "list_formulas" | "get_formula"
     )
 }
 
@@ -4908,6 +4955,483 @@ async fn tool_merge_results(
         "all_completed": all_completed,
         "child_count": results.len(),
         "children": results,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Chat session tools (v0.7.0)
+// ---------------------------------------------------------------------------
+
+async fn tool_list_chat_sessions(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let platform = params.get("platform").and_then(|v| v.as_str());
+    let status = params
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("active");
+    let limit: i64 = params
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(20);
+
+    let rows: Vec<(String, String, String, String, Option<String>, Option<String>, i32, Option<String>, String)> =
+        if let Some(plat) = platform {
+            sqlx::query_as(
+                "SELECT id, platform, channel_id, user_id, user_display_name, assigned_agent,
+                        message_count, last_message_at::text, status
+                 FROM chat_sessions
+                 WHERE platform = $1 AND status = $2
+                 ORDER BY last_message_at DESC NULLS LAST
+                 LIMIT $3",
+            )
+            .bind(plat)
+            .bind(status)
+            .bind(limit)
+            .fetch_all(&state.pg)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT id, platform, channel_id, user_id, user_display_name, assigned_agent,
+                        message_count, last_message_at::text, status
+                 FROM chat_sessions
+                 WHERE status = $1
+                 ORDER BY last_message_at DESC NULLS LAST
+                 LIMIT $2",
+            )
+            .bind(status)
+            .bind(limit)
+            .fetch_all(&state.pg)
+            .await?
+        };
+
+    let sessions: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(id, plat, ch, uid, name, agent, cnt, last, st)| {
+            serde_json::json!({
+                "id": id,
+                "platform": plat,
+                "channel_id": ch,
+                "user_id": uid,
+                "user_display_name": name,
+                "assigned_agent": agent,
+                "message_count": cnt,
+                "last_message_at": last,
+                "status": st,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "sessions": sessions,
+        "total": sessions.len(),
+    }))
+}
+
+async fn tool_reply_to_chat(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let session_id = param_str(params, "session_id")?;
+    let content = param_str(params, "content")?;
+
+    // Look up session to get platform and channel info
+    let row: Option<(String, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT platform, channel_id, thread_id, status FROM chat_sessions WHERE id = $1",
+    )
+    .bind(session_id)
+    .fetch_optional(&state.pg)
+    .await?;
+
+    let (platform, channel_id, thread_id, status) = row.ok_or_else(|| {
+        BroodlinkError::NotFound(format!("chat session not found: {session_id}"))
+    })?;
+
+    if status != "active" {
+        return Err(BroodlinkError::Validation {
+            field: "session_id".to_string(),
+            message: format!("chat session {session_id} is {status}, not active"),
+        });
+    }
+
+    // Insert into reply queue
+    sqlx::query(
+        "INSERT INTO chat_reply_queue (session_id, task_id, content, platform, channel_id, thread_id)
+         VALUES ($1, '00000000-0000-0000-0000-000000000000', $2, $3, $4, $5)",
+    )
+    .bind(session_id)
+    .bind(content)
+    .bind(&platform)
+    .bind(&channel_id)
+    .bind(&thread_id)
+    .execute(&state.pg)
+    .await?;
+
+    // Store as outbound message
+    sqlx::query(
+        "INSERT INTO chat_messages (session_id, direction, content) VALUES ($1, 'outbound', $2)",
+    )
+    .bind(session_id)
+    .bind(content)
+    .execute(&state.pg)
+    .await?;
+
+    Ok(serde_json::json!({
+        "session_id": session_id,
+        "status": "queued",
+        "platform": platform,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Formula registry tools (v0.7.0)
+// ---------------------------------------------------------------------------
+
+async fn tool_list_formulas(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let enabled_only = params
+        .get("enabled_only")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let tag = params.get("tag").and_then(|v| v.as_str());
+
+    let rows: Vec<(String, String, String, Option<String>, i32, bool, bool, i32, Option<String>, Option<String>)> =
+        if enabled_only {
+            sqlx::query_as(
+                "SELECT id, name, display_name, description, version, is_system, enabled,
+                        usage_count, last_used_at::text, created_at::text
+                 FROM formula_registry
+                 WHERE enabled = true
+                 ORDER BY name",
+            )
+            .fetch_all(&state.pg)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT id, name, display_name, description, version, is_system, enabled,
+                        usage_count, last_used_at::text, created_at::text
+                 FROM formula_registry
+                 ORDER BY name",
+            )
+            .fetch_all(&state.pg)
+            .await?
+        };
+
+    let mut formulas: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(id, name, display_name, desc, ver, system, enabled, usage, last_used, created)| {
+            serde_json::json!({
+                "id": id,
+                "name": name,
+                "display_name": display_name,
+                "description": desc,
+                "version": ver,
+                "is_system": system,
+                "enabled": enabled,
+                "usage_count": usage,
+                "last_used_at": last_used,
+                "created_at": created,
+            })
+        })
+        .collect();
+
+    // Filter by tag if provided
+    if let Some(tag_filter) = tag {
+        // Need to fetch tags for filtering
+        let tag_rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+            "SELECT name, tags FROM formula_registry",
+        )
+        .fetch_all(&state.pg)
+        .await?;
+
+        let names_with_tag: std::collections::HashSet<String> = tag_rows
+            .iter()
+            .filter(|(_, tags)| {
+                tags.as_array()
+                    .map_or(false, |arr| arr.iter().any(|t| t.as_str() == Some(tag_filter)))
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        formulas.retain(|f| {
+            f.get("name")
+                .and_then(|n| n.as_str())
+                .map_or(false, |n| names_with_tag.contains(n))
+        });
+    }
+
+    Ok(serde_json::json!({
+        "formulas": formulas,
+        "total": formulas.len(),
+    }))
+}
+
+async fn tool_get_formula(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let name = param_str(params, "name")?;
+
+    let row: Option<(String, String, String, Option<String>, i32, serde_json::Value, Option<String>, serde_json::Value, bool, bool, i32, Option<String>, Option<String>, Option<String>)> =
+        sqlx::query_as(
+            "SELECT id, name, display_name, description, version, definition, author,
+                    tags, is_system, enabled, usage_count, last_used_at::text,
+                    created_at::text, updated_at::text
+             FROM formula_registry
+             WHERE name = $1",
+        )
+        .bind(name)
+        .fetch_optional(&state.pg)
+        .await?;
+
+    let (id, nm, display, desc, ver, def, author, tags, system, enabled, usage, last_used, created, updated) =
+        row.ok_or_else(|| BroodlinkError::NotFound(format!("formula not found: {name}")))?;
+
+    Ok(serde_json::json!({
+        "id": id,
+        "name": nm,
+        "display_name": display,
+        "description": desc,
+        "version": ver,
+        "definition": def,
+        "author": author,
+        "tags": tags,
+        "is_system": system,
+        "enabled": enabled,
+        "usage_count": usage,
+        "last_used_at": last_used,
+        "created_at": created,
+        "updated_at": updated,
+    }))
+}
+
+/// Validate a formula definition JSON structure.
+fn validate_formula_definition(def: &serde_json::Value) -> Result<(), String> {
+    let steps = def
+        .get("steps")
+        .and_then(|s| s.as_array())
+        .ok_or("definition must have a 'steps' array")?;
+
+    if steps.is_empty() {
+        return Err("formula must have at least one step".to_string());
+    }
+
+    let mut step_names = Vec::new();
+    for (i, step) in steps.iter().enumerate() {
+        let name = step
+            .get("name")
+            .and_then(|n| n.as_str())
+            .ok_or(format!("step {i} missing 'name'"))?;
+        step_names.push(name.to_string());
+
+        if step.get("agent_role").and_then(|r| r.as_str()).is_none() {
+            return Err(format!("step '{name}' missing 'agent_role'"));
+        }
+        if step.get("prompt").and_then(|p| p.as_str()).is_none() {
+            return Err(format!("step '{name}' missing 'prompt'"));
+        }
+    }
+
+    // Validate parameters
+    if let Some(params) = def.get("parameters").and_then(|p| p.as_array()) {
+        for param in params {
+            let ptype = param.get("type").and_then(|t| t.as_str()).unwrap_or("string");
+            if !matches!(ptype, "string" | "integer" | "boolean") {
+                let pname = param.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                return Err(format!(
+                    "parameter '{pname}' has invalid type '{ptype}' (must be string, integer, or boolean)"
+                ));
+            }
+        }
+    }
+
+    // Validate on_failure references an existing step name
+    if let Some(on_failure) = def.get("on_failure") {
+        if !on_failure.is_null() {
+            if let Some(step_name) = on_failure.get("step_name").and_then(|s| s.as_str()) {
+                if !step_names.iter().any(|n| n == step_name) {
+                    return Err(format!(
+                        "on_failure references unknown step '{step_name}'"
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn tool_create_formula(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let name = param_str(params, "name")?;
+    let display_name = param_str(params, "display_name")?;
+    let description = param_str_opt(params, "description");
+    let definition_str = param_str(params, "definition")?;
+    let tags_str = param_str_opt(params, "tags");
+
+    // Parse and validate definition
+    let definition: serde_json::Value = serde_json::from_str(definition_str).map_err(|e| {
+        BroodlinkError::Validation {
+            field: "definition".to_string(),
+            message: format!("invalid JSON: {e}"),
+        }
+    })?;
+
+    validate_formula_definition(&definition).map_err(|msg| BroodlinkError::Validation {
+        field: "definition".to_string(),
+        message: msg,
+    })?;
+
+    // Parse tags
+    let tags: serde_json::Value = if let Some(ts) = tags_str {
+        serde_json::from_str(ts).unwrap_or(serde_json::json!([]))
+    } else {
+        serde_json::json!([])
+    };
+
+    let id = uuid::Uuid::new_v4().to_string();
+
+    sqlx::query(
+        "INSERT INTO formula_registry (id, name, display_name, description, definition, tags, author)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(&id)
+    .bind(name)
+    .bind(display_name)
+    .bind(description)
+    .bind(&definition)
+    .bind(&tags)
+    .bind("agent")
+    .execute(&state.pg)
+    .await
+    .map_err(|e| {
+        if e.to_string().contains("duplicate key") || e.to_string().contains("unique") {
+            BroodlinkError::Validation {
+                field: "name".to_string(),
+                message: format!("formula '{name}' already exists"),
+            }
+        } else {
+            BroodlinkError::Database(e)
+        }
+    })?;
+
+    Ok(serde_json::json!({
+        "id": id,
+        "name": name,
+        "status": "created",
+    }))
+}
+
+async fn tool_update_formula(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let name = param_str(params, "name")?;
+    let definition_str = param_str_opt(params, "definition");
+    let display_name = param_str_opt(params, "display_name");
+    let description = param_str_opt(params, "description");
+    let enabled = params.get("enabled").and_then(|v| v.as_bool());
+    let tags_str = param_str_opt(params, "tags");
+
+    // Verify formula exists
+    let exists: Option<(String, bool)> = sqlx::query_as(
+        "SELECT id, is_system FROM formula_registry WHERE name = $1",
+    )
+    .bind(name)
+    .fetch_optional(&state.pg)
+    .await?;
+
+    let (_id, _is_system) = exists.ok_or_else(|| {
+        BroodlinkError::NotFound(format!("formula not found: {name}"))
+    })?;
+
+    // Build dynamic update
+    let mut updates = Vec::new();
+    let mut bump_version = false;
+
+    if let Some(def_str) = definition_str {
+        let definition: serde_json::Value = serde_json::from_str(def_str).map_err(|e| {
+            BroodlinkError::Validation {
+                field: "definition".to_string(),
+                message: format!("invalid JSON: {e}"),
+            }
+        })?;
+
+        validate_formula_definition(&definition).map_err(|msg| BroodlinkError::Validation {
+            field: "definition".to_string(),
+            message: msg,
+        })?;
+
+        sqlx::query("UPDATE formula_registry SET definition = $1 WHERE name = $2")
+            .bind(&definition)
+            .bind(name)
+            .execute(&state.pg)
+            .await?;
+        updates.push("definition");
+        bump_version = true;
+    }
+
+    if let Some(dn) = display_name {
+        sqlx::query("UPDATE formula_registry SET display_name = $1 WHERE name = $2")
+            .bind(dn)
+            .bind(name)
+            .execute(&state.pg)
+            .await?;
+        updates.push("display_name");
+    }
+
+    if let Some(desc) = description {
+        sqlx::query("UPDATE formula_registry SET description = $1 WHERE name = $2")
+            .bind(desc)
+            .bind(name)
+            .execute(&state.pg)
+            .await?;
+        updates.push("description");
+    }
+
+    if let Some(en) = enabled {
+        sqlx::query("UPDATE formula_registry SET enabled = $1 WHERE name = $2")
+            .bind(en)
+            .bind(name)
+            .execute(&state.pg)
+            .await?;
+        updates.push("enabled");
+    }
+
+    if let Some(ts) = tags_str {
+        let tags: serde_json::Value = serde_json::from_str(ts).unwrap_or(serde_json::json!([]));
+        sqlx::query("UPDATE formula_registry SET tags = $1 WHERE name = $2")
+            .bind(&tags)
+            .bind(name)
+            .execute(&state.pg)
+            .await?;
+        updates.push("tags");
+    }
+
+    // Bump version if definition changed
+    if bump_version {
+        sqlx::query("UPDATE formula_registry SET version = version + 1 WHERE name = $1")
+            .bind(name)
+            .execute(&state.pg)
+            .await?;
+    }
+
+    // Always update timestamp
+    sqlx::query("UPDATE formula_registry SET updated_at = NOW() WHERE name = $1")
+        .bind(name)
+        .execute(&state.pg)
+        .await?;
+
+    Ok(serde_json::json!({
+        "name": name,
+        "status": "updated",
+        "updated_fields": updates,
+        "version_bumped": bump_version,
     }))
 }
 
@@ -6627,7 +7151,7 @@ mod tests {
     #[test]
     fn test_tool_registry_count() {
         // Must match the number of match arms in tool_dispatch (excluding the _ fallback)
-        assert_eq!(TOOL_REGISTRY.len(), 78, "tool registry should have 78 tools");
+        assert_eq!(TOOL_REGISTRY.len(), 84, "tool registry should have 84 tools");
     }
 
     #[test]
@@ -7229,5 +7753,152 @@ mod tests {
             };
             assert_eq!(expr, *expected, "direction '{direction}' next_entity_expr mismatch");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.7.0: Chat tool parameter extraction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_list_chat_sessions_param_extraction() {
+        // list_chat_sessions uses optional params: platform, status (default "active"), limit (default 20)
+        let params = json!({"platform": "slack", "status": "closed", "limit": 5});
+        assert_eq!(params.get("platform").and_then(|v| v.as_str()), Some("slack"));
+        assert_eq!(
+            params.get("status").and_then(|v| v.as_str()).unwrap_or("active"),
+            "closed"
+        );
+        assert_eq!(params.get("limit").and_then(|v| v.as_i64()).unwrap_or(20), 5);
+
+        // With no params, defaults should apply
+        let empty = json!({});
+        assert_eq!(empty.get("platform").and_then(|v| v.as_str()), None);
+        assert_eq!(
+            empty.get("status").and_then(|v| v.as_str()).unwrap_or("active"),
+            "active"
+        );
+        assert_eq!(empty.get("limit").and_then(|v| v.as_i64()).unwrap_or(20), 20);
+    }
+
+    #[test]
+    fn test_reply_to_chat_param_extraction() {
+        // reply_to_chat requires session_id and content
+        let params = json!({"session_id": "abc-123", "content": "Hello from agent"});
+        let session_id = param_str(&params, "session_id").unwrap();
+        let content = param_str(&params, "content").unwrap();
+        assert_eq!(session_id, "abc-123");
+        assert_eq!(content, "Hello from agent");
+
+        // Missing session_id should fail
+        let bad_params = json!({"content": "hello"});
+        assert!(param_str(&bad_params, "session_id").is_err(), "missing session_id should error");
+
+        // Missing content should fail
+        let bad_params = json!({"session_id": "abc-123"});
+        assert!(param_str(&bad_params, "content").is_err(), "missing content should error");
+    }
+
+    #[test]
+    fn test_chat_tool_schemas_in_registry() {
+        let names: Vec<&str> = TOOL_REGISTRY
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap_or(""))
+            .collect();
+        assert!(names.contains(&"list_chat_sessions"), "registry missing list_chat_sessions");
+        assert!(names.contains(&"reply_to_chat"), "registry missing reply_to_chat");
+    }
+
+    #[test]
+    fn test_list_chat_sessions_is_readonly() {
+        assert!(is_readonly_tool("list_chat_sessions"), "list_chat_sessions should be readonly");
+    }
+
+    #[test]
+    fn test_reply_to_chat_is_not_readonly() {
+        assert!(!is_readonly_tool("reply_to_chat"), "reply_to_chat should NOT be readonly");
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.7.0: Formula definition validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_formula_valid() {
+        let def = json!({
+            "formula": {"name": "test", "description": "test"},
+            "steps": [
+                {"name": "s1", "agent_role": "worker", "prompt": "do stuff", "output": "out"}
+            ],
+            "parameters": [
+                {"name": "topic", "type": "string", "required": true}
+            ]
+        });
+        assert!(validate_formula_definition(&def).is_ok());
+    }
+
+    #[test]
+    fn test_validate_formula_missing_step_name() {
+        let def = json!({
+            "steps": [
+                {"agent_role": "worker", "prompt": "do stuff", "output": "out"}
+            ]
+        });
+        let err = validate_formula_definition(&def).unwrap_err();
+        assert!(err.contains("missing 'name'"), "error should mention missing name: {err}");
+    }
+
+    #[test]
+    fn test_validate_formula_invalid_param_type() {
+        let def = json!({
+            "steps": [
+                {"name": "s1", "agent_role": "worker", "prompt": "do", "output": "o"}
+            ],
+            "parameters": [
+                {"name": "x", "type": "float"}
+            ]
+        });
+        let err = validate_formula_definition(&def).unwrap_err();
+        assert!(err.contains("invalid type 'float'"), "error should mention invalid type: {err}");
+    }
+
+    #[test]
+    fn test_validate_formula_bad_on_failure_ref() {
+        let def = json!({
+            "steps": [
+                {"name": "s1", "agent_role": "worker", "prompt": "do", "output": "o"}
+            ],
+            "on_failure": {
+                "step_name": "nonexistent_step"
+            }
+        });
+        let err = validate_formula_definition(&def).unwrap_err();
+        assert!(err.contains("nonexistent_step"), "error should mention bad step ref: {err}");
+    }
+
+    #[test]
+    fn test_validate_formula_empty_steps() {
+        let def = json!({"steps": []});
+        let err = validate_formula_definition(&def).unwrap_err();
+        assert!(err.contains("at least one step"), "error should mention empty steps: {err}");
+    }
+
+    #[test]
+    fn test_formula_tools_in_registry() {
+        let names: Vec<&str> = TOOL_REGISTRY
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap_or(""))
+            .collect();
+        assert!(names.contains(&"list_formulas"), "registry missing list_formulas");
+        assert!(names.contains(&"get_formula"), "registry missing get_formula");
+        assert!(names.contains(&"create_formula"), "registry missing create_formula");
+        assert!(names.contains(&"update_formula"), "registry missing update_formula");
+    }
+
+    #[test]
+    fn test_formula_readonly_tools() {
+        assert!(is_readonly_tool("list_formulas"), "list_formulas should be readonly");
+        assert!(is_readonly_tool("get_formula"), "get_formula should be readonly");
+        assert!(!is_readonly_tool("create_formula"), "create_formula should NOT be readonly");
+        assert!(!is_readonly_tool("update_formula"), "update_formula should NOT be readonly");
     }
 }

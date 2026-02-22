@@ -593,6 +593,10 @@ struct FormulaFile {
     steps: Vec<FormulaStep>,
     #[serde(default)]
     on_failure: Option<FormulaStep>,
+    /// Top-level parameters (from JSONB registry format).
+    #[allow(dead_code)]
+    #[serde(default)]
+    parameters: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -604,7 +608,8 @@ struct FormulaMetadata {
     #[allow(dead_code)]
     description: Option<String>,
     #[allow(dead_code)]
-    parameters: Option<toml::Value>,
+    #[serde(default)]
+    parameters: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -636,6 +641,50 @@ struct FormulaStep {
 enum FormulaInput {
     Single(String),
     Multiple(Vec<String>),
+}
+
+/// Load a formula from Postgres registry first, falling back to TOML files.
+async fn load_formula_from_registry(
+    pg: &sqlx::PgPool,
+    config: &Config,
+    formula_name: &str,
+) -> Result<FormulaFile, BroodlinkError> {
+    // Try Postgres first
+    let row: Option<(serde_json::Value,)> = sqlx::query_as(
+        "SELECT definition FROM formula_registry WHERE name = $1 AND enabled = true",
+    )
+    .bind(formula_name)
+    .fetch_optional(pg)
+    .await?;
+
+    if let Some((definition,)) = row {
+        // Increment usage_count and update last_used_at
+        let _ = sqlx::query(
+            "UPDATE formula_registry SET usage_count = usage_count + 1, last_used_at = NOW(), updated_at = NOW()
+             WHERE name = $1",
+        )
+        .bind(formula_name)
+        .execute(pg)
+        .await;
+
+        // Parse JSONB definition into FormulaFile
+        let formula: FormulaFile = serde_json::from_value(definition).map_err(|e| {
+            BroodlinkError::Internal(format!("failed to parse registry formula {formula_name}: {e}"))
+        })?;
+
+        if formula.steps.is_empty() {
+            return Err(BroodlinkError::Internal(format!(
+                "registry formula {formula_name} has no steps"
+            )));
+        }
+
+        info!(formula = formula_name, source = "registry", "loaded formula from Postgres registry");
+        return Ok(formula);
+    }
+
+    // Fall back to TOML file
+    info!(formula = formula_name, source = "toml", "formula not in registry, falling back to TOML");
+    load_formula(config, formula_name)
 }
 
 fn load_formula(config: &Config, formula_name: &str) -> Result<FormulaFile, BroodlinkError> {
@@ -742,7 +791,7 @@ async fn handle_workflow_start(
         "starting workflow"
     );
 
-    let formula = load_formula(&state.config, &payload.formula_name)?;
+    let formula = load_formula_from_registry(&state.pg, &state.config, &payload.formula_name).await?;
     let total_steps = formula.steps.len() as i32;
 
     // Update workflow_runs with total_steps and set status to running
@@ -2603,5 +2652,104 @@ output = "result"
             Some(FormulaInput::Multiple(v)) => assert_eq!(v, &["a", "b"]),
             other => panic!("expected Multiple input, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.7.0: JSONB definition → FormulaFile deserialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_formula_jsonb_deserialization() {
+        // This is the JSONB format stored in formula_registry.definition
+        let definition = serde_json::json!({
+            "formula": {
+                "name": "test-jsonb",
+                "description": "A test formula from JSONB",
+                "version": "2"
+            },
+            "parameters": [
+                {"name": "topic", "type": "string", "required": true}
+            ],
+            "steps": [
+                {
+                    "name": "step_1",
+                    "agent_role": "researcher",
+                    "tools": ["semantic_search"],
+                    "prompt": "Research {{topic}}",
+                    "output": "result",
+                    "when": null,
+                    "retries": 0,
+                    "timeout_seconds": null,
+                    "group": null
+                }
+            ],
+            "on_failure": null
+        });
+
+        let formula: FormulaFile = serde_json::from_value(definition).unwrap();
+        assert_eq!(formula.formula.name, "test-jsonb");
+        assert_eq!(formula.formula.description.as_deref(), Some("A test formula from JSONB"));
+        assert_eq!(formula.steps.len(), 1);
+        assert_eq!(formula.steps[0].name, "step_1");
+        assert_eq!(formula.steps[0].agent_role, "researcher");
+        assert_eq!(formula.steps[0].prompt, "Research {{topic}}");
+        assert_eq!(formula.steps[0].output, "result");
+        assert!(formula.on_failure.is_none());
+    }
+
+    #[test]
+    fn test_formula_jsonb_multi_step_deserialization() {
+        let definition = serde_json::json!({
+            "formula": {"name": "multi", "description": "Multi-step"},
+            "steps": [
+                {"name": "a", "agent_role": "worker", "prompt": "do A", "output": "ra"},
+                {"name": "b", "agent_role": "worker", "prompt": "do B", "input": "ra", "output": "rb"},
+                {"name": "c", "agent_role": "writer", "prompt": "do C", "input": ["ra", "rb"], "output": "rc"}
+            ]
+        });
+
+        let formula: FormulaFile = serde_json::from_value(definition).unwrap();
+        assert_eq!(formula.steps.len(), 3);
+        assert!(formula.steps[0].input.is_none());
+        match &formula.steps[1].input {
+            Some(FormulaInput::Single(s)) => assert_eq!(s, "ra"),
+            other => panic!("expected Single input for step b, got {other:?}"),
+        }
+        match &formula.steps[2].input {
+            Some(FormulaInput::Multiple(v)) => assert_eq!(v, &["ra", "rb"]),
+            other => panic!("expected Multiple input for step c, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_formula_toml_fallback_still_works() {
+        // Verify the TOML format is still parsed correctly (backward compat)
+        let toml_str = r#"
+[formula]
+name = "toml-test"
+version = "1.0.0"
+
+[[steps]]
+name = "s1"
+agent_role = "worker"
+prompt = "test"
+output = "out"
+"#;
+        let formula: FormulaFile = toml::from_str(toml_str).unwrap();
+        assert_eq!(formula.formula.name, "toml-test");
+        assert_eq!(formula.steps.len(), 1);
+    }
+
+    #[test]
+    fn test_formula_registry_loading_logic() {
+        // Simulate the loading priority: registry → TOML
+        // If registry returns a valid FormulaFile, that should be used
+        let registry_def = serde_json::json!({
+            "formula": {"name": "from-registry"},
+            "steps": [{"name": "s1", "agent_role": "w", "prompt": "p", "output": "o"}]
+        });
+        let formula: FormulaFile = serde_json::from_value(registry_def).unwrap();
+        assert_eq!(formula.formula.name, "from-registry");
+        assert!(!formula.steps.is_empty());
     }
 }

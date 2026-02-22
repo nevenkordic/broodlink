@@ -472,6 +472,38 @@ async fn run_cycle(state: &AppState) -> Result<(), BroodlinkError> {
     }
 
     // -----------------------------------------------------------------------
+    // 5j. Chat session expiry + reply queue cleanup (v0.7.0)
+    // -----------------------------------------------------------------------
+    if state.config.chat.enabled {
+        match chat_cleanup(&state.pg, &state.config).await {
+            Ok((sessions_closed, replies_failed)) => {
+                if sessions_closed > 0 || replies_failed > 0 {
+                    info!(sessions_closed, replies_failed, "chat cleanup completed");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "chat cleanup failed");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 5k. Dashboard session cleanup (v0.7.0)
+    // -----------------------------------------------------------------------
+    if state.config.dashboard_auth.enabled {
+        match dashboard_session_cleanup(&state.pg, &state.config).await {
+            Ok(deleted) => {
+                if deleted > 0 {
+                    info!(expired_sessions = deleted, "dashboard session cleanup completed");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "dashboard session cleanup failed");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // 6. Publish broodlink.<env>.health (NATS)
     // -----------------------------------------------------------------------
     let dolt_ok = sqlx::query("SELECT 1").execute(&state.dolt).await.is_ok();
@@ -1500,6 +1532,95 @@ async fn deliver_outbound_notifications(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// v0.7.0: Chat session cleanup
+// ---------------------------------------------------------------------------
+
+/// Close expired sessions and fail timed-out replies.
+async fn chat_cleanup(
+    pg: &PgPool,
+    config: &Config,
+) -> Result<(u64, u64), BroodlinkError> {
+    let timeout_hours = i64::from(config.chat.session_timeout_hours);
+    let reply_timeout_secs = config.chat.reply_timeout_seconds as i64;
+
+    // Close sessions where last_message_at is older than session_timeout_hours
+    let sessions_result = sqlx::query(
+        "UPDATE chat_sessions
+         SET status = 'closed', updated_at = NOW()
+         WHERE status = 'active'
+           AND last_message_at < NOW() - ($1 || ' hours')::interval",
+    )
+    .bind(timeout_hours.to_string())
+    .execute(pg)
+    .await?;
+    let sessions_closed = sessions_result.rows_affected();
+
+    // Mark pending replies older than reply_timeout_seconds as 'failed'
+    let replies_result = sqlx::query(
+        "UPDATE chat_reply_queue
+         SET status = 'failed', error_msg = 'reply timeout'
+         WHERE status = 'pending'
+           AND created_at < NOW() - ($1 || ' seconds')::interval",
+    )
+    .bind(reply_timeout_secs.to_string())
+    .execute(pg)
+    .await?;
+    let replies_failed = replies_result.rows_affected();
+
+    Ok((sessions_closed, replies_failed))
+}
+
+// ---------------------------------------------------------------------------
+// v0.7.0: Dashboard session cleanup
+// ---------------------------------------------------------------------------
+
+/// Delete expired dashboard sessions and enforce max sessions per user.
+async fn dashboard_session_cleanup(
+    pg: &PgPool,
+    config: &Config,
+) -> Result<u64, BroodlinkError> {
+    // Delete all expired sessions
+    let expired = sqlx::query("DELETE FROM dashboard_sessions WHERE expires_at < NOW()")
+        .execute(pg)
+        .await?;
+    let mut total_deleted = expired.rows_affected();
+
+    // Enforce max sessions per user
+    let max = i64::from(config.dashboard_auth.max_sessions_per_user);
+    let over_limit: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT user_id, COUNT(*) as cnt
+         FROM dashboard_sessions
+         GROUP BY user_id
+         HAVING COUNT(*) > $1",
+    )
+    .bind(max)
+    .fetch_all(pg)
+    .await?;
+
+    for (user_id, count) in &over_limit {
+        let excess = count - max;
+        if excess > 0 {
+            let result = sqlx::query(
+                "DELETE FROM dashboard_sessions
+                 WHERE id IN (
+                     SELECT id FROM dashboard_sessions
+                     WHERE user_id = $1
+                     ORDER BY created_at ASC
+                     LIMIT $2
+                 )",
+            )
+            .bind(user_id)
+            .bind(excess)
+            .execute(pg)
+            .await?;
+            total_deleted += result.rows_affected();
+        }
+    }
+
+    Ok(total_deleted)
 }
 
 /// Publish a JSON payload to NATS (best-effort, logs warning on failure).

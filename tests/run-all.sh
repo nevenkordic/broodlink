@@ -155,6 +155,26 @@ if [ -f "tests/v060-regression.sh" ]; then
     "bash tests/v060-regression.sh"
 fi
 
+# v0.7.0 chat integration tests
+if [ -f "tests/chat-integration.sh" ]; then
+  sleep 10  # let rate-limit bucket refill before chat tests
+  run_suite "Chat integration tests" \
+    "bash tests/chat-integration.sh"
+fi
+
+# v0.7.0 formula registry tests
+if [ -f "tests/formula-registry.sh" ]; then
+  sleep 10  # let rate-limit bucket refill before formula tests
+  run_suite "Formula registry tests" \
+    "bash tests/formula-registry.sh"
+fi
+
+# v0.7.0 dashboard auth tests
+if [ -f "tests/dashboard-auth.sh" ]; then
+  run_suite "Dashboard auth tests" \
+    "bash tests/dashboard-auth.sh"
+fi
+
 # v0.3.0 deployment tests
 if [ -f "tests/deployment.sh" ]; then
   run_suite "Deployment configuration tests" \

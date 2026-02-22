@@ -19,7 +19,7 @@ fail() { FAIL=$((FAIL + 1)); printf "  FAIL: %s\n" "$1"; }
 echo "=== JS Namespace Regression Tests ==="
 
 # Every JS module that references window.Broodlink must NOT reference window.BL
-for f in agents.js audit.js commits.js decisions.js memory.js dashboard.js beads.js knowledge-graph.js; do
+for f in agents.js audit.js commits.js decisions.js memory.js dashboard.js beads.js knowledge-graph.js chat.js auth.js; do
   file="$JS_DIR/$f"
   if [ ! -f "$file" ]; then
     fail "$f: file not found"
@@ -155,6 +155,44 @@ else
 fi
 
 echo ""
+echo "=== Chat Field Regression Tests ==="
+
+# chat.js must use fetchApi (not raw fetch)
+if grep -q 'fetchApi' "$JS_DIR/chat.js" 2>/dev/null; then
+  pass "chat.js: uses fetchApi"
+else
+  fail "chat.js: missing fetchApi (should use BL.fetchApi)"
+fi
+
+# chat.js must use REFRESH_INTERVAL
+if grep -q 'REFRESH_INTERVAL' "$JS_DIR/chat.js" 2>/dev/null; then
+  pass "chat.js: uses REFRESH_INTERVAL"
+else
+  fail "chat.js: missing REFRESH_INTERVAL constant reference"
+fi
+
+# chat.js must handle session status rendering
+if grep -q 'active_sessions\|message_count\|last_message_at' "$JS_DIR/chat.js" 2>/dev/null; then
+  pass "chat.js: handles session fields (active_sessions/message_count/last_message_at)"
+else
+  fail "chat.js: missing expected chat session field references"
+fi
+
+# chat.js must reference the platform filter
+if grep -q 'platform' "$JS_DIR/chat.js" 2>/dev/null; then
+  pass "chat.js: handles platform filtering"
+else
+  fail "chat.js: missing platform filter logic"
+fi
+
+# chat.js must handle message direction (inbound/outbound)
+if grep -q 'direction.*inbound\|inbound.*outbound' "$JS_DIR/chat.js" 2>/dev/null; then
+  pass "chat.js: handles message direction (inbound/outbound)"
+else
+  fail "chat.js: missing inbound/outbound message direction handling"
+fi
+
+echo ""
 echo "=== Sidebar Logo Regression ==="
 
 SIDEBAR="status-site/themes/broodlink-status/layouts/partials/sidebar.html"
@@ -176,6 +214,53 @@ if grep -q 'sidebar-logo' "$CSS" 2>/dev/null; then
 else
   fail "style.css: missing sidebar-logo CSS rules"
 fi
+
+echo ""
+echo "=== Auth JS Field Regression Tests ==="
+
+# auth.js must use sessionStorage (not localStorage)
+if grep -q 'localStorage' "$JS_DIR/auth.js" 2>/dev/null; then
+  fail "auth.js: uses localStorage (should use sessionStorage)"
+else
+  pass "auth.js: uses sessionStorage"
+fi
+
+# auth.js must export BLAuth namespace
+if grep -q 'window\.BLAuth' "$JS_DIR/auth.js" 2>/dev/null; then
+  pass "auth.js: exports BLAuth namespace"
+else
+  fail "auth.js: missing BLAuth namespace"
+fi
+
+# auth.js must send X-Broodlink-Session header
+if grep -q 'X-Broodlink-Session' "$JS_DIR/auth.js" 2>/dev/null; then
+  pass "auth.js: sends X-Broodlink-Session header"
+else
+  fail "auth.js: missing X-Broodlink-Session header"
+fi
+
+# utils.js must inject session token
+if grep -q 'broodlink_session_token' "$JS_DIR/utils.js" 2>/dev/null; then
+  pass "utils.js: injects session token in fetchApi"
+else
+  fail "utils.js: missing session token injection"
+fi
+
+# control.js must have enforceRoles function
+if grep -q 'enforceRoles' "$JS_DIR/control.js" 2>/dev/null; then
+  pass "control.js: has enforceRoles function"
+else
+  fail "control.js: missing enforceRoles"
+fi
+
+# control.js must export user management functions
+for fn in createUser changeRole toggleUser resetPassword; do
+  if grep -q "$fn" "$JS_DIR/control.js" 2>/dev/null; then
+    pass "control.js: exports $fn"
+  else
+    fail "control.js: missing $fn"
+  fi
+done
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

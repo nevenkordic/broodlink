@@ -56,13 +56,22 @@
    */
   function fetchApi(path) {
     var url = STATUS_API_URL + path;
+    var hdrs = {
+      'Accept': 'application/json',
+      'X-Broodlink-Api-Key': STATUS_API_KEY
+    };
+
+    // Inject session token if available (dashboard auth)
+    var sessionToken = typeof sessionStorage !== 'undefined'
+      ? sessionStorage.getItem('broodlink_session_token')
+      : null;
+    if (sessionToken) {
+      hdrs['X-Broodlink-Session'] = sessionToken;
+    }
 
     return fetch(url, {
       method: 'GET',
-      headers: {
-        'Accept': 'application/json',
-        'X-Broodlink-Api-Key': STATUS_API_KEY
-      },
+      headers: hdrs,
       signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined
     })
       .then(function (res) {

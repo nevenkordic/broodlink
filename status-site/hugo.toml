@@ -8,7 +8,7 @@ theme            = "broodlink-status"
   statusApiKey    = "dev-api-key"  # override in production
   refreshInterval = 10000
   company         = "Broodlink"
-  version         = "0.6.0"
+  version         = "0.7.0"
 
 [build]
   [build.environment]

@@ -1,0 +1,62 @@
+{{ define "main" }}
+<div class="login-container">
+  <div class="login-card">
+    <div class="login-header">
+      <img src="/img/broodlink-logo.svg" alt="Broodlink" class="login-logo">
+      <h2>Dashboard Login</h2>
+    </div>
+    <form id="login-form" onsubmit="return false;">
+      <div class="form-group">
+        <label for="login-username">Username</label>
+        <input type="text" id="login-username" name="username" required autocomplete="username" autofocus>
+      </div>
+      <div class="form-group">
+        <label for="login-password">Password</label>
+        <input type="password" id="login-password" name="password" required autocomplete="current-password">
+      </div>
+      <div id="login-error" class="login-error" role="alert" hidden></div>
+      <button type="submit" id="login-submit" class="btn btn-primary btn-block">Sign In</button>
+    </form>
+  </div>
+</div>
+{{ end }}
+
+{{ define "scripts" }}
+<script src="/js/auth.js"></script>
+<script>
+(function () {
+  'use strict';
+  var form = document.getElementById('login-form');
+  var errorEl = document.getElementById('login-error');
+  var submitBtn = document.getElementById('login-submit');
+
+  // If already authenticated, redirect
+  if (window.BLAuth && window.BLAuth.isAuthenticated()) {
+    window.location.href = '/';
+    return;
+  }
+
+  form.addEventListener('submit', function () {
+    var username = document.getElementById('login-username').value.trim();
+    var password = document.getElementById('login-password').value;
+
+    if (!username || !password) return;
+
+    errorEl.hidden = true;
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Signing in...';
+
+    window.BLAuth.login(username, password)
+      .then(function () {
+        window.location.href = '/';
+      })
+      .catch(function (err) {
+        errorEl.textContent = err.message || 'Login failed';
+        errorEl.hidden = false;
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Sign In';
+      });
+  });
+})();
+</script>
+{{ end }}
