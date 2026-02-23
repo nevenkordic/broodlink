@@ -256,6 +256,14 @@ async fn main() {
         });
     }
 
+    // Spawn Telegram long-polling loop (no public URL needed)
+    {
+        let st = Arc::clone(&state);
+        tokio::spawn(async move {
+            telegram_polling_loop(&st).await;
+        });
+    }
+
     // Subscribe to NATS task_completed/task_failed for chat reply routing
     if config.chat.enabled {
         if let Some(nc) = nats_client {
@@ -1802,10 +1810,14 @@ async fn webhook_telegram_handler(
         )
         .await;
 
+        // Send typing indicator + generate LLM reply
+        send_telegram_typing(&state, &chat_id_str).await;
+        let llm_reply = call_ollama_chat(&state, user_name, text).await;
+
         let reply = serde_json::json!({
             "method": "sendMessage",
             "chat_id": chat_id,
-            "text": "Got it! Working on your request...",
+            "text": llm_reply,
         });
         return (StatusCode::OK, axum::Json(reply)).into_response();
     }
@@ -1816,6 +1828,170 @@ async fn webhook_telegram_handler(
         "text": "Usage: /broodlink <command>. Try 'help'.",
     });
     (StatusCode::OK, axum::Json(reply)).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Telegram message processing (shared by webhook + polling)
+// ---------------------------------------------------------------------------
+
+/// Process a single Telegram update object.  Returns an optional reply text.
+async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -> Option<String> {
+    let message = update.get("message")?;
+    let text = message.get("text").and_then(|t| t.as_str()).unwrap_or("");
+    if text.is_empty() {
+        return None;
+    }
+
+    let user_name = message
+        .get("from")
+        .and_then(|f| f.get("first_name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("telegram-user");
+    let user_id_val = message
+        .get("from")
+        .and_then(|f| f.get("id"))
+        .and_then(|id| id.as_i64())
+        .unwrap_or(0);
+    let chat_id = message
+        .get("chat")
+        .and_then(|c| c.get("id"))
+        .and_then(|id| id.as_i64())
+        .unwrap_or(0);
+    let thread_id = message
+        .get("message_thread_id")
+        .and_then(|t| t.as_i64())
+        .map(|t| t.to_string());
+
+    info!(platform = "telegram", user = %user_name, chat_id = chat_id, text = %text, "inbound message (poll)");
+
+    // Command handling
+    if text.starts_with('/') || text.starts_with("broodlink ") {
+        if let Some((command, args)) = parse_command_text(text) {
+            log_webhook(&state.pg, None, "inbound", &format!("telegram.{command}"), update, "delivered", None).await;
+            let cmd = WebhookCommand {
+                command,
+                args,
+                user: user_name.to_string(),
+                platform: "telegram".to_string(),
+            };
+            return Some(execute_command(state, &cmd).await);
+        }
+    }
+
+    // Conversational message
+    if state.config.chat.enabled {
+        let chat_id_str = chat_id.to_string();
+        let user_id_str = user_id_val.to_string();
+        handle_chat_message(
+            state,
+            "telegram",
+            &chat_id_str,
+            &user_id_str,
+            user_name,
+            text,
+            thread_id.as_deref(),
+            None,
+        )
+        .await;
+
+        // Send typing indicator instead of a canned reply
+        send_telegram_typing(state, &chat_id_str).await;
+
+        // Generate a quick LLM reply via Ollama
+        let reply = call_ollama_chat(state, user_name, text).await;
+        return Some(reply);
+    }
+
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Telegram long-polling loop (no public URL required)
+// ---------------------------------------------------------------------------
+
+async fn telegram_polling_loop(state: &AppState) {
+    info!("Telegram polling loop started");
+    let mut offset: i64 = 0;
+
+    loop {
+        let (token_opt, _) = get_telegram_creds(state).await;
+        let token = match token_opt {
+            Some(t) if !t.is_empty() => t,
+            _ => {
+                // No token configured yet — wait and retry
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                continue;
+            }
+        };
+
+        let url = format!(
+            "https://api.telegram.org/bot{token}/getUpdates?offset={offset}&timeout=30"
+        );
+
+        let resp = match state.http_client.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "Telegram getUpdates failed");
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+
+        let body: serde_json::Value = match resp.json().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(error = %e, "failed to parse getUpdates response");
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+
+        let updates = match body.get("result").and_then(|r| r.as_array()) {
+            Some(arr) => arr,
+            None => {
+                if body.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                    warn!(body = %body, "Telegram getUpdates returned error — clearing token cache");
+                    // Token may have been revoked; clear cache so next iteration re-fetches
+                    let mut guard = state.telegram_creds.write().await;
+                    *guard = None;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                }
+                continue;
+            }
+        };
+
+        for update in updates {
+            // Advance offset past this update
+            if let Some(uid) = update.get("update_id").and_then(|v| v.as_i64()) {
+                if uid >= offset {
+                    offset = uid + 1;
+                }
+            }
+
+            if let Some(reply) = process_telegram_update(state, update).await {
+                // Send reply back
+                let chat_id = update
+                    .get("message")
+                    .and_then(|m| m.get("chat"))
+                    .and_then(|c| c.get("id"))
+                    .and_then(|id| id.as_i64())
+                    .unwrap_or(0);
+
+                if chat_id != 0 {
+                    if let Err(e) = deliver_telegram(
+                        state,
+                        &chat_id.to_string(),
+                        None,
+                        &reply,
+                    )
+                    .await
+                    {
+                        warn!(error = %e, chat_id = chat_id, "failed to send polling reply");
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2159,6 +2335,82 @@ async fn handle_task_completion_for_chat(
         is_failure = is_failure,
         "chat reply queued"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Telegram typing indicator
+// ---------------------------------------------------------------------------
+
+async fn send_telegram_typing(state: &AppState, chat_id: &str) {
+    let (token_opt, _) = get_telegram_creds(state).await;
+    let token = match token_opt {
+        Some(t) if !t.is_empty() => t,
+        _ => return,
+    };
+    let url = format!("https://api.telegram.org/bot{token}/sendChatAction");
+    let _ = state
+        .http_client
+        .post(&url)
+        .json(&serde_json::json!({"chat_id": chat_id, "action": "typing"}))
+        .send()
+        .await;
+}
+
+// ---------------------------------------------------------------------------
+// Quick Ollama chat (direct LLM call for Telegram responses)
+// ---------------------------------------------------------------------------
+
+async fn call_ollama_chat(state: &AppState, user_name: &str, message: &str) -> String {
+    let ollama_url = &state.config.ollama.url;
+    let timeout_secs = state.config.ollama.timeout_seconds;
+    let url = format!("{ollama_url}/api/generate");
+
+    let prompt = format!(
+        "You are Broodlink, a helpful AI assistant. Keep responses concise and conversational.\n\n\
+         {user_name}: {message}\n\nBroodlink:"
+    );
+
+    let payload = serde_json::json!({
+        "model": "qwen3:1.7b",
+        "prompt": prompt,
+        "stream": false,
+        "options": {
+            "temperature": 0.7,
+            "num_predict": 256,
+        }
+    });
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        state.http_client.post(&url).json(&payload).send(),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(resp)) => {
+            match resp.json::<serde_json::Value>().await {
+                Ok(body) => {
+                    body.get("response")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("I couldn't generate a response right now.")
+                        .trim()
+                        .to_string()
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to parse Ollama response");
+                    "Something went wrong generating a response.".to_string()
+                }
+            }
+        }
+        Ok(Err(e)) => {
+            warn!(error = %e, "Ollama request failed");
+            "I'm having trouble connecting to my language model right now.".to_string()
+        }
+        Err(_) => {
+            warn!("Ollama request timed out");
+            "Response took too long. Try again.".to_string()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

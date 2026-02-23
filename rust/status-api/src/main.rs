@@ -3286,11 +3286,13 @@ async fn handler_telegram_status(
 
     match row {
         Some((_token, username, webhook_url, enabled, registered_at)) => {
+            let mode = if webhook_url.is_some() { "webhook" } else { "polling" };
             Ok(ok_response(serde_json::json!({
                 "configured": true,
                 "enabled": enabled,
                 "bot_username": username,
                 "webhook_url": webhook_url,
+                "mode": mode,
                 "registered_at": registered_at,
             })))
         }
@@ -3312,10 +3314,7 @@ async fn handler_telegram_register(
     let webhook_url = body
         .get("webhook_url")
         .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if webhook_url.is_empty() {
-        return Err(StatusApiError::BadRequest("webhook_url is required".into()));
-    }
+        .filter(|s| !s.is_empty());
     let secret_token = body
         .get("secret_token")
         .and_then(|v| v.as_str())
@@ -3354,30 +3353,36 @@ async fn handler_telegram_register(
         .and_then(|id| id.as_i64())
         .map(|id| id.to_string());
 
-    // Step 2: Register webhook with Telegram
-    let mut webhook_payload = serde_json::json!({
-        "url": webhook_url,
-    });
-    if let Some(ref secret) = secret_token {
-        webhook_payload["secret_token"] = serde_json::Value::String(secret.clone());
-    }
+    // Step 2: Register webhook with Telegram (skip for polling-only mode)
+    let mode = if let Some(url) = webhook_url {
+        let mut webhook_payload = serde_json::json!({"url": url});
+        if let Some(ref secret) = secret_token {
+            webhook_payload["secret_token"] = serde_json::Value::String(secret.clone());
+        }
 
-    let hook_url = format!("https://api.telegram.org/bot{bot_token}/setWebhook");
-    let hook_resp = state
-        .http_client
-        .post(&hook_url)
-        .json(&webhook_payload)
-        .send()
-        .await
-        .map_err(|e| StatusApiError::Internal(format!("setWebhook call failed: {e}")))?;
+        let hook_url = format!("https://api.telegram.org/bot{bot_token}/setWebhook");
+        let hook_resp = state
+            .http_client
+            .post(&hook_url)
+            .json(&webhook_payload)
+            .send()
+            .await
+            .map_err(|e| StatusApiError::Internal(format!("setWebhook call failed: {e}")))?;
 
-    if !hook_resp.status().is_success() {
-        let status = hook_resp.status();
-        let text = hook_resp.text().await.unwrap_or_default();
-        return Err(StatusApiError::Internal(format!(
-            "setWebhook failed ({status}): {text}"
-        )));
-    }
+        if !hook_resp.status().is_success() {
+            let status = hook_resp.status();
+            let text = hook_resp.text().await.unwrap_or_default();
+            return Err(StatusApiError::Internal(format!(
+                "setWebhook failed ({status}): {text}"
+            )));
+        }
+        "webhook"
+    } else {
+        // Polling mode: delete any existing webhook so getUpdates works
+        let del_url = format!("https://api.telegram.org/bot{bot_token}/deleteWebhook");
+        let _ = state.http_client.post(&del_url).send().await;
+        "polling"
+    };
 
     // Step 3: Upsert into platform_credentials
     sqlx::query(
@@ -3401,12 +3406,13 @@ async fn handler_telegram_register(
     .execute(&state.pg)
     .await?;
 
-    info!(bot_username = ?bot_username, "Telegram bot registered");
+    info!(bot_username = ?bot_username, mode = mode, "Telegram bot registered");
 
     Ok(ok_response(serde_json::json!({
         "ok": true,
         "bot_username": bot_username,
         "bot_id": bot_id,
+        "mode": mode,
     })))
 }
 

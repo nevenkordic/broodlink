@@ -754,6 +754,9 @@
     var container = document.getElementById('ctrl-telegram-content');
     if (!container) return;
 
+    // Don't re-render if the registration form is already showing (preserves user input)
+    if (document.getElementById('tg-bot-token')) return;
+
     BL.fetchApi('/api/v1/telegram/status').then(function (data) {
       if (data.configured) {
         container.innerHTML =
@@ -765,8 +768,8 @@
           '<table style="width:100%;font-size:0.85rem">' +
           '<tr><td style="color:var(--muted);padding:0.25rem 1rem 0.25rem 0">Bot</td>' +
           '<td><strong>' + BL.escapeHtml(data.bot_username || '—') + '</strong></td></tr>' +
-          '<tr><td style="color:var(--muted);padding:0.25rem 1rem 0.25rem 0">Webhook</td>' +
-          '<td><code style="font-size:0.75rem">' + BL.escapeHtml(data.webhook_url || '—') + '</code></td></tr>' +
+          '<tr><td style="color:var(--muted);padding:0.25rem 1rem 0.25rem 0">Mode</td>' +
+          '<td>' + badge(data.mode === 'polling' ? 'active' : 'pending') + ' ' + BL.escapeHtml(data.mode || 'unknown') + '</td></tr>' +
           '<tr><td style="color:var(--muted);padding:0.25rem 1rem 0.25rem 0">Registered</td>' +
           '<td>' + BL.formatRelativeTime(data.registered_at) + '</td></tr>' +
           '<tr><td style="color:var(--muted);padding:0.25rem 1rem 0.25rem 0">Status</td>' +
@@ -778,18 +781,11 @@
       } else {
         container.innerHTML =
           '<div class="card" style="max-width:480px;padding:1.5rem">' +
-          '<p style="margin-bottom:1rem;color:var(--muted)">Register your Telegram bot to receive and reply to messages.</p>' +
+          '<p style="margin-bottom:1rem;color:var(--muted)">Register your Telegram bot to receive and reply to messages. ' +
+          'Uses long-polling by default (no public URL needed).</p>' +
           '<div style="display:flex;flex-direction:column;gap:0.75rem">' +
           '<label style="font-size:0.85rem;font-weight:600">Bot Token' +
-          '<input id="tg-bot-token" type="text" placeholder="123456:ABC-DEF1234ghIkl..." ' +
-          'style="width:100%;margin-top:0.25rem;padding:0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:4px;color:var(--fg);font-family:monospace;font-size:0.8rem" />' +
-          '</label>' +
-          '<label style="font-size:0.85rem;font-weight:600">Webhook URL' +
-          '<input id="tg-webhook-url" type="text" placeholder="https://example.com/webhook/telegram" ' +
-          'style="width:100%;margin-top:0.25rem;padding:0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:4px;color:var(--fg);font-size:0.85rem" />' +
-          '</label>' +
-          '<label style="font-size:0.85rem;font-weight:600">Secret Token <span style="color:var(--muted);font-weight:normal">(optional)</span>' +
-          '<input id="tg-secret-token" type="text" placeholder="random-secret-for-verification" ' +
+          '<input id="tg-bot-token" type="text" placeholder="Paste full token from @BotFather" ' +
           'style="width:100%;margin-top:0.25rem;padding:0.5rem;background:var(--bg-card);border:1px solid var(--border);border-radius:4px;color:var(--fg);font-family:monospace;font-size:0.8rem" />' +
           '</label>' +
           '</div>' +
@@ -804,17 +800,13 @@
 
   function registerBot() {
     var token = (document.getElementById('tg-bot-token') || {}).value || '';
-    var url = (document.getElementById('tg-webhook-url') || {}).value || '';
-    var secret = (document.getElementById('tg-secret-token') || {}).value || '';
 
     if (!token) { toast('Bot token is required', 'error'); return; }
-    if (!url) { toast('Webhook URL is required', 'error'); return; }
 
     var btn = document.getElementById('tg-register-btn');
     if (btn) { btn.disabled = true; btn.textContent = 'Registering...'; }
 
-    var payload = { bot_token: token, webhook_url: url };
-    if (secret) payload.secret_token = secret;
+    var payload = { bot_token: token };
 
     postApi('/api/v1/telegram/register', payload)
       .then(function (data) {
