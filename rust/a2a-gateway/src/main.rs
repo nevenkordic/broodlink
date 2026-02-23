@@ -21,6 +21,7 @@
 //! - `POST /webhook/telegram`         — receive Telegram bot updates
 //! - `GET  /health`                   — health check
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::process;
 use std::sync::Arc;
@@ -127,10 +128,17 @@ struct AppState {
     bridge_url: String,
     bridge_jwt: String,
     http_client: reqwest::Client,
+    ollama_client: reqwest::Client,
     api_key: Option<String>,
     /// Cached Telegram credentials from platform_credentials table.
     /// (bot_token, secret_token, fetched_at)
     telegram_creds: tokio::sync::RwLock<Option<(String, Option<String>, std::time::Instant)>>,
+    /// Limits concurrent Ollama chat calls (prevents queue pileup).
+    ollama_semaphore: tokio::sync::Semaphore,
+    /// TTL cache for Brave search results: query → (result, fetched_at).
+    brave_cache: tokio::sync::RwLock<HashMap<String, (String, std::time::Instant)>>,
+    /// In-flight chat dedup: "platform:chat_id:text_hash" → started_at.
+    inflight_chats: tokio::sync::RwLock<HashMap<String, std::time::Instant>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +147,28 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
+    // Load .env file if present (secrets stay out of config.toml)
+    match std::fs::read_to_string(".env") {
+        Ok(contents) => {
+            for line in contents.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((key, val)) = line.split_once('=') {
+                    let key = key.trim();
+                    let val = val.trim();
+                    // SAFETY: called before any threads are spawned
+                    unsafe { std::env::set_var(key, val); }
+                    eprintln!(".env: loaded {key}");
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!(".env: not loaded ({e})");
+        }
+    }
+
     let config = match Config::load() {
         Ok(c) => Arc::new(c),
         Err(e) => {
@@ -243,9 +273,18 @@ async fn main() {
         bridge_jwt,
         pg,
         http_client: reqwest::Client::new(),
+        ollama_client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(config.ollama.timeout_seconds))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new()),
         api_key,
         config: Arc::clone(&config),
         telegram_creds: tokio::sync::RwLock::new(None),
+        ollama_semaphore: tokio::sync::Semaphore::new(
+            config.a2a.ollama_concurrency as usize,
+        ),
+        brave_cache: tokio::sync::RwLock::new(HashMap::new()),
+        inflight_chats: tokio::sync::RwLock::new(HashMap::new()),
     });
 
     // Spawn chat reply delivery loop
@@ -1468,7 +1507,7 @@ async fn webhook_slack_handler(
         )
             .into_response()
     } else if state.config.chat.enabled && !text.is_empty() {
-        handle_chat_message(
+        let _ = handle_chat_message(
             &state,
             "slack",
             &channel_id,
@@ -1531,7 +1570,7 @@ async fn handle_slack_event(state: &AppState, body: &str) -> Response {
                     if text.starts_with("/broodlink") || text.starts_with("broodlink ") {
                         // Let the slash command handler deal with it
                     } else {
-                        handle_chat_message(
+                        let _ = handle_chat_message(
                             state,
                             "slack",
                             channel,
@@ -1635,7 +1674,7 @@ async fn webhook_teams_handler(
             .into_response()
     } else if state.config.chat.enabled && activity_type == "message" && !text.is_empty() {
         // Conversational message
-        handle_chat_message(
+        let _ = handle_chat_message(
             &state,
             "teams",
             channel_id,
@@ -1798,7 +1837,30 @@ async fn webhook_telegram_handler(
         let chat_id_str = chat_id.to_string();
         let user_id_str = user_id_val.to_string();
 
-        handle_chat_message(
+        // Dedup: skip if same message is already in-flight (before DB/bridge work)
+        let dedup_key = chat_dedup_key("telegram", &chat_id_str, text);
+        let dedup_window =
+            std::time::Duration::from_secs(state.config.a2a.dedup_window_secs);
+        {
+            let mut guard = state.inflight_chats.write().await;
+            if let Some(ts) = guard.get(&dedup_key) {
+                if ts.elapsed() < dedup_window {
+                    info!(key = %dedup_key, "duplicate message suppressed (in-flight)");
+                    let reply = serde_json::json!({
+                        "method": "sendMessage",
+                        "chat_id": chat_id,
+                        "text": "Still working on your previous message...",
+                    });
+                    return (StatusCode::OK, axum::Json(reply)).into_response();
+                }
+            }
+            guard.insert(dedup_key.clone(), std::time::Instant::now());
+            if guard.len() > 200 {
+                guard.retain(|_, ts| ts.elapsed() < dedup_window);
+            }
+        }
+
+        let session_id = handle_chat_message(
             &state,
             "telegram",
             &chat_id_str,
@@ -1810,9 +1872,53 @@ async fn webhook_telegram_handler(
         )
         .await;
 
-        // Send typing indicator + generate LLM reply
-        send_telegram_typing(&state, &chat_id_str).await;
-        let llm_reply = call_ollama_chat(&state, user_name, text).await;
+        // Fetch conversation history for context
+        let history = if let Some(ref sid) = session_id {
+            fetch_chat_history(&state, sid).await
+        } else {
+            Vec::new()
+        };
+
+        // Generate LLM reply with typing indicator refresh
+        let is_busy;
+        let llm_reply = match state.ollama_semaphore.try_acquire() {
+            Ok(_permit) => {
+                is_busy = false;
+                send_telegram_typing(&state, &chat_id_str).await;
+                tokio::select! {
+                    r = call_ollama_chat(&state, &history) => r,
+                    _ = async {
+                        loop {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
+                            send_telegram_typing(&state, &chat_id_str).await;
+                        }
+                    } => unreachable!(),
+                }
+            }
+            Err(_) => {
+                is_busy = true;
+                state.config.a2a.busy_message.clone()
+            }
+        };
+
+        // Remove from in-flight
+        {
+            let mut guard = state.inflight_chats.write().await;
+            guard.remove(&dedup_key);
+        }
+
+        // Store outbound reply (skip transient busy messages)
+        if !is_busy {
+            if let Some(ref sid) = session_id {
+                let _ = sqlx::query(
+                    "INSERT INTO chat_messages (session_id, direction, content) VALUES ($1, 'outbound', $2)",
+                )
+                .bind(sid)
+                .bind(&llm_reply)
+                .execute(&state.pg)
+                .await;
+            }
+        }
 
         let reply = serde_json::json!({
             "method": "sendMessage",
@@ -1882,7 +1988,26 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
     if state.config.chat.enabled {
         let chat_id_str = chat_id.to_string();
         let user_id_str = user_id_val.to_string();
-        handle_chat_message(
+
+        // Dedup: skip if same message is already in-flight (before DB/bridge work)
+        let dedup_key = chat_dedup_key("telegram", &chat_id_str, text);
+        let dedup_window =
+            std::time::Duration::from_secs(state.config.a2a.dedup_window_secs);
+        {
+            let mut guard = state.inflight_chats.write().await;
+            if let Some(ts) = guard.get(&dedup_key) {
+                if ts.elapsed() < dedup_window {
+                    info!(key = %dedup_key, "duplicate message suppressed (in-flight)");
+                    return Some("Still working on your previous message...".to_string());
+                }
+            }
+            guard.insert(dedup_key.clone(), std::time::Instant::now());
+            if guard.len() > 200 {
+                guard.retain(|_, ts| ts.elapsed() < dedup_window);
+            }
+        }
+
+        let session_id = handle_chat_message(
             state,
             "telegram",
             &chat_id_str,
@@ -1894,11 +2019,54 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
         )
         .await;
 
-        // Send typing indicator instead of a canned reply
-        send_telegram_typing(state, &chat_id_str).await;
+        // Fetch conversation history for context
+        let history = if let Some(ref sid) = session_id {
+            fetch_chat_history(state, sid).await
+        } else {
+            Vec::new()
+        };
 
-        // Generate a quick LLM reply via Ollama
-        let reply = call_ollama_chat(state, user_name, text).await;
+        // Generate LLM reply with typing indicator refresh
+        let is_busy;
+        let reply = match state.ollama_semaphore.try_acquire() {
+            Ok(_permit) => {
+                is_busy = false;
+                send_telegram_typing(state, &chat_id_str).await;
+                tokio::select! {
+                    r = call_ollama_chat(state, &history) => r,
+                    _ = async {
+                        loop {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
+                            send_telegram_typing(state, &chat_id_str).await;
+                        }
+                    } => unreachable!(),
+                }
+            }
+            Err(_) => {
+                is_busy = true;
+                state.config.a2a.busy_message.clone()
+            }
+        };
+
+        // Remove from in-flight
+        {
+            let mut guard = state.inflight_chats.write().await;
+            guard.remove(&dedup_key);
+        }
+
+        // Store outbound reply in chat_messages (skip transient busy messages)
+        if !is_busy {
+            if let Some(ref sid) = session_id {
+                let _ = sqlx::query(
+                    "INSERT INTO chat_messages (session_id, direction, content) VALUES ($1, 'outbound', $2)",
+                )
+                .bind(sid)
+                .bind(&reply)
+                .execute(&state.pg)
+                .await;
+            }
+        }
+
         return Some(reply);
     }
 
@@ -1911,7 +2079,22 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
 
 async fn telegram_polling_loop(state: &AppState) {
     info!("Telegram polling loop started");
-    let mut offset: i64 = 0;
+
+    // Restore offset from DB to avoid duplicate processing on restart
+    let mut offset: i64 = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT meta->>'poll_offset' FROM platform_credentials WHERE platform = 'telegram'",
+    )
+    .fetch_optional(&state.pg)
+    .await
+    .ok()
+    .flatten()
+    .flatten()
+    .and_then(|s| s.parse::<i64>().ok())
+    .unwrap_or(0);
+
+    if offset > 0 {
+        info!(offset = offset, "restored Telegram poll offset from DB");
+    }
 
     loop {
         let (token_opt, _) = get_telegram_creds(state).await;
@@ -1960,11 +2143,13 @@ async fn telegram_polling_loop(state: &AppState) {
             }
         };
 
+        let mut offset_changed = false;
         for update in updates {
             // Advance offset past this update
             if let Some(uid) = update.get("update_id").and_then(|v| v.as_i64()) {
                 if uid >= offset {
                     offset = uid + 1;
+                    offset_changed = true;
                 }
             }
 
@@ -1978,6 +2163,7 @@ async fn telegram_polling_loop(state: &AppState) {
                     .unwrap_or(0);
 
                 if chat_id != 0 {
+                    info!(chat_id = chat_id, reply_len = reply.len(), "sending Telegram reply");
                     if let Err(e) = deliver_telegram(
                         state,
                         &chat_id.to_string(),
@@ -1990,6 +2176,16 @@ async fn telegram_polling_loop(state: &AppState) {
                     }
                 }
             }
+        }
+
+        // Persist offset to DB so restarts don't re-process messages
+        if offset_changed {
+            let _ = sqlx::query(
+                "UPDATE platform_credentials SET meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object('poll_offset', $1::text), updated_at = NOW() WHERE platform = 'telegram'",
+            )
+            .bind(offset.to_string())
+            .execute(&state.pg)
+            .await;
         }
     }
 }
@@ -2033,7 +2229,7 @@ async fn handle_chat_message(
     text: &str,
     thread_id: Option<&str>,
     reply_url: Option<&str>,
-) {
+) -> Option<String> {
     let chat_cfg = &state.config.chat;
     let session_id = Uuid::new_v4().to_string();
 
@@ -2062,7 +2258,7 @@ async fn handle_chat_message(
         Some(r) => r,
         None => {
             error!(platform = platform, user_id = user_id, "failed to upsert chat session");
-            return;
+            return None;
         }
     };
 
@@ -2180,6 +2376,8 @@ async fn handle_chat_message(
             error!(error = %e, session_id = %sid, "failed to create chat task");
         }
     }
+
+    Some(sid)
 }
 
 /// Background loop: deliver pending chat replies to platforms.
@@ -2360,57 +2558,396 @@ async fn send_telegram_typing(state: &AppState, chat_id: &str) {
 // Quick Ollama chat (direct LLM call for Telegram responses)
 // ---------------------------------------------------------------------------
 
-async fn call_ollama_chat(state: &AppState, user_name: &str, message: &str) -> String {
+/// Fetch recent chat history as (role, content) pairs for Ollama context.
+async fn fetch_chat_history(state: &AppState, session_id: &str) -> Vec<(String, String)> {
+    let max_ctx = i64::from(state.config.chat.max_context_messages);
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT direction, content FROM chat_messages
+         WHERE session_id = $1
+         ORDER BY created_at DESC
+         LIMIT $2",
+    )
+    .bind(session_id)
+    .bind(max_ctx)
+    .fetch_all(&state.pg)
+    .await
+    .unwrap_or_default();
+
+    // Reverse to chronological order, map direction to Ollama roles
+    rows.into_iter()
+        .rev()
+        .map(|(dir, content)| {
+            let role = if dir == "inbound" {
+                "user".to_string()
+            } else {
+                "assistant".to_string()
+            };
+            (role, content)
+        })
+        .collect()
+}
+
+async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> String {
     let ollama_url = &state.config.ollama.url;
     let timeout_secs = state.config.ollama.timeout_seconds;
-    let url = format!("{ollama_url}/api/generate");
+    let url = format!("{ollama_url}/api/chat");
+    let chat_cfg = &state.config.chat;
+    let tool_cfg = &chat_cfg.tools;
 
-    let prompt = format!(
-        "You are Broodlink, a helpful AI assistant. Keep responses concise and conversational.\n\n\
-         {user_name}: {message}\n\nBroodlink:"
+    // Resolve Brave API key: config → env var → None
+    let brave_key = if !tool_cfg.brave_api_key.is_empty() {
+        Some(tool_cfg.brave_api_key.clone())
+    } else {
+        std::env::var("BROODLINK_BRAVE_API_KEY").ok()
+    };
+    let tools_available = tool_cfg.web_search_enabled && brave_key.is_some();
+    info!(
+        web_search_enabled = tool_cfg.web_search_enabled,
+        brave_key_present = brave_key.is_some(),
+        tools_available = tools_available,
+        "chat tool availability"
     );
 
-    let payload = serde_json::json!({
-        "model": "qwen3:1.7b",
-        "prompt": prompt,
-        "stream": false,
-        "options": {
-            "temperature": 0.7,
-            "num_predict": 256,
+    // Dynamic system prompt
+    let mut system_prompt = String::from(
+        "You are Broodlink, an AI assistant. Keep responses concise and conversational.",
+    );
+    if tools_available {
+        system_prompt.push_str(
+            " You have a web_search tool. ONLY use it for: \
+             (1) real-time data like news, weather, stock prices, sports scores, \
+             (2) events or information from the last 30 days, \
+             (3) specific URLs, product availability, or live status checks. \
+             Do NOT search for general knowledge, definitions, programming concepts, \
+             or anything you can answer from training data. \
+             When you do search, cite your sources.",
+        );
+    }
+    system_prompt.push_str(
+        " If you don't know something and can't look it up, say so honestly.",
+    );
+
+    // Build message array: system prompt + conversation history
+    // Limit context when tools are active to keep prompt size manageable for CPU inference
+    let max_history = if tools_available {
+        tool_cfg.tool_context_messages as usize
+    } else {
+        history.len()
+    };
+    let history_slice = if history.len() > max_history {
+        &history[history.len() - max_history..]
+    } else {
+        history
+    };
+
+    let mut messages = vec![serde_json::json!({
+        "role": "system",
+        "content": system_prompt,
+    })];
+    for (role, content) in history_slice {
+        messages.push(serde_json::json!({
+            "role": role,
+            "content": content,
+        }));
+    }
+
+    // Tool definitions
+    let tools_def = if tools_available {
+        Some(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web for current information, recent events, or facts you are unsure about.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["query"],
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The search query"
+                        }
+                    }
+                }
+            }
+        }]))
+    } else {
+        None
+    };
+
+    let max_rounds = tool_cfg.max_tool_rounds;
+    let model = &chat_cfg.chat_model;
+
+    for round in 0..=max_rounds {
+        // Include tools only on rounds where the model can still call them
+        let include_tools = round < max_rounds && tools_def.is_some();
+
+        let mut payload = serde_json::json!({
+            "model": model,
+            "messages": messages,
+            "stream": false,
+            "think": false,
+            "options": {
+                "temperature": 0.7,
+                "num_predict": 512,
+                "num_ctx": state.config.ollama.num_ctx,
+            }
+        });
+        if include_tools {
+            payload["tools"] = tools_def.clone().unwrap();
         }
-    });
+
+        let body: serde_json::Value = match state
+            .ollama_client
+            .post(&url)
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(resp) => match resp.json().await {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(error = %e, round = round, "failed to parse Ollama response");
+                    return "...".to_string();
+                }
+            },
+            Err(e) if e.is_timeout() => {
+                warn!(round = round, "Ollama request timed out ({}s)", timeout_secs);
+                return "...".to_string();
+            }
+            Err(e) => {
+                warn!(error = %e, round = round, "Ollama request failed");
+                return "...".to_string();
+            }
+        };
+
+        let msg = match body.get("message") {
+            Some(m) => m,
+            None => return "...".to_string(),
+        };
+
+        // Check for tool calls
+        let tool_calls = msg.get("tool_calls").and_then(|tc| tc.as_array());
+        if let Some(calls) = tool_calls {
+            if !calls.is_empty() {
+                // Append assistant message with tool_calls to conversation
+                messages.push(msg.clone());
+
+                // Execute each tool call
+                for call in calls {
+                    let fn_obj = call.get("function");
+                    let name = fn_obj
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("");
+                    let args_raw = fn_obj
+                        .and_then(|f| f.get("arguments"));
+
+                    info!(tool = name, round = round, "executing tool call");
+
+                    let tool_result = match name {
+                        "web_search" => {
+                            let query = args_raw
+                                .and_then(|a| {
+                                    // arguments can be a string or an object
+                                    if let Some(s) = a.as_str() {
+                                        serde_json::from_str::<serde_json::Value>(s).ok()
+                                    } else {
+                                        Some(a.clone())
+                                    }
+                                })
+                                .and_then(|obj| obj.get("query").and_then(|q| q.as_str()).map(|s| s.to_string()))
+                                .unwrap_or_default();
+
+                            if let Some(ref key) = brave_key {
+                                let cache_ttl = std::time::Duration::from_secs(
+                                    tool_cfg.search_cache_ttl_secs,
+                                );
+                                let cache_key = normalize_search_query(&query);
+                                // Check cache
+                                let cached = {
+                                    let guard = state.brave_cache.read().await;
+                                    guard
+                                        .get(&cache_key)
+                                        .filter(|(_, ts)| ts.elapsed() < cache_ttl)
+                                        .map(|(result, _)| result.clone())
+                                };
+                                if let Some(result) = cached {
+                                    info!(query = %query, "brave search cache hit");
+                                    result
+                                } else {
+                                    let result = execute_brave_search(
+                                        &state.http_client,
+                                        key,
+                                        &query,
+                                        tool_cfg.search_result_count,
+                                    )
+                                    .await;
+                                    // Cache successful results
+                                    if !result.starts_with("Search unavailable")
+                                        && !result.starts_with("Search failed")
+                                        && !result.starts_with("Search timed out")
+                                    {
+                                        let mut guard = state.brave_cache.write().await;
+                                        guard.insert(
+                                            cache_key,
+                                            (result.clone(), std::time::Instant::now()),
+                                        );
+                                        if guard.len() > 100 {
+                                            guard.retain(|_, (_, ts)| ts.elapsed() < cache_ttl);
+                                        }
+                                    }
+                                    result
+                                }
+                            } else {
+                                "Search unavailable: no API key configured.".to_string()
+                            }
+                        }
+                        _ => format!("Unknown tool: {name}"),
+                    };
+
+                    info!(tool = name, result_len = tool_result.len(), "tool result");
+
+                    messages.push(serde_json::json!({
+                        "role": "tool",
+                        "content": tool_result,
+                    }));
+                }
+
+                // Continue loop — Ollama will get the tool results on next iteration
+                continue;
+            }
+        }
+
+        // No tool calls — extract text response
+        let content = msg
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .trim();
+
+        let cleaned = strip_think_tags(content);
+        return if cleaned.is_empty() {
+            "...".to_string()
+        } else {
+            cleaned
+        };
+    }
+
+    // Exhausted all rounds without a text response
+    warn!("tool-calling loop exhausted max rounds");
+    "...".to_string()
+}
+
+/// Remove `<think>...</think>` blocks from model output.
+fn strip_think_tags(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("<think>") {
+        result.push_str(&rest[..start]);
+        if let Some(end) = rest[start..].find("</think>") {
+            rest = &rest[start + end + 8..];
+        } else {
+            // Unclosed <think> — drop everything after it
+            return result.trim().to_string();
+        }
+    }
+    result.push_str(rest);
+    result.trim().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Tool executors
+// ---------------------------------------------------------------------------
+
+/// Execute a Brave Web Search and return formatted results.
+async fn execute_brave_search(
+    http_client: &reqwest::Client,
+    api_key: &str,
+    query: &str,
+    count: u32,
+) -> String {
+    let url = format!(
+        "https://api.search.brave.com/res/v1/web/search?q={}&count={count}",
+        urlencoding_encode(query),
+    );
 
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        state.http_client.post(&url).json(&payload).send(),
+        std::time::Duration::from_secs(10),
+        http_client
+            .get(&url)
+            .header("X-Subscription-Token", api_key)
+            .header("Accept", "application/json")
+            .send(),
     )
     .await;
 
-    match result {
-        Ok(Ok(resp)) => {
-            match resp.json::<serde_json::Value>().await {
-                Ok(body) => {
-                    body.get("response")
-                        .and_then(|r| r.as_str())
-                        .unwrap_or("I couldn't generate a response right now.")
-                        .trim()
-                        .to_string()
-                }
-                Err(e) => {
-                    warn!(error = %e, "failed to parse Ollama response");
-                    "Something went wrong generating a response.".to_string()
-                }
+    let resp = match result {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return format!("Search unavailable: {e}"),
+        Err(_) => return "Search timed out.".to_string(),
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        return format!("Search failed (HTTP {status}).");
+    }
+
+    let body: serde_json::Value = match resp.json().await {
+        Ok(b) => b,
+        Err(e) => return format!("Failed to parse search results: {e}"),
+    };
+
+    let results = body
+        .get("web")
+        .and_then(|w| w.get("results"))
+        .and_then(|r| r.as_array());
+
+    match results {
+        Some(arr) if !arr.is_empty() => {
+            let mut out = String::new();
+            for (i, item) in arr.iter().enumerate() {
+                let title = item.get("title").and_then(|t| t.as_str()).unwrap_or("Untitled");
+                let url = item.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                let desc = item.get("description").and_then(|d| d.as_str()).unwrap_or("");
+                out.push_str(&format!("{}. {} ({}) — {}\n", i + 1, title, url, desc));
+            }
+            out
+        }
+        _ => "No results found.".to_string(),
+    }
+}
+
+/// Build a dedup key from platform, chat_id, and normalized message text.
+fn chat_dedup_key(platform: &str, chat_id: &str, text: &str) -> String {
+    format!("{platform}:{chat_id}:{}", normalize_search_query(text))
+}
+
+/// Normalize a search query for cache/dedup keys: trim, lowercase, collapse whitespace.
+fn normalize_search_query(query: &str) -> String {
+    query
+        .trim()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Minimal URL-encoding for query parameters.
+fn urlencoding_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push('+'),
+            _ => {
+                out.push('%');
+                out.push_str(&format!("{b:02X}"));
             }
         }
-        Ok(Err(e)) => {
-            warn!(error = %e, "Ollama request failed");
-            "I'm having trouble connecting to my language model right now.".to_string()
-        }
-        Err(_) => {
-            warn!("Ollama request timed out");
-            "Response took too long. Try again.".to_string()
-        }
     }
+    out
 }
 
 // ---------------------------------------------------------------------------

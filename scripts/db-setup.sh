@@ -64,7 +64,8 @@ for migration in \
   020_formula_registry \
   021_dashboard_auth \
   022_schema_hardening \
-  023_platform_credentials; do
+  023_platform_credentials \
+  024_platform_credentials_meta; do
   echo "  Applying ${migration}..."
   PGPASSWORD=$PGPASSWORD psql \
     -h 127.0.0.1 -U broodlink_agent \

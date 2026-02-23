@@ -51,7 +51,8 @@ formulas_dir = ".beads/formulas"
 [ollama]
 url             = "http://localhost:11434"
 embedding_model = "nomic-embed-text"
-timeout_seconds = 30
+timeout_seconds = 120
+num_ctx         = 4096
 
 [secrets]
 provider        = "sops"
@@ -95,10 +96,12 @@ cors_origins            = ["http://localhost:1313"]
 port = 3310
 
 [a2a]
-enabled        = true
-port           = 3313
-api_key_name   = "BROODLINK_A2A_API_KEY"
-bridge_url     = "http://localhost:3310"
+enabled              = true
+port                 = 3313
+api_key_name         = "BROODLINK_A2A_API_KEY"
+bridge_url           = "http://localhost:3310"
+ollama_concurrency   = 1
+dedup_window_secs    = 30
 # bridge_jwt_path defaults to $HOME/.broodlink/jwt-a2a-gateway.token
 
 [memory_search]
@@ -144,6 +147,7 @@ max_retries           = 3
 
 [chat]
 enabled = true
+chat_model = "qwen3:32b"
 max_context_messages = 10
 session_timeout_hours = 24
 reply_timeout_seconds = 300
@@ -151,6 +155,13 @@ reply_retry_attempts = 3
 default_agent_role = "worker"
 greeting_enabled = true
 greeting_message = "Hello! I'm a Broodlink agent. How can I help?"
+
+[chat.tools]
+web_search_enabled = true
+max_tool_rounds = 3
+search_result_count = 5
+tool_context_messages = 4
+search_cache_ttl_secs = 300
 
 [dashboard_auth]
 enabled = false

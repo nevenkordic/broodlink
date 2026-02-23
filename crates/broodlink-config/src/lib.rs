@@ -186,6 +186,12 @@ pub struct OllamaConfig {
     pub embedding_model: String,
     #[serde(default = "default_ollama_timeout")]
     pub timeout_seconds: u64,
+    #[serde(default = "default_ollama_num_ctx")]
+    pub num_ctx: u32,
+}
+
+fn default_ollama_num_ctx() -> u32 {
+    4096
 }
 
 fn default_ollama_timeout() -> u64 {
@@ -415,6 +421,12 @@ pub struct A2aConfig {
     pub bridge_jwt_path: Option<String>,
     #[serde(default)]
     pub cors_origins: Vec<String>,
+    #[serde(default = "default_a2a_ollama_concurrency")]
+    pub ollama_concurrency: u32,
+    #[serde(default = "default_a2a_busy_message")]
+    pub busy_message: String,
+    #[serde(default = "default_a2a_dedup_window_secs")]
+    pub dedup_window_secs: u64,
 }
 
 impl Default for A2aConfig {
@@ -426,6 +438,9 @@ impl Default for A2aConfig {
             bridge_url: default_a2a_bridge_url(),
             bridge_jwt_path: None,
             cors_origins: Vec::new(),
+            ollama_concurrency: default_a2a_ollama_concurrency(),
+            busy_message: default_a2a_busy_message(),
+            dedup_window_secs: default_a2a_dedup_window_secs(),
         }
     }
 }
@@ -440,6 +455,18 @@ fn default_a2a_api_key_name() -> String {
 
 fn default_a2a_bridge_url() -> String {
     "http://localhost:3310".to_string()
+}
+
+fn default_a2a_ollama_concurrency() -> u32 {
+    1
+}
+
+fn default_a2a_busy_message() -> String {
+    "I'm currently processing another request. Please try again in a moment.".to_string()
+}
+
+fn default_a2a_dedup_window_secs() -> u64 {
+    30
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -763,6 +790,8 @@ fn default_webhook_max_retries() -> u32 {
 pub struct ChatConfig {
     #[serde(default = "default_chat_enabled")]
     pub enabled: bool,
+    #[serde(default = "default_chat_model")]
+    pub chat_model: String,
     #[serde(default = "default_chat_max_context_messages")]
     pub max_context_messages: u32,
     #[serde(default = "default_chat_session_timeout_hours")]
@@ -777,12 +806,44 @@ pub struct ChatConfig {
     pub greeting_enabled: bool,
     #[serde(default = "default_chat_greeting_message")]
     pub greeting_message: String,
+    #[serde(default)]
+    pub tools: ChatToolsConfig,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct ChatToolsConfig {
+    #[serde(default)]
+    pub web_search_enabled: bool,
+    #[serde(default)]
+    pub brave_api_key: String,
+    #[serde(default = "default_chat_max_tool_rounds")]
+    pub max_tool_rounds: u32,
+    #[serde(default = "default_chat_search_result_count")]
+    pub search_result_count: u32,
+    #[serde(default = "default_chat_tool_context_messages")]
+    pub tool_context_messages: u32,
+    #[serde(default = "default_chat_search_cache_ttl")]
+    pub search_cache_ttl_secs: u64,
+}
+
+impl Default for ChatToolsConfig {
+    fn default() -> Self {
+        Self {
+            web_search_enabled: false,
+            brave_api_key: String::new(),
+            max_tool_rounds: default_chat_max_tool_rounds(),
+            search_result_count: default_chat_search_result_count(),
+            tool_context_messages: default_chat_tool_context_messages(),
+            search_cache_ttl_secs: default_chat_search_cache_ttl(),
+        }
+    }
 }
 
 impl Default for ChatConfig {
     fn default() -> Self {
         Self {
             enabled: default_chat_enabled(),
+            chat_model: default_chat_model(),
             max_context_messages: default_chat_max_context_messages(),
             session_timeout_hours: default_chat_session_timeout_hours(),
             reply_timeout_seconds: default_chat_reply_timeout_seconds(),
@@ -790,12 +851,33 @@ impl Default for ChatConfig {
             default_agent_role: default_chat_default_agent_role(),
             greeting_enabled: default_chat_greeting_enabled(),
             greeting_message: default_chat_greeting_message(),
+            tools: ChatToolsConfig::default(),
         }
     }
 }
 
 fn default_chat_enabled() -> bool {
     true
+}
+
+fn default_chat_model() -> String {
+    "qwen3:32b".to_string()
+}
+
+fn default_chat_max_tool_rounds() -> u32 {
+    3
+}
+
+fn default_chat_search_result_count() -> u32 {
+    5
+}
+
+fn default_chat_tool_context_messages() -> u32 {
+    4
+}
+
+fn default_chat_search_cache_ttl() -> u64 {
+    300
 }
 
 fn default_chat_max_context_messages() -> u32 {
