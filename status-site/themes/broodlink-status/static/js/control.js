@@ -774,8 +774,13 @@
           '<td>' + BL.formatRelativeTime(data.registered_at) + '</td></tr>' +
           '<tr><td style="color:var(--muted);padding:0.25rem 1rem 0.25rem 0">Status</td>' +
           '<td>' + badge(data.enabled ? 'active' : 'offline') + '</td></tr>' +
+          (data.auth_code ? '<tr><td style="color:var(--muted);padding:0.25rem 1rem 0.25rem 0">Access Code</td>' +
+          '<td><code style="background:var(--bg);padding:0.15rem 0.5rem;border-radius:3px;font-size:0.9rem;letter-spacing:0.05em">' +
+          BL.escapeHtml(data.auth_code) + '</code></td></tr>' : '') +
+          (data.allowed_users && data.allowed_users.length > 0 ? '<tr><td style="color:var(--muted);padding:0.25rem 1rem 0.25rem 0">Authorized</td>' +
+          '<td>' + data.allowed_users.length + ' user' + (data.allowed_users.length !== 1 ? 's' : '') + '</td></tr>' : '') +
           '</table>' +
-          '<div style="margin-top:1.25rem">' +
+          '<div style="margin-top:1.25rem;display:flex;gap:0.5rem">' +
           '<button class="btn btn-danger btn-sm" onclick="Ctrl.disconnectBot()">Disconnect Bot</button>' +
           '</div></div>';
       } else {
@@ -811,6 +816,9 @@
     postApi('/api/v1/telegram/register', payload)
       .then(function (data) {
         toast('Bot registered as ' + (data.bot_username || 'unknown'), 'success');
+        // Clear the form so loadTelegram's guard doesn't bail
+        var c = document.getElementById('ctrl-telegram-content');
+        if (c) c.innerHTML = '';
         loadTelegram();
       })
       .catch(function (err) {
@@ -820,7 +828,7 @@
   }
 
   function disconnectBot() {
-    if (!confirm('Disconnect the Telegram bot? This will remove the webhook registration.')) return;
+    if (!confirm('Disconnect the Telegram bot? This will remove the webhook, credentials, and all chat history.')) return;
     postApi('/api/v1/telegram/disconnect')
       .then(function () {
         toast('Telegram bot disconnected', 'success');

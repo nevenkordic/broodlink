@@ -3007,6 +3007,7 @@ dependencies = [
  "broodlink-telemetry",
  "chrono",
  "futures",
+ "rand",
  "reqwest",
  "serde",
  "serde_json",

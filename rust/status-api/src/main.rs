@@ -49,6 +49,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{MySqlPool, PgPool};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info, warn};
+use rand::Rng;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -3277,16 +3278,24 @@ async fn handler_reset_password(
 async fn handler_telegram_status(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let row = sqlx::query_as::<_, (String, Option<String>, Option<String>, bool, Option<String>)>(
-        "SELECT bot_token, bot_username, webhook_url, enabled, registered_at::text
+    let row = sqlx::query_as::<_, (String, Option<String>, Option<String>, bool, Option<String>, Option<serde_json::Value>)>(
+        "SELECT bot_token, bot_username, webhook_url, enabled, registered_at::text, meta
          FROM platform_credentials WHERE platform = 'telegram'",
     )
     .fetch_optional(&state.pg)
     .await?;
 
     match row {
-        Some((_token, username, webhook_url, enabled, registered_at)) => {
+        Some((_token, username, webhook_url, enabled, registered_at, meta)) => {
             let mode = if webhook_url.is_some() { "webhook" } else { "polling" };
+            let auth_code = meta.as_ref()
+                .and_then(|m| m.get("auth_code"))
+                .and_then(|v| v.as_str());
+            let allowed_users = meta.as_ref()
+                .and_then(|m| m.get("allowed_user_ids"))
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect::<Vec<_>>())
+                .unwrap_or_default();
             Ok(ok_response(serde_json::json!({
                 "configured": true,
                 "enabled": enabled,
@@ -3294,6 +3303,8 @@ async fn handler_telegram_status(
                 "webhook_url": webhook_url,
                 "mode": mode,
                 "registered_at": registered_at,
+                "auth_code": auth_code,
+                "allowed_users": allowed_users,
             })))
         }
         None => Ok(ok_response(serde_json::json!({"configured": false}))),
@@ -3384,16 +3395,30 @@ async fn handler_telegram_register(
         "polling"
     };
 
-    // Step 3: Upsert into platform_credentials
+    // Step 3: Generate access code (8-char alphanumeric from CSPRNG)
+    let auth_code: String = {
+        let mut rng = rand::thread_rng();
+        (0..8)
+            .map(|_| {
+                let idx = rng.gen_range(0..36);
+                if idx < 10 { (b'0' + idx) as char } else { (b'a' + idx - 10) as char }
+            })
+            .collect()
+    };
+
+    let meta = serde_json::json!({ "auth_code": auth_code });
+
+    // Step 4: Upsert into platform_credentials
     sqlx::query(
-        "INSERT INTO platform_credentials (platform, bot_token, secret_token, webhook_url, bot_username, bot_id, registered_at)
-         VALUES ('telegram', $1, $2, $3, $4, $5, NOW())
+        "INSERT INTO platform_credentials (platform, bot_token, secret_token, webhook_url, bot_username, bot_id, meta, registered_at)
+         VALUES ('telegram', $1, $2, $3, $4, $5, $6, NOW())
          ON CONFLICT (platform) DO UPDATE SET
            bot_token = EXCLUDED.bot_token,
            secret_token = EXCLUDED.secret_token,
            webhook_url = EXCLUDED.webhook_url,
            bot_username = EXCLUDED.bot_username,
            bot_id = EXCLUDED.bot_id,
+           meta = EXCLUDED.meta,
            enabled = true,
            registered_at = NOW(),
            updated_at = NOW()",
@@ -3403,8 +3428,15 @@ async fn handler_telegram_register(
     .bind(webhook_url)
     .bind(&bot_username)
     .bind(&bot_id)
+    .bind(&meta)
     .execute(&state.pg)
     .await?;
+
+    // Notify gateway to invalidate credential cache
+    let creds_subject = format!("{}.platform.credentials_changed", state.config.nats.subject_prefix);
+    if let Err(e) = state.nats.publish(creds_subject, "register".into()).await {
+        warn!(error = %e, "failed to publish credentials_changed event");
+    }
 
     info!(bot_username = ?bot_username, mode = mode, "Telegram bot registered");
 
@@ -3413,6 +3445,7 @@ async fn handler_telegram_register(
         "bot_username": bot_username,
         "bot_id": bot_id,
         "mode": mode,
+        "auth_code": auth_code,
     })))
 }
 
@@ -3434,15 +3467,42 @@ async fn handler_telegram_disconnect(
         }
     }
 
+    // Cascade-delete chat data (FK order: messages/replies → sessions → credentials)
+    let sessions_deleted = sqlx::query_scalar::<_, i64>(
+        "WITH tg_sessions AS (
+            SELECT id FROM chat_sessions WHERE platform = 'telegram'
+        ),
+        del_replies AS (
+            DELETE FROM chat_reply_queue WHERE session_id IN (SELECT id FROM tg_sessions)
+        ),
+        del_messages AS (
+            DELETE FROM chat_messages WHERE session_id IN (SELECT id FROM tg_sessions)
+        ),
+        del_sessions AS (
+            DELETE FROM chat_sessions WHERE id IN (SELECT id FROM tg_sessions) RETURNING 1
+        )
+        SELECT COUNT(*) FROM del_sessions",
+    )
+    .fetch_one(&state.pg)
+    .await
+    .unwrap_or(0);
+
     sqlx::query("DELETE FROM platform_credentials WHERE platform = 'telegram'")
         .execute(&state.pg)
         .await?;
 
-    info!("Telegram bot disconnected");
+    // Notify gateway to invalidate credential cache
+    let creds_subject = format!("{}.platform.credentials_changed", state.config.nats.subject_prefix);
+    if let Err(e) = state.nats.publish(creds_subject, "disconnect".into()).await {
+        warn!(error = %e, "failed to publish credentials_changed event");
+    }
+
+    info!(sessions_deleted = sessions_deleted, "Telegram bot disconnected — credentials and chat data removed");
 
     Ok(ok_response(serde_json::json!({
         "ok": true,
         "disconnected": true,
+        "sessions_deleted": sessions_deleted,
     })))
 }
 

@@ -62,7 +62,7 @@ services:
       - "11434:11434"
     volumes:
       - ollama-data:/root/.ollama
-    mem_limit: 28g
+    mem_limit: 30g
     restart: unless-stopped
 
   # ── Observability (optional) ───────────────────────────────────

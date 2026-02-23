@@ -82,7 +82,7 @@ After startup, you'll have:
 5. **Multi-agent collaboration** -- `decompose_task` splits work into sub-tasks with merge strategies (concatenate, vote, best) -- `create_workspace` + `workspace_read`/`workspace_write` for shared context -- coordinator tracks child completions and auto-merges results
 6. **Budget enforcement** -- `check_budget` middleware deducts tokens per tool call -- `set_budget`/`get_budget` tools for management -- daily replenishment via heartbeat -- `BudgetExhausted` error (402) blocks calls when depleted
 7. **Webhook gateway** -- a2a-gateway receives Slack slash commands, Teams bot messages, Telegram updates -- parses `/broodlink <command>` into tool calls -- outbound notifications for agent.offline, task.failed, budget.low, workflow events, guardrail violations
-8. **Conversational gateway** (v0.7.0) -- a2a-gateway receives Slack/Teams/Telegram messages → creates chat sessions → routes to coordinator for task creation → delivers replies via platform-specific APIs -- `list_chat_sessions`/`reply_to_chat` tools for agent interaction -- direct Ollama LLM chat with tool calling (Brave Search for real-time queries: weather, news, scores) -- efficiency safeguards: Ollama concurrency semaphore (configurable, default 1), Brave search result cache (5-min TTL), duplicate message suppression (30s dedup window checked before any DB/bridge work), periodic typing indicator refresh (every 4s via `tokio::select!`) -- busy/dedup replies excluded from conversation history to prevent context pollution
+8. **Conversational gateway** (v0.7.0) -- a2a-gateway receives Slack/Teams/Telegram messages → creates chat sessions → routes to coordinator for task creation → delivers replies via platform-specific APIs -- `list_chat_sessions`/`reply_to_chat` tools for agent interaction -- direct Ollama LLM chat with tool calling (Brave Search for real-time queries: weather, news, scores) -- efficiency safeguards: Ollama concurrency semaphore (configurable, default 1), Brave search result cache (5-min TTL), duplicate message suppression (30s dedup window checked before any DB/bridge work), periodic typing indicator refresh (every 4s via `tokio::select!`) -- busy/dedup replies excluded from conversation history to prevent context pollution -- Telegram access code authentication: random 8-char code generated on bot registration, new users must send the code to be added to the allow list -- cascade delete on bot disconnect removes all related chat data -- NATS-based credential cache invalidation: status-api publishes `credentials_changed` on register/disconnect, a2a-gateway subscribes and immediately invalidates its credential cache (no stale window)
 9. **Formula registry** (v0.7.0) -- coordinator loads formula definitions from Postgres `formula_registry` table (TOML fallback) -- `list_formulas`/`get_formula`/`create_formula`/`update_formula` tools for CRUD -- seed script populates system formulas from `.beads/formulas/`
 10. **Dashboard auth** (v0.7.0) -- session-based RBAC (viewer/operator/admin) -- bcrypt passwords, session tokens in Postgres -- API key fallback when auth disabled -- role enforcement in JS control panel
 11. **Heartbeat cycle** (every 5 min) -- Dolt commit, Beads issue sync, agent metrics computation, daily summary generation, stale agent deactivation, memory search index sync (Dolt → Postgres), knowledge graph backfill, KG entity/edge expiry with weight decay, daily budget replenishment, chat session expiry, dashboard session cleanup
@@ -165,7 +165,7 @@ The E2E suite covers: service health, JWT/API key auth, all tool categories, sta
 | `scripts/start-services.sh` | Start/stop all 7 Rust services + Hugo (`--stop` to stop) |
 | `scripts/build.sh` | cargo deny + tests + release build + Hugo |
 | `scripts/secrets-init.sh` | Generate JWT keypair, create `.secrets/env`, scaffold `secrets.skeleton.json` |
-| `scripts/db-setup.sh` | Create databases, run all 24 migrations, create Qdrant collections |
+| `scripts/db-setup.sh` | Create databases, run all 26 migrations, create Qdrant collections |
 | `scripts/rotate-jwt-keys.sh` | Generate new JWT keypair with kid fingerprint, retire old keys after grace period |
 | `scripts/backfill-search-index.sh` | One-time backfill of Postgres memory_search_index from Dolt agent_memory |
 | `scripts/backfill-knowledge-graph.sh` | One-time backfill of knowledge graph entities from existing memories |
@@ -197,7 +197,7 @@ broodlink/
 ├── agents/                       # Python agent SDK (any OpenAI-compatible LLM)
 ├── status-site/                  # Hugo dashboard (WCAG 2.1 AA)
 │   └── themes/broodlink-status/
-├── migrations/                   # SQL migrations (24 files, additive only)
+├── migrations/                   # SQL migrations (26 files, additive only)
 │   ├── 001_dolt_brain.sql
 │   ├── 002_postgres_hotpaths.sql
 │   ├── 003_postgres_functions.sql

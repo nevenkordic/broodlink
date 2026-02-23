@@ -131,8 +131,8 @@ struct AppState {
     ollama_client: reqwest::Client,
     api_key: Option<String>,
     /// Cached Telegram credentials from platform_credentials table.
-    /// (bot_token, secret_token, fetched_at)
-    telegram_creds: tokio::sync::RwLock<Option<(String, Option<String>, std::time::Instant)>>,
+    /// (bot_token, secret_token, allowed_user_ids, auth_code, fetched_at)
+    telegram_creds: tokio::sync::RwLock<Option<(String, Option<String>, Vec<i64>, Option<String>, std::time::Instant)>>,
     /// Limits concurrent Ollama chat calls (prevents queue pileup).
     ollama_semaphore: tokio::sync::Semaphore,
     /// TTL cache for Brave search results: query → (result, fetched_at).
@@ -272,7 +272,10 @@ async fn main() {
         bridge_url: config.a2a.bridge_url.clone(),
         bridge_jwt,
         pg,
-        http_client: reqwest::Client::new(),
+        http_client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new()),
         ollama_client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(config.ollama.timeout_seconds))
             .build()
@@ -308,6 +311,26 @@ async fn main() {
         if let Some(nc) = nats_client {
             let prefix = config.nats.subject_prefix.clone();
             let st = Arc::clone(&state);
+
+            // credential changes (invalidate cache immediately on register/disconnect)
+            let nc_creds = nc.clone();
+            let st_creds = Arc::clone(&state);
+            let subj_creds = format!("{prefix}.platform.credentials_changed");
+            tokio::spawn(async move {
+                match nc_creds.subscribe(subj_creds.clone()).await {
+                    Ok(mut sub) => {
+                        info!(subject = %subj_creds, "subscribed for credential changes");
+                        while let Some(_msg) = sub.next().await {
+                            info!("credential change notification received — invalidating cache");
+                            let mut guard = st_creds.telegram_creds.write().await;
+                            *guard = None;
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "failed to subscribe to credentials_changed");
+                    }
+                }
+            });
 
             // task_completed
             let nc2 = nc.clone(); // clone for the second subscription
@@ -1707,34 +1730,45 @@ async fn webhook_teams_handler(
 // Telegram credential lookup (DB with cache, config fallback)
 // ---------------------------------------------------------------------------
 
-/// Returns (bot_token, secret_token) from DB cache, falling back to config.
-async fn get_telegram_creds(state: &AppState) -> (Option<String>, Option<String>) {
+/// Returns (bot_token, secret_token, allowed_user_ids, auth_code) from DB cache, falling back to config.
+async fn get_telegram_creds(state: &AppState) -> (Option<String>, Option<String>, Vec<i64>, Option<String>) {
     // Check cache (60s TTL)
     {
         let guard = state.telegram_creds.read().await;
-        if let Some((token, secret, fetched)) = guard.as_ref() {
+        if let Some((token, secret, allowed, auth_code, fetched)) = guard.as_ref() {
             if fetched.elapsed() < std::time::Duration::from_secs(60) {
-                return (Some(token.clone()), secret.clone());
+                return (Some(token.clone()), secret.clone(), allowed.clone(), auth_code.clone());
             }
         }
     }
 
-    // Query DB
-    let row = sqlx::query_as::<_, (String, Option<String>)>(
-        "SELECT bot_token, secret_token FROM platform_credentials WHERE platform = 'telegram' AND enabled = true",
+    // Query DB (include meta for allowed_user_ids + auth_code)
+    let row = sqlx::query_as::<_, (String, Option<String>, Option<serde_json::Value>)>(
+        "SELECT bot_token, secret_token, meta FROM platform_credentials WHERE platform = 'telegram' AND enabled = true",
     )
     .fetch_optional(&state.pg)
     .await
     .ok()
     .flatten();
 
-    if let Some((token, secret)) = row {
+    if let Some((token, secret, meta)) = row {
+        let allowed: Vec<i64> = meta
+            .as_ref()
+            .and_then(|m| m.get("allowed_user_ids"))
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+            .unwrap_or_default();
+        let auth_code = meta
+            .as_ref()
+            .and_then(|m| m.get("auth_code"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let mut guard = state.telegram_creds.write().await;
-        *guard = Some((token.clone(), secret.clone(), std::time::Instant::now()));
-        return (Some(token), secret);
+        *guard = Some((token.clone(), secret.clone(), allowed.clone(), auth_code.clone(), std::time::Instant::now()));
+        return (Some(token), secret, allowed, auth_code);
     }
 
-    // Fallback to config
+    // Fallback to config (no allowed list — open access)
     let token = state.config.webhooks.telegram_bot_token.clone();
     let secret = state.config.webhooks.telegram_secret_token.clone();
     if token.is_some() {
@@ -1742,10 +1776,12 @@ async fn get_telegram_creds(state: &AppState) -> (Option<String>, Option<String>
         *guard = Some((
             token.clone().unwrap_or_default(),
             secret.clone(),
+            Vec::new(),
+            None,
             std::time::Instant::now(),
         ));
     }
-    (token, secret)
+    (token, secret, Vec::new(), None)
 }
 
 // ---------------------------------------------------------------------------
@@ -1762,7 +1798,7 @@ async fn webhook_telegram_handler(
     }
 
     // Verify Telegram secret token if configured (DB-first, config fallback)
-    let (_tg_token, tg_secret) = get_telegram_creds(&state).await;
+    let (_tg_token, tg_secret, tg_allowed_users, tg_auth_code) = get_telegram_creds(&state).await;
     if let Some(ref secret) = tg_secret {
         let provided = headers
             .get("X-Telegram-Bot-Api-Secret-Token")
@@ -1805,6 +1841,38 @@ async fn webhook_telegram_handler(
         .get("message_thread_id")
         .and_then(|t| t.as_i64())
         .map(|t| t.to_string());
+
+    // Auth gate: check access code or allow list
+    if !tg_allowed_users.contains(&user_id_val) {
+        if let Some(ref code) = tg_auth_code {
+            if text.trim().eq_ignore_ascii_case(code) {
+                // Correct code — add user to allowed list in DB and invalidate cache
+                info!(platform = "telegram", user = %user_name, user_id = user_id_val, "auth code accepted");
+                if let Err(e) = add_telegram_allowed_user(&state, user_id_val).await {
+                    warn!(error = %e, "failed to persist allowed user");
+                }
+                let reply = serde_json::json!({
+                    "method": "sendMessage",
+                    "chat_id": chat_id,
+                    "text": format!("Authenticated! Welcome, {user_name}."),
+                });
+                return (StatusCode::OK, axum::Json(reply)).into_response();
+            }
+            // Wrong code or regular message — don't log text (could be auth attempt)
+            warn!(platform = "telegram", user_id = user_id_val, user = %user_name, "telegram user not authenticated");
+            let reply = serde_json::json!({
+                "method": "sendMessage",
+                "chat_id": chat_id,
+                "text": "Send the access code to use this bot.",
+            });
+            return (StatusCode::OK, axum::Json(reply)).into_response();
+        }
+        // No auth_code configured but allow list exists and user not in it — silent reject
+        if !tg_allowed_users.is_empty() {
+            warn!(user_id = user_id_val, user = %user_name, "telegram user not in allowed list — ignored");
+            return (StatusCode::OK, axum::Json(serde_json::json!({"ok": true}))).into_response();
+        }
+    }
 
     info!(platform = "telegram", user = %user_name, chat_id = chat_id, text = %text, "inbound webhook");
 
@@ -2097,7 +2165,7 @@ async fn telegram_polling_loop(state: &AppState) {
     }
 
     loop {
-        let (token_opt, _) = get_telegram_creds(state).await;
+        let (token_opt, _, _, _) = get_telegram_creds(state).await;
         let token = match token_opt {
             Some(t) if !t.is_empty() => t,
             _ => {
@@ -2111,9 +2179,19 @@ async fn telegram_polling_loop(state: &AppState) {
             "https://api.telegram.org/bot{token}/getUpdates?offset={offset}&timeout=30"
         );
 
-        let resp = match state.http_client.get(&url).send().await {
+        let resp = match state
+            .http_client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(45)) // 30s server poll + 15s headroom
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
+                if e.is_timeout() {
+                    // Normal — server-side long poll may not respond in time
+                    continue;
+                }
                 warn!(error = %e, "Telegram getUpdates failed");
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 continue;
@@ -2143,6 +2221,9 @@ async fn telegram_polling_loop(state: &AppState) {
             }
         };
 
+        // Re-fetch credentials before processing (may have changed during 30s poll)
+        let (_, _, allowed_users, auth_code) = get_telegram_creds(state).await;
+
         let mut offset_changed = false;
         for update in updates {
             // Advance offset past this update
@@ -2150,6 +2231,59 @@ async fn telegram_polling_loop(state: &AppState) {
                 if uid >= offset {
                     offset = uid + 1;
                     offset_changed = true;
+                }
+            }
+
+            // Auth gate: check access code or allow list
+            let sender_id = update
+                .get("message")
+                .and_then(|m| m.get("from"))
+                .and_then(|f| f.get("id"))
+                .and_then(|id| id.as_i64())
+                .unwrap_or(0);
+            let msg_text = update
+                .get("message")
+                .and_then(|m| m.get("text"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            let msg_chat_id = update
+                .get("message")
+                .and_then(|m| m.get("chat"))
+                .and_then(|c| c.get("id"))
+                .and_then(|id| id.as_i64())
+                .unwrap_or(0);
+
+            if !allowed_users.contains(&sender_id) {
+                if let Some(ref code) = auth_code {
+                    if msg_text.trim().eq_ignore_ascii_case(code) {
+                        // Correct code — add user to allowed list
+                        info!(platform = "telegram", user_id = sender_id, "auth code accepted");
+                        if let Err(e) = add_telegram_allowed_user(state, sender_id).await {
+                            warn!(error = %e, "failed to persist allowed user");
+                        }
+                        let sender_name = update.get("message")
+                            .and_then(|m| m.get("from"))
+                            .and_then(|f| f.get("first_name"))
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("there");
+                        if msg_chat_id != 0 {
+                            let _ = deliver_telegram(state, &msg_chat_id.to_string(), None,
+                                &format!("Authenticated! Welcome, {sender_name}.")).await;
+                        }
+                        continue;
+                    }
+                    // Wrong code — prompt
+                    warn!(user_id = sender_id, "telegram user not authenticated");
+                    if msg_chat_id != 0 {
+                        let _ = deliver_telegram(state, &msg_chat_id.to_string(), None,
+                            "Send the access code to use this bot.").await;
+                    }
+                    continue;
+                }
+                // No auth_code but allow list exists — silent reject
+                if !allowed_users.is_empty() {
+                    warn!(user_id = sender_id, "telegram user not in allowed list — ignored");
+                    continue;
                 }
             }
 
@@ -2540,7 +2674,7 @@ async fn handle_task_completion_for_chat(
 // ---------------------------------------------------------------------------
 
 async fn send_telegram_typing(state: &AppState, chat_id: &str) {
-    let (token_opt, _) = get_telegram_creds(state).await;
+    let (token_opt, _, _, _) = get_telegram_creds(state).await;
     let token = match token_opt {
         Some(t) if !t.is_empty() => t,
         _ => return,
@@ -2707,22 +2841,31 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
                 Ok(b) => b,
                 Err(e) => {
                     warn!(error = %e, round = round, "failed to parse Ollama response");
-                    return "...".to_string();
+                    return "Something went wrong. Please try again.".to_string();
                 }
             },
             Err(e) if e.is_timeout() => {
                 warn!(round = round, "Ollama request timed out ({}s)", timeout_secs);
-                return "...".to_string();
+                return "Response timed out. Please try a shorter question.".to_string();
             }
             Err(e) => {
                 warn!(error = %e, round = round, "Ollama request failed");
-                return "...".to_string();
+                return "I'm temporarily unavailable. Please try again in a moment.".to_string();
             }
         };
 
+        // Check for Ollama-level errors (OOM, model not found, etc.)
+        if let Some(err) = body.get("error").and_then(|e| e.as_str()) {
+            warn!(error = %err, round = round, "Ollama returned error");
+            return "I'm temporarily unable to process your message. Please try again in a moment.".to_string();
+        }
+
         let msg = match body.get("message") {
             Some(m) => m,
-            None => return "...".to_string(),
+            None => {
+                warn!(round = round, body = %body, "Ollama response missing 'message' field");
+                return "Something went wrong. Please try again.".to_string();
+            }
         };
 
         // Check for tool calls
@@ -2827,7 +2970,7 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
 
         let cleaned = strip_think_tags(content);
         return if cleaned.is_empty() {
-            "...".to_string()
+            "I wasn't able to generate a response. Please try again.".to_string()
         } else {
             cleaned
         };
@@ -2835,7 +2978,7 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
 
     // Exhausted all rounds without a text response
     warn!("tool-calling loop exhausted max rounds");
-    "...".to_string()
+    "I wasn't able to generate a response. Please try again.".to_string()
 }
 
 /// Remove `<think>...</think>` blocks from model output.
@@ -2915,6 +3058,31 @@ async fn execute_brave_search(
         }
         _ => "No results found.".to_string(),
     }
+}
+
+/// Add a Telegram user ID to the allowed_user_ids in platform_credentials.meta and invalidate cache.
+async fn add_telegram_allowed_user(state: &AppState, user_id: i64) -> Result<(), String> {
+    sqlx::query(
+        "UPDATE platform_credentials
+         SET meta = jsonb_set(
+             COALESCE(meta, '{}'::jsonb),
+             '{allowed_user_ids}',
+             (COALESCE(meta->'allowed_user_ids', '[]'::jsonb) || to_jsonb($1::bigint))
+         ),
+         updated_at = NOW()
+         WHERE platform = 'telegram'",
+    )
+    .bind(user_id)
+    .execute(&state.pg)
+    .await
+    .map_err(|e| format!("DB error adding allowed user: {e}"))?;
+
+    // Invalidate credential cache so next call picks up new allow list
+    let mut guard = state.telegram_creds.write().await;
+    *guard = None;
+
+    info!(user_id = user_id, "telegram user authenticated and added to allowed list");
+    Ok(())
 }
 
 /// Build a dedup key from platform, chat_id, and normalized message text.
@@ -3042,7 +3210,7 @@ async fn deliver_telegram(
     thread_id: Option<&str>,
     text: &str,
 ) -> Result<(), String> {
-    let (tg_token, _) = get_telegram_creds(state).await;
+    let (tg_token, _, _, _) = get_telegram_creds(state).await;
     let token = tg_token.unwrap_or_default();
     if token.is_empty() {
         return Err("no telegram_bot_token configured".to_string());

@@ -29,9 +29,27 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 - **Platform Credentials**: `platform_credentials` table (migration 024) for
   storing Telegram bot tokens and other platform secrets with JSONB metadata.
   Telegram poll offset persisted across restarts via `meta->>'poll_offset'`.
+  status-api publishes `{prefix}.platform.credentials_changed` via NATS on
+  bot registration and disconnection; a2a-gateway subscribes and immediately
+  invalidates its `telegram_creds` cache (eliminates 60s stale cache window).
+- **Telegram Access Code Authentication**: Random 8-char alphanumeric access
+  code generated on bot registration (true RNG via `rand` crate) and stored in
+  `platform_credentials.meta->>'auth_code'`. New users must send the code to
+  authenticate; verified user IDs added to `allowed_user_ids` in JSONB meta.
+  a2a-gateway enforces the allow list at both webhook and polling entry points.
+- **Cascade Delete on Bot Disconnect**: `handler_telegram_disconnect` now
+  cascade-deletes all related data (`chat_reply_queue`, `chat_messages`,
+  `chat_sessions`, `platform_credentials`) in a single CTE query.
 - **Telegram Long-Polling**: `getUpdates`-based polling loop with configurable
   offset persistence, automatic token cache invalidation on errors, and typing
-  indicators.
+  indicators. Credentials re-fetched after `getUpdates` returns (not before),
+  so `allowed_users` is always current when processing updates.
+- **Auth Code Security Hardening**: Message text from unauthenticated users is
+  never logged (prevents auth code leakage). Inbound webhook log line moved
+  after the auth gate (only logged for authenticated users). Auth code
+  messages return before reaching chat history storage or LLM context. Wrong
+  code and random messages receive the same generic prompt (no information
+  leakage about code validity).
 - **Formula Registry**: Persistent formula storage in Postgres `formula_registry`
   table (migration 020) with CRUD tools (`create_formula`, `get_formula`,
   `update_formula`, `delete_formula`, `list_formulas`). Seed script
@@ -48,6 +66,8 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 - **Users tab** in control panel with create/edit/toggle/reset-password actions
   and role enforcement (viewer hides write controls, non-admin hides Users tab).
 - **Formulas tab** in control panel for formula CRUD and toggle.
+- **Dashboard Telegram status card** shows access code and authorized user
+  count in the Telegram tab.
 - `scripts/create-admin.sh` for bootstrapping dashboard admin users with
   pgcrypto fallback (no Python bcrypt dependency required).
 - Heartbeat: chat session expiry and dashboard session cleanup cycles.
@@ -68,6 +88,8 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 
 ### Fixed
 
+- Dashboard Telegram registration form stuck on "Registering..." after
+  successful bot registration (form now clears before reloading status).
 - `grep -q` + `pipefail` SIGPIPE bug in formula-registry.sh (early grep exit
   killed the piped script).
 - Bash `${2:-{}}` brace parsing bug in dashboard-auth.sh (trailing `}` appended
