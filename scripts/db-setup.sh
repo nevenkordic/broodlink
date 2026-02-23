@@ -114,6 +114,7 @@ DOLT_PW_ARG="${DOLT_PASSWORD:+-p${DOLT_PASSWORD}}"
 
 for migration in 001_dolt_brain 005b_agent_max_concurrent 008b_agent_budget_tokens; do
   echo "  Applying ${migration}..."
+  # shellcheck disable=SC2086
   mysql \
     -h 127.0.0.1 \
     -P 3307 \
@@ -136,6 +137,7 @@ if [[ -n "$QDRANT_KEY" ]]; then
   QDRANT_AUTH="-H api-key: $QDRANT_KEY"
 fi
 
+# shellcheck disable=SC2086
 curl -sf -X PUT \
   http://localhost:6333/collections/broodlink_memory \
   -H "Content-Type: application/json" \
@@ -152,6 +154,7 @@ curl -sf -X PUT \
 
 echo "  broodlink_memory collection ready."
 
+# shellcheck disable=SC2086
 curl -sf -X PUT \
   http://localhost:6333/collections/broodlink_kg_entities \
   -H "Content-Type: application/json" \

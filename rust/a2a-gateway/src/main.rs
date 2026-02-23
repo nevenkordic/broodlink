@@ -4,10 +4,6 @@
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
-#![deny(clippy::unwrap_used)]
-#![deny(clippy::expect_used)]
-#![warn(clippy::pedantic)]
-
 //! A2A (Agent-to-Agent) Gateway — Google's open protocol for cross-platform agent interop.
 //!
 //! Exposes:
@@ -132,7 +128,15 @@ struct AppState {
     api_key: Option<String>,
     /// Cached Telegram credentials from platform_credentials table.
     /// (bot_token, secret_token, allowed_user_ids, auth_code, fetched_at)
-    telegram_creds: tokio::sync::RwLock<Option<(String, Option<String>, Vec<i64>, Option<String>, std::time::Instant)>>,
+    telegram_creds: tokio::sync::RwLock<
+        Option<(
+            String,
+            Option<String>,
+            Vec<i64>,
+            Option<String>,
+            std::time::Instant,
+        )>,
+    >,
     /// Limits concurrent Ollama chat calls (prevents queue pileup).
     ollama_semaphore: tokio::sync::Semaphore,
     /// TTL cache for Brave search results: query → (result, fetched_at).
@@ -159,7 +163,9 @@ async fn main() {
                     let key = key.trim();
                     let val = val.trim();
                     // SAFETY: called before any threads are spawned
-                    unsafe { std::env::set_var(key, val); }
+                    unsafe {
+                        std::env::set_var(key, val);
+                    }
                     eprintln!(".env: loaded {key}");
                 }
             }
@@ -277,15 +283,15 @@ async fn main() {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new()),
         ollama_client: reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(config.ollama.timeout_seconds))
+            .timeout(std::time::Duration::from_secs(
+                config.ollama.timeout_seconds,
+            ))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new()),
         api_key,
         config: Arc::clone(&config),
         telegram_creds: tokio::sync::RwLock::new(None),
-        ollama_semaphore: tokio::sync::Semaphore::new(
-            config.a2a.ollama_concurrency as usize,
-        ),
+        ollama_semaphore: tokio::sync::Semaphore::new(config.a2a.ollama_concurrency as usize),
         brave_cache: tokio::sync::RwLock::new(HashMap::new()),
         inflight_chats: tokio::sync::RwLock::new(HashMap::new()),
     });
@@ -341,17 +347,23 @@ async fn main() {
                     Ok(mut sub) => {
                         info!(subject = %subj_completed, "subscribed for chat completions");
                         while let Some(msg) = sub.next().await {
-                            if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
+                            if let Ok(payload) =
+                                serde_json::from_slice::<serde_json::Value>(&msg.payload)
+                            {
                                 let task_id = payload
                                     .get("task_id")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or_default();
-                                let result_data = payload
-                                    .get("result_data")
-                                    .cloned()
-                                    .unwrap_or_default();
+                                let result_data =
+                                    payload.get("result_data").cloned().unwrap_or_default();
                                 if !task_id.is_empty() {
-                                    handle_task_completion_for_chat(&st_completed, task_id, &result_data, false).await;
+                                    handle_task_completion_for_chat(
+                                        &st_completed,
+                                        task_id,
+                                        &result_data,
+                                        false,
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -369,7 +381,9 @@ async fn main() {
                     Ok(mut sub) => {
                         info!(subject = %subj_failed, "subscribed for chat failures");
                         while let Some(msg) = sub.next().await {
-                            if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
+                            if let Ok(payload) =
+                                serde_json::from_slice::<serde_json::Value>(&msg.payload)
+                            {
                                 let task_id = payload
                                     .get("task_id")
                                     .and_then(|v| v.as_str())
@@ -380,7 +394,8 @@ async fn main() {
                                     .unwrap_or("Task failed");
                                 if !task_id.is_empty() {
                                     let err_val = serde_json::json!({ "error": error_msg });
-                                    handle_task_completion_for_chat(&st, task_id, &err_val, true).await;
+                                    handle_task_completion_for_chat(&st, task_id, &err_val, true)
+                                        .await;
                                 }
                             }
                         }
@@ -415,7 +430,10 @@ async fn main() {
         .route("/a2a/tasks/send", post(tasks_send_handler))
         .route("/a2a/tasks/get", post(tasks_get_handler))
         .route("/a2a/tasks/cancel", post(tasks_cancel_handler))
-        .route("/a2a/tasks/sendSubscribe", post(tasks_send_subscribe_handler))
+        .route(
+            "/a2a/tasks/sendSubscribe",
+            post(tasks_send_subscribe_handler),
+        )
         // Webhook inbound routes
         .route("/webhook/slack", post(webhook_slack_handler))
         .route("/webhook/teams", post(webhook_teams_handler))
@@ -509,7 +527,9 @@ async fn bridge_call(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(GatewayError::Bridge(format!("bridge returned {status}: {text}")));
+        return Err(GatewayError::Bridge(format!(
+            "bridge returned {status}: {text}"
+        )));
     }
 
     let data: serde_json::Value = resp
@@ -557,11 +577,7 @@ fn jsonrpc_ok(id: Option<serde_json::Value>, result: serde_json::Value) -> Respo
         .into_response()
 }
 
-fn jsonrpc_err(
-    id: Option<serde_json::Value>,
-    code: i32,
-    message: &str,
-) -> Response {
+fn jsonrpc_err(id: Option<serde_json::Value>, code: i32, message: &str) -> Response {
     let resp = serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -753,24 +769,19 @@ async fn tasks_get_handler(
         Err(e) => return jsonrpc_err(None, -32700, &format!("parse error: {e}")),
     };
 
-    let external_id = rpc
-        .params
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let external_id = rpc.params.get("id").and_then(|v| v.as_str()).unwrap_or("");
 
     if external_id.is_empty() {
         return jsonrpc_err(rpc.id, -32602, "missing required param: id");
     }
 
     // Look up internal ID
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT internal_id FROM a2a_task_map WHERE external_id = $1",
-    )
-    .bind(external_id)
-    .fetch_optional(&state.pg)
-    .await
-    .unwrap_or(None);
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT internal_id FROM a2a_task_map WHERE external_id = $1")
+            .bind(external_id)
+            .fetch_optional(&state.pg)
+            .await
+            .unwrap_or(None);
 
     let Some((internal_id,)) = row else {
         return jsonrpc_err(rpc.id, -32001, "task not found");
@@ -806,7 +817,11 @@ async fn tasks_get_handler(
             });
             (map_status(internal_status), msg, arts)
         }
-        Err(e) => (A2aTaskStatus::Unknown, Some(format!("lookup failed: {e}")), None),
+        Err(e) => (
+            A2aTaskStatus::Unknown,
+            Some(format!("lookup failed: {e}")),
+            None,
+        ),
     };
 
     let task_resp = A2aTaskResponse {
@@ -839,24 +854,19 @@ async fn tasks_cancel_handler(
         Err(e) => return jsonrpc_err(None, -32700, &format!("parse error: {e}")),
     };
 
-    let external_id = rpc
-        .params
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let external_id = rpc.params.get("id").and_then(|v| v.as_str()).unwrap_or("");
 
     if external_id.is_empty() {
         return jsonrpc_err(rpc.id, -32602, "missing required param: id");
     }
 
     // Look up internal ID
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT internal_id FROM a2a_task_map WHERE external_id = $1",
-    )
-    .bind(external_id)
-    .fetch_optional(&state.pg)
-    .await
-    .unwrap_or(None);
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT internal_id FROM a2a_task_map WHERE external_id = $1")
+            .bind(external_id)
+            .fetch_optional(&state.pg)
+            .await
+            .unwrap_or(None);
 
     let Some((internal_id,)) = row else {
         return jsonrpc_err(rpc.id, -32001, "task not found");
@@ -1037,7 +1047,9 @@ async fn tasks_send_subscribe_handler(
                         .get("data")
                         .and_then(|d| d.get("result_data"))
                         .and_then(|r| {
-                            if r.is_null() { None } else {
+                            if r.is_null() {
+                                None
+                            } else {
                                 Some(serde_json::json!([
                                     {"parts": [{"type": "text", "text": r.to_string()}]}
                                 ]))
@@ -1125,38 +1137,33 @@ fn parse_command_text(text: &str) -> Option<(String, Vec<String>)> {
 }
 
 /// Execute a parsed webhook command via bridge calls.
-async fn execute_command(
-    state: &AppState,
-    cmd: &WebhookCommand,
-) -> String {
+async fn execute_command(state: &AppState, cmd: &WebhookCommand) -> String {
     match cmd.command.as_str() {
-        "agents" | "list" => {
-            match bridge_call(state, "list_agents", serde_json::json!({})).await {
-                Ok(data) => {
-                    let agents = data
-                        .as_array()
-                        .or_else(|| data.get("agents").and_then(|a| a.as_array()));
-                    match agents {
-                        Some(arr) => {
-                            if arr.is_empty() {
-                                return "No agents registered.".to_string();
-                            }
-                            let mut lines = vec!["Agent Roster:".to_string()];
-                            for a in arr {
-                                let id = a.get("agent_id").and_then(|v| v.as_str()).unwrap_or("?");
-                                let role = a.get("role").and_then(|v| v.as_str()).unwrap_or("?");
-                                let active = a.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
-                                let icon = if active { "+" } else { "-" };
-                                lines.push(format!("  [{icon}] {id} ({role})"));
-                            }
-                            lines.join("\n")
+        "agents" | "list" => match bridge_call(state, "list_agents", serde_json::json!({})).await {
+            Ok(data) => {
+                let agents = data
+                    .as_array()
+                    .or_else(|| data.get("agents").and_then(|a| a.as_array()));
+                match agents {
+                    Some(arr) => {
+                        if arr.is_empty() {
+                            return "No agents registered.".to_string();
                         }
-                        None => format!("Agents: {data}"),
+                        let mut lines = vec!["Agent Roster:".to_string()];
+                        for a in arr {
+                            let id = a.get("agent_id").and_then(|v| v.as_str()).unwrap_or("?");
+                            let role = a.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+                            let active = a.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+                            let icon = if active { "+" } else { "-" };
+                            lines.push(format!("  [{icon}] {id} ({role})"));
+                        }
+                        lines.join("\n")
                     }
+                    None => format!("Agents: {data}"),
                 }
-                Err(e) => format!("Error listing agents: {e}"),
             }
-        }
+            Err(e) => format!("Error listing agents: {e}"),
+        },
 
         "toggle" => {
             let agent_id = match cmd.args.first() {
@@ -1268,42 +1275,42 @@ async fn execute_command(
             }
         }
 
-        "dlq" => {
-            match bridge_call(state, "inspect_dlq", serde_json::json!({})).await {
-                Ok(data) => {
-                    let entries = data
-                        .as_array()
-                        .or_else(|| data.get("entries").and_then(|e| e.as_array()));
-                    match entries {
-                        Some(arr) => {
-                            let unresolved: Vec<_> = arr
-                                .iter()
-                                .filter(|e| !e.get("resolved").and_then(|v| v.as_bool()).unwrap_or(false))
-                                .collect();
-                            if unresolved.is_empty() {
-                                return "DLQ is empty.".to_string();
-                            }
-                            let mut lines = vec![format!("DLQ ({} entries):", unresolved.len())];
-                            for e in unresolved.iter().take(5) {
-                                let task = e.get("task_id").and_then(|v| v.as_str()).unwrap_or("?");
-                                let reason = e.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
-                                let retries = e.get("retry_count").and_then(|v| v.as_i64()).unwrap_or(0);
-                                lines.push(format!("  {task}: {reason} (retries: {retries})"));
-                            }
-                            if unresolved.len() > 5 {
-                                lines.push(format!("  ... and {} more", unresolved.len() - 5));
-                            }
-                            lines.join("\n")
+        "dlq" => match bridge_call(state, "inspect_dlq", serde_json::json!({})).await {
+            Ok(data) => {
+                let entries = data
+                    .as_array()
+                    .or_else(|| data.get("entries").and_then(|e| e.as_array()));
+                match entries {
+                    Some(arr) => {
+                        let unresolved: Vec<_> = arr
+                            .iter()
+                            .filter(|e| {
+                                !e.get("resolved").and_then(|v| v.as_bool()).unwrap_or(false)
+                            })
+                            .collect();
+                        if unresolved.is_empty() {
+                            return "DLQ is empty.".to_string();
                         }
-                        None => format!("DLQ: {data}"),
+                        let mut lines = vec![format!("DLQ ({} entries):", unresolved.len())];
+                        for e in unresolved.iter().take(5) {
+                            let task = e.get("task_id").and_then(|v| v.as_str()).unwrap_or("?");
+                            let reason = e.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
+                            let retries =
+                                e.get("retry_count").and_then(|v| v.as_i64()).unwrap_or(0);
+                            lines.push(format!("  {task}: {reason} (retries: {retries})"));
+                        }
+                        if unresolved.len() > 5 {
+                            lines.push(format!("  ... and {} more", unresolved.len() - 5));
+                        }
+                        lines.join("\n")
                     }
+                    None => format!("DLQ: {data}"),
                 }
-                Err(e) => format!("Error inspecting DLQ: {e}"),
             }
-        }
+            Err(e) => format!("Error inspecting DLQ: {e}"),
+        },
 
-        "help" => {
-            "Broodlink commands:\n\
+        "help" => "Broodlink commands:\n\
              \x20 agents         — list all agents\n\
              \x20 toggle <id>    — toggle agent active/inactive\n\
              \x20 budget <id>    — show agent budget\n\
@@ -1311,8 +1318,7 @@ async fn execute_command(
              \x20 workflow start <formula> — start a workflow\n\
              \x20 dlq            — show dead-letter queue\n\
              \x20 help           — show this help"
-                .to_string()
-        }
+            .to_string(),
 
         other => format!("Unknown command: {other}. Try 'help'."),
     }
@@ -1361,7 +1367,12 @@ async fn log_webhook(
 // Webhook signature verification helpers
 // ---------------------------------------------------------------------------
 
-fn verify_slack_signature(signing_secret: &str, timestamp: &str, body: &str, signature: &str) -> bool {
+fn verify_slack_signature(
+    signing_secret: &str,
+    timestamp: &str,
+    body: &str,
+    signature: &str,
+) -> bool {
     // Reject requests older than 5 minutes to prevent replay attacks
     if let Ok(ts) = timestamp.parse::<i64>() {
         let now = std::time::SystemTime::now()
@@ -1394,7 +1405,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 /// Verify Teams webhook using HMAC-SHA256 shared secret.
@@ -1428,7 +1442,11 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
     // Simple base64 decode (standard alphabet with padding)
     use std::collections::HashMap;
     let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let table: HashMap<u8, u8> = alphabet.iter().enumerate().map(|(i, &c)| (c, i as u8)).collect();
+    let table: HashMap<u8, u8> = alphabet
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| (c, i as u8))
+        .collect();
 
     let input = input.trim_end_matches('=');
     let mut out = Vec::with_capacity(input.len() * 3 / 4);
@@ -1489,15 +1507,15 @@ async fn webhook_slack_handler(
             let mut parts = pair.splitn(2, '=');
             let key = parts.next()?;
             let value = parts.next().unwrap_or("");
-            Some((
-                urlencoding_decode(key),
-                urlencoding_decode(value),
-            ))
+            Some((urlencoding_decode(key), urlencoding_decode(value)))
         })
         .collect();
 
     let text = params.get("text").cloned().unwrap_or_default();
-    let user = params.get("user_name").cloned().unwrap_or_else(|| "slack-user".to_string());
+    let user = params
+        .get("user_name")
+        .cloned()
+        .unwrap_or_else(|| "slack-user".to_string());
     let user_id = params.get("user_id").cloned().unwrap_or_default();
     let channel_id = params.get("channel_id").cloned().unwrap_or_default();
     let response_url = params.get("response_url").cloned();
@@ -1508,7 +1526,16 @@ async fn webhook_slack_handler(
     // Otherwise, if chat is enabled, treat as conversational message
     if let Some((command, args)) = parse_command_text(&text) {
         let payload_json = serde_json::to_value(&params).unwrap_or_default();
-        log_webhook(&state.pg, None, "inbound", &format!("slack.{command}"), &payload_json, "delivered", None).await;
+        log_webhook(
+            &state.pg,
+            None,
+            "inbound",
+            &format!("slack.{command}"),
+            &payload_json,
+            "delivered",
+            None,
+        )
+        .await;
 
         let cmd = WebhookCommand {
             command,
@@ -1567,7 +1594,10 @@ async fn handle_slack_event(state: &AppState, body: &str) -> Response {
 
     // Handle URL verification challenge
     if payload.get("type").and_then(|t| t.as_str()) == Some("url_verification") {
-        let challenge = payload.get("challenge").and_then(|c| c.as_str()).unwrap_or("");
+        let challenge = payload
+            .get("challenge")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
         return (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "text/plain")],
@@ -1582,7 +1612,10 @@ async fn handle_slack_event(state: &AppState, body: &str) -> Response {
             let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
             // Only handle message events, ignore bot messages
-            if event_type == "message" && event.get("bot_id").is_none() && event.get("subtype").is_none() {
+            if event_type == "message"
+                && event.get("bot_id").is_none()
+                && event.get("subtype").is_none()
+            {
                 let channel = event.get("channel").and_then(|c| c.as_str()).unwrap_or("");
                 let user = event.get("user").and_then(|u| u.as_str()).unwrap_or("");
                 let text = event.get("text").and_then(|t| t.as_str()).unwrap_or("");
@@ -1594,14 +1627,9 @@ async fn handle_slack_event(state: &AppState, body: &str) -> Response {
                         // Let the slash command handler deal with it
                     } else {
                         let _ = handle_chat_message(
-                            state,
-                            "slack",
-                            channel,
-                            user,
+                            state, "slack", channel, user,
                             user, // display name not available in events API, use user_id
-                            text,
-                            thread_ts,
-                            None,
+                            text, thread_ts, None,
                         )
                         .await;
                     }
@@ -1645,10 +1673,7 @@ async fn webhook_teams_handler(
         }
     };
 
-    let text = payload
-        .get("text")
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
+    let text = payload.get("text").and_then(|t| t.as_str()).unwrap_or("");
     let user_name = payload
         .get("from")
         .and_then(|f| f.get("name"))
@@ -1662,21 +1687,30 @@ async fn webhook_teams_handler(
     let channel_id = payload
         .get("channelId")
         .and_then(|c| c.as_str())
-        .or_else(|| payload.get("conversation").and_then(|c| c.get("id")).and_then(|i| i.as_str()))
+        .or_else(|| {
+            payload
+                .get("conversation")
+                .and_then(|c| c.get("id"))
+                .and_then(|i| i.as_str())
+        })
         .unwrap_or("");
-    let service_url = payload
-        .get("serviceUrl")
-        .and_then(|s| s.as_str());
-    let activity_type = payload
-        .get("type")
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
+    let service_url = payload.get("serviceUrl").and_then(|s| s.as_str());
+    let activity_type = payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
     info!(platform = "teams", user = %user_name, text = %text, "inbound webhook");
 
     // Check for /broodlink command first
     if let Some((command, args)) = parse_command_text(text) {
-        log_webhook(&state.pg, None, "inbound", &format!("teams.{command}"), &payload, "delivered", None).await;
+        log_webhook(
+            &state.pg,
+            None,
+            "inbound",
+            &format!("teams.{command}"),
+            &payload,
+            "delivered",
+            None,
+        )
+        .await;
 
         let cmd = WebhookCommand {
             command,
@@ -1731,13 +1765,20 @@ async fn webhook_teams_handler(
 // ---------------------------------------------------------------------------
 
 /// Returns (bot_token, secret_token, allowed_user_ids, auth_code) from DB cache, falling back to config.
-async fn get_telegram_creds(state: &AppState) -> (Option<String>, Option<String>, Vec<i64>, Option<String>) {
+async fn get_telegram_creds(
+    state: &AppState,
+) -> (Option<String>, Option<String>, Vec<i64>, Option<String>) {
     // Check cache (60s TTL)
     {
         let guard = state.telegram_creds.read().await;
         if let Some((token, secret, allowed, auth_code, fetched)) = guard.as_ref() {
             if fetched.elapsed() < std::time::Duration::from_secs(60) {
-                return (Some(token.clone()), secret.clone(), allowed.clone(), auth_code.clone());
+                return (
+                    Some(token.clone()),
+                    secret.clone(),
+                    allowed.clone(),
+                    auth_code.clone(),
+                );
             }
         }
     }
@@ -1764,7 +1805,13 @@ async fn get_telegram_creds(state: &AppState) -> (Option<String>, Option<String>
             .and_then(|v| v.as_str())
             .map(String::from);
         let mut guard = state.telegram_creds.write().await;
-        *guard = Some((token.clone(), secret.clone(), allowed.clone(), auth_code.clone(), std::time::Instant::now()));
+        *guard = Some((
+            token.clone(),
+            secret.clone(),
+            allowed.clone(),
+            auth_code.clone(),
+            std::time::Instant::now(),
+        ));
         return (Some(token), secret, allowed, auth_code);
     }
 
@@ -1818,10 +1865,7 @@ async fn webhook_telegram_handler(
     };
 
     let message = payload.get("message").unwrap_or(&payload);
-    let text = message
-        .get("text")
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
+    let text = message.get("text").and_then(|t| t.as_str()).unwrap_or("");
     let user_name = message
         .get("from")
         .and_then(|f| f.get("first_name"))
@@ -1879,7 +1923,16 @@ async fn webhook_telegram_handler(
     // Check for /broodlink command or /command style
     if text.starts_with('/') || text.starts_with("broodlink ") {
         if let Some((command, args)) = parse_command_text(text) {
-            log_webhook(&state.pg, None, "inbound", &format!("telegram.{command}"), &payload, "delivered", None).await;
+            log_webhook(
+                &state.pg,
+                None,
+                "inbound",
+                &format!("telegram.{command}"),
+                &payload,
+                "delivered",
+                None,
+            )
+            .await;
 
             let cmd = WebhookCommand {
                 command,
@@ -1907,8 +1960,7 @@ async fn webhook_telegram_handler(
 
         // Dedup: skip if same message is already in-flight (before DB/bridge work)
         let dedup_key = chat_dedup_key("telegram", &chat_id_str, text);
-        let dedup_window =
-            std::time::Duration::from_secs(state.config.a2a.dedup_window_secs);
+        let dedup_window = std::time::Duration::from_secs(state.config.a2a.dedup_window_secs);
         {
             let mut guard = state.inflight_chats.write().await;
             if let Some(ts) = guard.get(&dedup_key) {
@@ -2041,7 +2093,16 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
     // Command handling
     if text.starts_with('/') || text.starts_with("broodlink ") {
         if let Some((command, args)) = parse_command_text(text) {
-            log_webhook(&state.pg, None, "inbound", &format!("telegram.{command}"), update, "delivered", None).await;
+            log_webhook(
+                &state.pg,
+                None,
+                "inbound",
+                &format!("telegram.{command}"),
+                update,
+                "delivered",
+                None,
+            )
+            .await;
             let cmd = WebhookCommand {
                 command,
                 args,
@@ -2059,8 +2120,7 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
 
         // Dedup: skip if same message is already in-flight (before DB/bridge work)
         let dedup_key = chat_dedup_key("telegram", &chat_id_str, text);
-        let dedup_window =
-            std::time::Duration::from_secs(state.config.a2a.dedup_window_secs);
+        let dedup_window = std::time::Duration::from_secs(state.config.a2a.dedup_window_secs);
         {
             let mut guard = state.inflight_chats.write().await;
             if let Some(ts) = guard.get(&dedup_key) {
@@ -2175,9 +2235,8 @@ async fn telegram_polling_loop(state: &AppState) {
             }
         };
 
-        let url = format!(
-            "https://api.telegram.org/bot{token}/getUpdates?offset={offset}&timeout=30"
-        );
+        let url =
+            format!("https://api.telegram.org/bot{token}/getUpdates?offset={offset}&timeout=30");
 
         let resp = match state
             .http_client
@@ -2257,32 +2316,50 @@ async fn telegram_polling_loop(state: &AppState) {
                 if let Some(ref code) = auth_code {
                     if msg_text.trim().eq_ignore_ascii_case(code) {
                         // Correct code — add user to allowed list
-                        info!(platform = "telegram", user_id = sender_id, "auth code accepted");
+                        info!(
+                            platform = "telegram",
+                            user_id = sender_id,
+                            "auth code accepted"
+                        );
                         if let Err(e) = add_telegram_allowed_user(state, sender_id).await {
                             warn!(error = %e, "failed to persist allowed user");
                         }
-                        let sender_name = update.get("message")
+                        let sender_name = update
+                            .get("message")
                             .and_then(|m| m.get("from"))
                             .and_then(|f| f.get("first_name"))
                             .and_then(|n| n.as_str())
                             .unwrap_or("there");
                         if msg_chat_id != 0 {
-                            let _ = deliver_telegram(state, &msg_chat_id.to_string(), None,
-                                &format!("Authenticated! Welcome, {sender_name}.")).await;
+                            let _ = deliver_telegram(
+                                state,
+                                &msg_chat_id.to_string(),
+                                None,
+                                &format!("Authenticated! Welcome, {sender_name}."),
+                            )
+                            .await;
                         }
                         continue;
                     }
                     // Wrong code — prompt
                     warn!(user_id = sender_id, "telegram user not authenticated");
                     if msg_chat_id != 0 {
-                        let _ = deliver_telegram(state, &msg_chat_id.to_string(), None,
-                            "Send the access code to use this bot.").await;
+                        let _ = deliver_telegram(
+                            state,
+                            &msg_chat_id.to_string(),
+                            None,
+                            "Send the access code to use this bot.",
+                        )
+                        .await;
                     }
                     continue;
                 }
                 // No auth_code but allow list exists — silent reject
                 if !allowed_users.is_empty() {
-                    warn!(user_id = sender_id, "telegram user not in allowed list — ignored");
+                    warn!(
+                        user_id = sender_id,
+                        "telegram user not in allowed list — ignored"
+                    );
                     continue;
                 }
             }
@@ -2297,14 +2374,13 @@ async fn telegram_polling_loop(state: &AppState) {
                     .unwrap_or(0);
 
                 if chat_id != 0 {
-                    info!(chat_id = chat_id, reply_len = reply.len(), "sending Telegram reply");
-                    if let Err(e) = deliver_telegram(
-                        state,
-                        &chat_id.to_string(),
-                        None,
-                        &reply,
-                    )
-                    .await
+                    info!(
+                        chat_id = chat_id,
+                        reply_len = reply.len(),
+                        "sending Telegram reply"
+                    );
+                    if let Err(e) =
+                        deliver_telegram(state, &chat_id.to_string(), None, &reply).await
                     {
                         warn!(error = %e, chat_id = chat_id, "failed to send polling reply");
                     }
@@ -2391,7 +2467,11 @@ async fn handle_chat_message(
     let (sid, msg_count) = match row {
         Some(r) => r,
         None => {
-            error!(platform = platform, user_id = user_id, "failed to upsert chat session");
+            error!(
+                platform = platform,
+                user_id = user_id,
+                "failed to upsert chat session"
+            );
             return None;
         }
     };
@@ -2452,7 +2532,11 @@ async fn handle_chat_message(
         .iter()
         .rev()
         .map(|(dir, content)| {
-            let label = if dir == "inbound" { user_name } else { "Broodlink" };
+            let label = if dir == "inbound" {
+                user_name
+            } else {
+                "Broodlink"
+            };
             format!("[{label}]: {content}")
         })
         .collect();
@@ -2525,30 +2609,48 @@ async fn reply_delivery_loop(state: &AppState) {
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
         // Fetch pending replies
-        let rows: Vec<(i64, String, String, Option<String>, String, Option<String>, String)> =
-            match sqlx::query_as(
-                "SELECT id, content, platform, reply_url, channel_id, thread_id, session_id
+        let rows: Vec<(
+            i64,
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+        )> = match sqlx::query_as(
+            "SELECT id, content, platform, reply_url, channel_id, thread_id, session_id
                  FROM chat_reply_queue
                  WHERE status = 'pending' AND attempts < $1
                  ORDER BY created_at ASC
                  LIMIT 10",
-            )
-            .bind(i64::from(max_attempts))
-            .fetch_all(&state.pg)
-            .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    debug!(error = %e, "reply delivery query failed");
-                    continue;
-                }
-            };
+        )
+        .bind(i64::from(max_attempts))
+        .fetch_all(&state.pg)
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(error = %e, "reply delivery query failed");
+                continue;
+            }
+        };
 
         for (id, content, platform, reply_url, channel_id, thread_id, _session_id) in rows {
             let delivered = match platform.as_str() {
-                "slack" => deliver_slack(state, reply_url.as_deref(), &channel_id, thread_id.as_deref(), &content).await,
+                "slack" => {
+                    deliver_slack(
+                        state,
+                        reply_url.as_deref(),
+                        &channel_id,
+                        thread_id.as_deref(),
+                        &content,
+                    )
+                    .await
+                }
                 "teams" => deliver_teams(state, reply_url.as_deref(), &channel_id, &content).await,
-                "telegram" => deliver_telegram(state, &channel_id, thread_id.as_deref(), &content).await,
+                "telegram" => {
+                    deliver_telegram(state, &channel_id, thread_id.as_deref(), &content).await
+                }
                 _ => {
                     warn!(platform = %platform, "unsupported platform for reply delivery");
                     Err("unsupported platform".to_string())
@@ -2591,13 +2693,12 @@ async fn handle_task_completion_for_chat(
     is_failure: bool,
 ) {
     // Look up chat metadata from task_queue.dependencies
-    let row: Option<(serde_json::Value,)> = sqlx::query_as(
-        "SELECT dependencies FROM task_queue WHERE id = $1",
-    )
-    .bind(task_id)
-    .fetch_optional(&state.pg)
-    .await
-    .unwrap_or(None);
+    let row: Option<(serde_json::Value,)> =
+        sqlx::query_as("SELECT dependencies FROM task_queue WHERE id = $1")
+            .bind(task_id)
+            .fetch_optional(&state.pg)
+            .await
+            .unwrap_or(None);
 
     let deps = match row {
         Some((d,)) => d,
@@ -2609,9 +2710,18 @@ async fn handle_task_completion_for_chat(
         None => return, // Not a chat task
     };
 
-    let session_id = chat.get("chat_session_id").and_then(|v| v.as_str()).unwrap_or_default();
-    let platform = chat.get("platform").and_then(|v| v.as_str()).unwrap_or_default();
-    let channel_id = chat.get("channel_id").and_then(|v| v.as_str()).unwrap_or_default();
+    let session_id = chat
+        .get("chat_session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let platform = chat
+        .get("platform")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let channel_id = chat
+        .get("channel_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     let thread_id = chat.get("thread_id").and_then(|v| v.as_str());
     let reply_url = chat.get("reply_url").and_then(|v| v.as_str());
 
@@ -2630,8 +2740,18 @@ async fn handle_task_completion_for_chat(
         result_data
             .as_str()
             .map(String::from)
-            .or_else(|| result_data.get("response").and_then(|v| v.as_str()).map(String::from))
-            .or_else(|| result_data.get("text").and_then(|v| v.as_str()).map(String::from))
+            .or_else(|| {
+                result_data
+                    .get("response")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+            .or_else(|| {
+                result_data
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
             .unwrap_or_else(|| result_data.to_string())
     };
 
@@ -2757,9 +2877,7 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
              When you do search, cite your sources.",
         );
     }
-    system_prompt.push_str(
-        " If you don't know something and can't look it up, say so honestly.",
-    );
+    system_prompt.push_str(" If you don't know something and can't look it up, say so honestly.");
 
     // Build message array: system prompt + conversation history
     // Limit context when tools are active to keep prompt size manageable for CPU inference
@@ -2830,34 +2948,34 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
             payload["tools"] = tools_def.clone().unwrap();
         }
 
-        let body: serde_json::Value = match state
-            .ollama_client
-            .post(&url)
-            .json(&payload)
-            .send()
-            .await
-        {
-            Ok(resp) => match resp.json().await {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(error = %e, round = round, "failed to parse Ollama response");
-                    return "Something went wrong. Please try again.".to_string();
+        let body: serde_json::Value =
+            match state.ollama_client.post(&url).json(&payload).send().await {
+                Ok(resp) => match resp.json().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(error = %e, round = round, "failed to parse Ollama response");
+                        return "Something went wrong. Please try again.".to_string();
+                    }
+                },
+                Err(e) if e.is_timeout() => {
+                    warn!(
+                        round = round,
+                        "Ollama request timed out ({}s)", timeout_secs
+                    );
+                    return "Response timed out. Please try a shorter question.".to_string();
                 }
-            },
-            Err(e) if e.is_timeout() => {
-                warn!(round = round, "Ollama request timed out ({}s)", timeout_secs);
-                return "Response timed out. Please try a shorter question.".to_string();
-            }
-            Err(e) => {
-                warn!(error = %e, round = round, "Ollama request failed");
-                return "I'm temporarily unavailable. Please try again in a moment.".to_string();
-            }
-        };
+                Err(e) => {
+                    warn!(error = %e, round = round, "Ollama request failed");
+                    return "I'm temporarily unavailable. Please try again in a moment."
+                        .to_string();
+                }
+            };
 
         // Check for Ollama-level errors (OOM, model not found, etc.)
         if let Some(err) = body.get("error").and_then(|e| e.as_str()) {
             warn!(error = %err, round = round, "Ollama returned error");
-            return "I'm temporarily unable to process your message. Please try again in a moment.".to_string();
+            return "I'm temporarily unable to process your message. Please try again in a moment."
+                .to_string();
         }
 
         let msg = match body.get("message") {
@@ -2882,8 +3000,7 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
                         .and_then(|f| f.get("name"))
                         .and_then(|n| n.as_str())
                         .unwrap_or("");
-                    let args_raw = fn_obj
-                        .and_then(|f| f.get("arguments"));
+                    let args_raw = fn_obj.and_then(|f| f.get("arguments"));
 
                     info!(tool = name, round = round, "executing tool call");
 
@@ -2898,13 +3015,16 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
                                         Some(a.clone())
                                     }
                                 })
-                                .and_then(|obj| obj.get("query").and_then(|q| q.as_str()).map(|s| s.to_string()))
+                                .and_then(|obj| {
+                                    obj.get("query")
+                                        .and_then(|q| q.as_str())
+                                        .map(|s| s.to_string())
+                                })
                                 .unwrap_or_default();
 
                             if let Some(ref key) = brave_key {
-                                let cache_ttl = std::time::Duration::from_secs(
-                                    tool_cfg.search_cache_ttl_secs,
-                                );
+                                let cache_ttl =
+                                    std::time::Duration::from_secs(tool_cfg.search_cache_ttl_secs);
                                 let cache_key = normalize_search_query(&query);
                                 // Check cache
                                 let cached = {
@@ -3049,9 +3169,15 @@ async fn execute_brave_search(
         Some(arr) if !arr.is_empty() => {
             let mut out = String::new();
             for (i, item) in arr.iter().enumerate() {
-                let title = item.get("title").and_then(|t| t.as_str()).unwrap_or("Untitled");
+                let title = item
+                    .get("title")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("Untitled");
                 let url = item.get("url").and_then(|u| u.as_str()).unwrap_or("");
-                let desc = item.get("description").and_then(|d| d.as_str()).unwrap_or("");
+                let desc = item
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("");
                 out.push_str(&format!("{}. {} ({}) — {}\n", i + 1, title, url, desc));
             }
             out
@@ -3081,7 +3207,10 @@ async fn add_telegram_allowed_user(state: &AppState, user_id: i64) -> Result<(),
     let mut guard = state.telegram_creds.write().await;
     *guard = None;
 
-    info!(user_id = user_id, "telegram user authenticated and added to allowed list");
+    info!(
+        user_id = user_id,
+        "telegram user authenticated and added to allowed list"
+    );
     Ok(())
 }
 
@@ -3145,7 +3274,12 @@ async fn deliver_slack(
         return Ok(());
     } else {
         // Use chat.postMessage with bot token
-        let token = state.config.webhooks.slack_bot_token.as_deref().unwrap_or("");
+        let token = state
+            .config
+            .webhooks
+            .slack_bot_token
+            .as_deref()
+            .unwrap_or("");
         if token.is_empty() {
             return Err("no slack_bot_token configured".to_string());
         }
@@ -3293,10 +3427,7 @@ mod tests {
     #[test]
     fn test_check_auth_invalid_bearer() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            "Bearer wrong-key".parse().unwrap(),
-        );
+        headers.insert(header::AUTHORIZATION, "Bearer wrong-key".parse().unwrap());
         let key = Some("test-key-123".to_string());
         assert_eq!(check_auth(&headers, &key), Err(StatusCode::UNAUTHORIZED));
     }
@@ -3396,8 +3527,14 @@ mod tests {
         assert!(evt.get("bot_id").is_none());
         assert_eq!(evt.get("channel").and_then(|c| c.as_str()), Some("C1234"));
         assert_eq!(evt.get("user").and_then(|u| u.as_str()), Some("U5678"));
-        assert_eq!(evt.get("text").and_then(|t| t.as_str()), Some("hello agent"));
-        assert_eq!(evt.get("thread_ts").and_then(|t| t.as_str()), Some("1234567890.000100"));
+        assert_eq!(
+            evt.get("text").and_then(|t| t.as_str()),
+            Some("hello agent")
+        );
+        assert_eq!(
+            evt.get("thread_ts").and_then(|t| t.as_str()),
+            Some("1234567890.000100")
+        );
     }
 
     #[test]
@@ -3413,7 +3550,10 @@ mod tests {
             }
         });
         let evt = event.get("event").unwrap();
-        assert!(evt.get("bot_id").is_some(), "bot messages should be detected");
+        assert!(
+            evt.get("bot_id").is_some(),
+            "bot messages should be detected"
+        );
     }
 
     #[test]
@@ -3426,11 +3566,32 @@ mod tests {
             "conversation": { "id": "conv-123" },
             "serviceUrl": "https://smba.trafficmanager.net/teams"
         });
-        assert_eq!(payload.get("type").and_then(|t| t.as_str()), Some("message"));
-        assert_eq!(payload.get("from").and_then(|f| f.get("name")).and_then(|n| n.as_str()), Some("Jane"));
-        assert_eq!(payload.get("from").and_then(|f| f.get("id")).and_then(|n| n.as_str()), Some("user-001"));
-        assert_eq!(payload.get("channelId").and_then(|c| c.as_str()), Some("teams-channel-1"));
-        assert_eq!(payload.get("serviceUrl").and_then(|s| s.as_str()), Some("https://smba.trafficmanager.net/teams"));
+        assert_eq!(
+            payload.get("type").and_then(|t| t.as_str()),
+            Some("message")
+        );
+        assert_eq!(
+            payload
+                .get("from")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str()),
+            Some("Jane")
+        );
+        assert_eq!(
+            payload
+                .get("from")
+                .and_then(|f| f.get("id"))
+                .and_then(|n| n.as_str()),
+            Some("user-001")
+        );
+        assert_eq!(
+            payload.get("channelId").and_then(|c| c.as_str()),
+            Some("teams-channel-1")
+        );
+        assert_eq!(
+            payload.get("serviceUrl").and_then(|s| s.as_str()),
+            Some("https://smba.trafficmanager.net/teams")
+        );
     }
 
     #[test]
@@ -3444,11 +3605,32 @@ mod tests {
             }
         });
         let msg = payload.get("message").unwrap();
-        assert_eq!(msg.get("text").and_then(|t| t.as_str()), Some("what is the weather?"));
-        assert_eq!(msg.get("from").and_then(|f| f.get("first_name")).and_then(|n| n.as_str()), Some("Bob"));
-        assert_eq!(msg.get("from").and_then(|f| f.get("id")).and_then(|i| i.as_i64()), Some(12345));
-        assert_eq!(msg.get("chat").and_then(|c| c.get("id")).and_then(|i| i.as_i64()), Some(67890));
-        assert_eq!(msg.get("message_thread_id").and_then(|t| t.as_i64()), Some(42));
+        assert_eq!(
+            msg.get("text").and_then(|t| t.as_str()),
+            Some("what is the weather?")
+        );
+        assert_eq!(
+            msg.get("from")
+                .and_then(|f| f.get("first_name"))
+                .and_then(|n| n.as_str()),
+            Some("Bob")
+        );
+        assert_eq!(
+            msg.get("from")
+                .and_then(|f| f.get("id"))
+                .and_then(|i| i.as_i64()),
+            Some(12345)
+        );
+        assert_eq!(
+            msg.get("chat")
+                .and_then(|c| c.get("id"))
+                .and_then(|i| i.as_i64()),
+            Some(67890)
+        );
+        assert_eq!(
+            msg.get("message_thread_id").and_then(|t| t.as_i64()),
+            Some(42)
+        );
     }
 
     #[test]
@@ -3474,8 +3656,16 @@ mod tests {
         // The SQL upsert uses ON CONFLICT (platform, channel_id, user_id).
         // Verify UUID generation is valid.
         let session_id = uuid::Uuid::new_v4().to_string();
-        assert_eq!(session_id.len(), 36, "UUID should be 36 chars including hyphens");
-        assert_eq!(session_id.chars().filter(|c| *c == '-').count(), 4, "UUID should have 4 hyphens");
+        assert_eq!(
+            session_id.len(),
+            36,
+            "UUID should be 36 chars including hyphens"
+        );
+        assert_eq!(
+            session_id.chars().filter(|c| *c == '-').count(),
+            4,
+            "UUID should have 4 hyphens"
+        );
     }
 
     #[test]
@@ -3548,15 +3738,24 @@ mod tests {
 
         // msg_count == 1 → new session → greeting should fire
         let msg_count = 1;
-        assert!(greeting_enabled && msg_count == 1, "greeting should fire on first message");
+        assert!(
+            greeting_enabled && msg_count == 1,
+            "greeting should fire on first message"
+        );
 
         // msg_count == 2 → returning user → no greeting
         let msg_count = 2;
-        assert!(!(greeting_enabled && msg_count == 1), "greeting should NOT fire on subsequent messages");
+        assert!(
+            !(greeting_enabled && msg_count == 1),
+            "greeting should NOT fire on subsequent messages"
+        );
 
         // greeting_enabled == false → never fire
         let greeting_enabled = false;
         let msg_count = 1;
-        assert!(!(greeting_enabled && msg_count == 1), "greeting should NOT fire when disabled");
+        assert!(
+            !(greeting_enabled && msg_count == 1),
+            "greeting should NOT fire when disabled"
+        );
     }
 }

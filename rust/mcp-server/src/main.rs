@@ -4,10 +4,6 @@
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
-#![deny(clippy::unwrap_used)]
-#![deny(clippy::expect_used)]
-#![warn(clippy::pedantic)]
-
 mod handler;
 mod protocol;
 mod streamable_http;
@@ -63,17 +59,13 @@ async fn main() {
     info!(service = SERVICE_NAME, "starting");
 
     // Read JWT token for authenticating with beads-bridge
-    let jwt_path = config
-        .mcp_server
-        .jwt_token_path
-        .clone()
-        .unwrap_or_else(|| {
-            let agent = &config.mcp_server.agent_id;
-            format!(
-                "{}/.broodlink/jwt-{agent}.token",
-                std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
-            )
-        });
+    let jwt_path = config.mcp_server.jwt_token_path.clone().unwrap_or_else(|| {
+        let agent = &config.mcp_server.agent_id;
+        format!(
+            "{}/.broodlink/jwt-{agent}.token",
+            std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
+        )
+    });
 
     let jwt_token = match std::fs::read_to_string(&jwt_path) {
         Ok(t) => t.trim().to_string(),
@@ -87,31 +79,31 @@ async fn main() {
     let status_url = format!("http://127.0.0.1:{}", config.status_api.port);
 
     // Resolve status-api key from the env var named in config (e.g. BROODLINK_STATUS_API_KEY)
-    let status_api_key = std::env::var(&config.status_api.api_key_name)
-        .unwrap_or_else(|_| {
-            error!(
-                key_name = %config.status_api.api_key_name,
-                "status API key env var not set — exiting"
-            );
-            process::exit(1);
-        });
+    let status_api_key = std::env::var(&config.status_api.api_key_name).unwrap_or_else(|_| {
+        error!(
+            key_name = %config.status_api.api_key_name,
+            "status API key env var not set — exiting"
+        );
+        process::exit(1);
+    });
 
-    let client = BridgeClient::new(
-        bridge_url,
-        jwt_token,
-        status_url,
-        status_api_key,
-    );
+    let client = BridgeClient::new(bridge_url, jwt_token, status_url, status_api_key);
 
     // Select transport based on config
     let transport = config.mcp_server.transport.as_str();
     match transport {
         "http" => {
-            info!(port = config.mcp_server.port, "starting Streamable HTTP transport");
+            info!(
+                port = config.mcp_server.port,
+                "starting Streamable HTTP transport"
+            );
             streamable_http::run_http_transport(config, client).await;
         }
         "sse" => {
-            info!(port = config.mcp_server.port, "starting legacy SSE transport");
+            info!(
+                port = config.mcp_server.port,
+                "starting legacy SSE transport"
+            );
             run_sse_transport(config, client).await;
         }
         "stdio" => {
@@ -119,7 +111,10 @@ async fn main() {
             run_stdio_transport(client).await;
         }
         _ => {
-            error!(transport = transport, "unknown transport — expected http, sse, or stdio");
+            error!(
+                transport = transport,
+                "unknown transport — expected http, sse, or stdio"
+            );
             process::exit(1);
         }
     }
@@ -225,9 +220,7 @@ async fn sse_handler(
     // Send the endpoint event so the client knows where to POST
     let endpoint_msg = format!("/message");
     tokio::spawn(async move {
-        let event = Event::default()
-            .event("endpoint")
-            .data(endpoint_msg);
+        let event = Event::default().event("endpoint").data(endpoint_msg);
         let _ = tx.send(Ok(event)).await;
         // Keep the channel open — the tx will be stored for sending responses
         // In a production MCP server, you'd store tx in shared state keyed by session

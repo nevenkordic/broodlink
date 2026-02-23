@@ -68,8 +68,10 @@ run_sql() {
   local sql="$1"
   local flags="${2:--q}"
   if command -v psql &>/dev/null; then
+    # shellcheck disable=SC2086
     PGPASSWORD=$PGPASSWORD psql -h 127.0.0.1 -U postgres -d broodlink_hot $flags -c "$sql" 2>/dev/null
   else
+    # shellcheck disable=SC2086
     podman exec -i broodlink-postgres psql -U postgres -d broodlink_hot $flags -c "$sql" 2>/dev/null
   fi
 }

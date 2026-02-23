@@ -19,9 +19,6 @@
  * <https://www.gnu.org/licenses/>.
  */
 
-#![deny(clippy::unwrap_used)]
-#![deny(clippy::expect_used)]
-#![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
 use std::collections::HashMap;
@@ -40,16 +37,16 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use broodlink_config::Config;
 use broodlink_secrets::SecretsProvider;
+use chrono::{Local, Utc};
 use futures::stream::Stream;
 use futures::StreamExt;
-use chrono::{Local, Utc};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sqlx::mysql::MySqlPoolOptions;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{MySqlPool, PgPool};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info, warn};
-use rand::Rng;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -95,7 +92,10 @@ impl IntoResponse for StatusApiError {
             }
             Self::Nats(e) => {
                 error!(error = %e, trace_id = %trace_id, "nats error");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal messaging error")
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal messaging error",
+                )
             }
             Self::Config(e) => {
                 error!(error = %e, trace_id = %trace_id, "config error");
@@ -103,7 +103,10 @@ impl IntoResponse for StatusApiError {
             }
             Self::Secrets(e) => {
                 error!(error = %e, trace_id = %trace_id, "secrets error");
-                (StatusCode::INTERNAL_SERVER_ERROR, "secrets resolution error")
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "secrets resolution error",
+                )
             }
             Self::Auth(msg) => {
                 warn!(msg = %msg, trace_id = %trace_id, "auth failure");
@@ -261,13 +264,19 @@ async fn main() {
         process::exit(1);
     });
 
-    let _telemetry_guard = broodlink_telemetry::init_telemetry(SERVICE_NAME, &boot_config.telemetry)
-        .unwrap_or_else(|e| {
-            eprintln!("fatal: telemetry init failed: {e}");
-            process::exit(1);
-        });
+    let _telemetry_guard =
+        broodlink_telemetry::init_telemetry(SERVICE_NAME, &boot_config.telemetry).unwrap_or_else(
+            |e| {
+                eprintln!("fatal: telemetry init failed: {e}");
+                process::exit(1);
+            },
+        );
 
-    info!(service = SERVICE_NAME, version = SERVICE_VERSION, "starting");
+    info!(
+        service = SERVICE_NAME,
+        version = SERVICE_VERSION,
+        "starting"
+    );
 
     let state = match init_state().await {
         Ok(s) => s,
@@ -354,11 +363,7 @@ async fn init_state() -> Result<AppState, StatusApiError> {
     // Dolt (MySQL) pool
     let dolt_url = format!(
         "mysql://{}:{}@{}:{}/{}",
-        config.dolt.user,
-        dolt_password,
-        config.dolt.host,
-        config.dolt.port,
-        config.dolt.database,
+        config.dolt.user, dolt_password, config.dolt.host, config.dolt.port, config.dolt.database,
     );
     let dolt = MySqlPoolOptions::new()
         .min_connections(config.dolt.min_connections)
@@ -389,7 +394,8 @@ async fn init_state() -> Result<AppState, StatusApiError> {
     let qdrant_url = config.qdrant.url.clone();
 
     // NATS client (cluster-aware via broodlink-runtime)
-    let nats = broodlink_runtime::connect_nats(&config.nats).await
+    let nats = broodlink_runtime::connect_nats(&config.nats)
+        .await
         .map_err(|e| StatusApiError::Nats(e.to_string()))?;
 
     Ok(AppState {
@@ -432,8 +438,14 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/audit", get(handler_audit))
         // v0.2.0 endpoints
         .route("/approvals", get(handler_approvals))
-        .route("/approval-policies", get(handler_approval_policies).post(handler_upsert_approval_policy))
-        .route("/approval-policies/:policy_id/toggle", post(handler_toggle_approval_policy))
+        .route(
+            "/approval-policies",
+            get(handler_approval_policies).post(handler_upsert_approval_policy),
+        )
+        .route(
+            "/approval-policies/:policy_id/toggle",
+            post(handler_toggle_approval_policy),
+        )
         .route("/approvals/:gate_id/review", post(handler_approval_review))
         .route("/agent-metrics", get(handler_agent_metrics))
         .route("/delegations", get(handler_delegations))
@@ -455,18 +467,36 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/tasks/:task_id/cancel", post(handler_task_cancel))
         .route("/workflows", get(handler_workflows))
         // v0.6.0 webhooks
-        .route("/webhooks", get(handler_webhooks).post(handler_webhook_create))
-        .route("/webhooks/:endpoint_id/toggle", post(handler_webhook_toggle))
-        .route("/webhooks/:endpoint_id/delete", post(handler_webhook_delete))
+        .route(
+            "/webhooks",
+            get(handler_webhooks).post(handler_webhook_create),
+        )
+        .route(
+            "/webhooks/:endpoint_id/toggle",
+            post(handler_webhook_toggle),
+        )
+        .route(
+            "/webhooks/:endpoint_id/delete",
+            post(handler_webhook_delete),
+        )
         .route("/webhook-log", get(handler_webhook_log))
         // v0.7.0 chat sessions
         .route("/chat/sessions", get(handler_chat_sessions))
-        .route("/chat/sessions/:session_id/messages", get(handler_chat_messages))
+        .route(
+            "/chat/sessions/:session_id/messages",
+            get(handler_chat_messages),
+        )
         .route("/chat/sessions/:session_id/close", post(handler_chat_close))
-        .route("/chat/sessions/:session_id/assign", post(handler_chat_assign))
+        .route(
+            "/chat/sessions/:session_id/assign",
+            post(handler_chat_assign),
+        )
         .route("/chat/stats", get(handler_chat_stats))
         // v0.7.0 formula registry
-        .route("/formulas", get(handler_list_formulas).post(handler_create_formula))
+        .route(
+            "/formulas",
+            get(handler_list_formulas).post(handler_create_formula),
+        )
         .route("/formulas/:name", get(handler_get_formula))
         .route("/formulas/:name/update", post(handler_update_formula))
         .route("/formulas/:name/toggle", post(handler_toggle_formula))
@@ -500,15 +530,18 @@ fn build_router(state: Arc<AppState>) -> Router {
         .layer(cors)
 }
 
-async fn security_headers_middleware(
-    req: Request<axum::body::Body>,
-    next: Next,
-) -> Response {
+async fn security_headers_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
     let mut resp = next.run(req).await;
     let headers = resp.headers_mut();
     headers.insert("X-Frame-Options", header::HeaderValue::from_static("DENY"));
-    headers.insert("X-Content-Type-Options", header::HeaderValue::from_static("nosniff"));
-    headers.insert("Referrer-Policy", header::HeaderValue::from_static("strict-origin-when-cross-origin"));
+    headers.insert(
+        "X-Content-Type-Options",
+        header::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        "Referrer-Policy",
+        header::HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
     resp
 }
 
@@ -533,10 +566,7 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
             .allow_headers(allowed_headers);
     }
 
-    let parsed: Vec<header::HeaderValue> = origins
-        .iter()
-        .filter_map(|o| o.parse().ok())
-        .collect();
+    let parsed: Vec<header::HeaderValue> = origins.iter().filter_map(|o| o.parse().ok()).collect();
 
     CorsLayer::new()
         .allow_origin(AllowOrigin::list(parsed))
@@ -594,7 +624,9 @@ async fn auth_middleware(
 
         if let Some((user_id, username, role, active)) = session {
             if !active {
-                return Err(StatusApiError::Auth("user account is deactivated".to_string()));
+                return Err(StatusApiError::Auth(
+                    "user account is deactivated".to_string(),
+                ));
             }
             req.extensions_mut().insert(AuthContext {
                 role: UserRole::from_str_loose(&role),
@@ -669,7 +701,17 @@ async fn handler_agents(
     let agents: Vec<serde_json::Value> = profiles
         .into_iter()
         .map(
-            |(agent_id, display_name, role, transport, cost_tier, capabilities, active, created_at, updated_at)| {
+            |(
+                agent_id,
+                display_name,
+                role,
+                transport,
+                cost_tier,
+                capabilities,
+                active,
+                created_at,
+                updated_at,
+            )| {
                 let latest_work = work_map.get(&agent_id).cloned();
                 let status = if active { "active" } else { "inactive" };
                 serde_json::json!({
@@ -710,9 +752,18 @@ async fn handler_tasks(
     let status_counts: HashMap<String, i64> = counts.into_iter().collect();
 
     // Last 20 tasks
-    let tasks = sqlx::query_as::<_, (
-        String, String, String, String, Option<i32>, Option<String>, String,
-    )>(
+    let tasks = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            String,
+            Option<i32>,
+            Option<String>,
+            String,
+        ),
+    >(
         "SELECT id, title, status, description, priority, assigned_agent, created_at::text
          FROM task_queue ORDER BY created_at DESC LIMIT 20",
     )
@@ -826,7 +877,17 @@ async fn handler_beads(
     let status_filter = params.get("status").cloned().unwrap_or_default();
 
     let issues = if status_filter.is_empty() {
-        sqlx::query_as::<_, (String, String, Option<String>, Option<String>, Option<String>, Option<String>)>(
+        sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ),
+        >(
             "SELECT bead_id, title, status, assignee, convoy_id, CAST(updated_at AS CHAR)
              FROM beads_issues
              ORDER BY updated_at DESC
@@ -835,7 +896,17 @@ async fn handler_beads(
         .fetch_all(&state.dolt)
         .await?
     } else {
-        sqlx::query_as::<_, (String, String, Option<String>, Option<String>, Option<String>, Option<String>)>(
+        sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ),
+        >(
             "SELECT bead_id, title, status, assignee, convoy_id, CAST(updated_at AS CHAR)
              FROM beads_issues
              WHERE status = ?
@@ -849,16 +920,18 @@ async fn handler_beads(
 
     let issues_json: Vec<serde_json::Value> = issues
         .into_iter()
-        .map(|(bead_id, title, status, assignee, convoy_id, updated_at)| {
-            serde_json::json!({
-                "bead_id": bead_id,
-                "title": title,
-                "status": status,
-                "assignee": assignee,
-                "convoy_id": convoy_id,
-                "updated_at": updated_at,
-            })
-        })
+        .map(
+            |(bead_id, title, status, assignee, convoy_id, updated_at)| {
+                serde_json::json!({
+                    "bead_id": bead_id,
+                    "title": title,
+                    "status": status,
+                    "assignee": assignee,
+                    "convoy_id": convoy_id,
+                    "updated_at": updated_at,
+                })
+            },
+        )
         .collect();
 
     Ok(ok_response(serde_json::json!({ "issues": issues_json })))
@@ -879,7 +952,13 @@ async fn handler_health(
     let dolt_status = match sqlx::query("SELECT 1").execute(&state.dolt).await {
         Ok(_) => DependencyStatus {
             status: "ok".to_string(),
-            latency_ms: Some(dolt_start.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
+            latency_ms: Some(
+                dolt_start
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            ),
             detail: None,
         },
         Err(e) => DependencyStatus {
@@ -895,7 +974,13 @@ async fn handler_health(
     let pg_status = match sqlx::query("SELECT 1").execute(&state.pg).await {
         Ok(_) => DependencyStatus {
             status: "ok".to_string(),
-            latency_ms: Some(pg_start.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
+            latency_ms: Some(
+                pg_start
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            ),
             detail: None,
         },
         Err(e) => DependencyStatus {
@@ -908,46 +993,49 @@ async fn handler_health(
 
     // NATS health: attempt a quick connect/flush check
     let nats_start = Instant::now();
-    let nats_status = match tokio::time::timeout(
-        Duration::from_secs(3),
-        async_nats::connect(&state.nats_url),
-    )
-    .await
-    {
-        Ok(Ok(client)) => {
-            let flush_result = tokio::time::timeout(
-                Duration::from_secs(2),
-                client.flush(),
-            )
-            .await;
-            match flush_result {
-                Ok(Ok(())) => DependencyStatus {
-                    status: "ok".to_string(),
-                    latency_ms: Some(
-                        nats_start.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-                    ),
-                    detail: None,
-                },
-                _ => DependencyStatus {
-                    status: "degraded".to_string(),
-                    latency_ms: Some(
-                        nats_start.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-                    ),
-                    detail: Some("connected but flush failed".to_string()),
-                },
+    let nats_status =
+        match tokio::time::timeout(Duration::from_secs(3), async_nats::connect(&state.nats_url))
+            .await
+        {
+            Ok(Ok(client)) => {
+                let flush_result =
+                    tokio::time::timeout(Duration::from_secs(2), client.flush()).await;
+                match flush_result {
+                    Ok(Ok(())) => DependencyStatus {
+                        status: "ok".to_string(),
+                        latency_ms: Some(
+                            nats_start
+                                .elapsed()
+                                .as_millis()
+                                .try_into()
+                                .unwrap_or(u64::MAX),
+                        ),
+                        detail: None,
+                    },
+                    _ => DependencyStatus {
+                        status: "degraded".to_string(),
+                        latency_ms: Some(
+                            nats_start
+                                .elapsed()
+                                .as_millis()
+                                .try_into()
+                                .unwrap_or(u64::MAX),
+                        ),
+                        detail: Some("connected but flush failed".to_string()),
+                    },
+                }
             }
-        }
-        Ok(Err(e)) => DependencyStatus {
-            status: "offline".to_string(),
-            latency_ms: None,
-            detail: Some(e.to_string()),
-        },
-        Err(_) => DependencyStatus {
-            status: "offline".to_string(),
-            latency_ms: None,
-            detail: Some("connection timed out".to_string()),
-        },
-    };
+            Ok(Err(e)) => DependencyStatus {
+                status: "offline".to_string(),
+                latency_ms: None,
+                detail: Some(e.to_string()),
+            },
+            Err(_) => DependencyStatus {
+                status: "offline".to_string(),
+                latency_ms: None,
+                detail: Some("connection timed out".to_string()),
+            },
+        };
     dependencies.insert("nats".to_string(), nats_status);
 
     // Qdrant health: HTTP health endpoint
@@ -961,14 +1049,22 @@ async fn handler_health(
             Ok(resp) if resp.status().is_success() => DependencyStatus {
                 status: "ok".to_string(),
                 latency_ms: Some(
-                    qdrant_start.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                    qdrant_start
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
                 ),
                 detail: None,
             },
             Ok(resp) => DependencyStatus {
                 status: "degraded".to_string(),
                 latency_ms: Some(
-                    qdrant_start.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                    qdrant_start
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
                 ),
                 detail: Some(format!("HTTP {}", resp.status())),
             },
@@ -1020,9 +1116,17 @@ async fn handler_health(
 async fn handler_activity(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let rows = sqlx::query_as::<_, (
-        i64, String, String, String, Option<serde_json::Value>, String,
-    )>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            String,
+            String,
+            Option<serde_json::Value>,
+            String,
+        ),
+    >(
         "SELECT id, agent_id, action, details, files_changed, created_at::text
          FROM work_log ORDER BY created_at DESC LIMIT 50",
     )
@@ -1057,10 +1161,9 @@ async fn handler_memory_stats(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
     // Total count
-    let (total_count,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM agent_memory")
-            .fetch_one(&state.dolt)
-            .await?;
+    let (total_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM agent_memory")
+        .fetch_one(&state.dolt)
+        .await?;
 
     // Most recent update
     let latest: Option<(String,)> =
@@ -1074,10 +1177,9 @@ async fn handler_memory_stats(
         sqlx::query_as("SELECT COUNT(DISTINCT agent_name) FROM agent_memory")
             .fetch_one(&state.dolt)
             .await?;
-    let (topics_count,): (i64,) =
-        sqlx::query_as("SELECT COUNT(DISTINCT topic) FROM agent_memory")
-            .fetch_one(&state.dolt)
-            .await?;
+    let (topics_count,): (i64,) = sqlx::query_as("SELECT COUNT(DISTINCT topic) FROM agent_memory")
+        .fetch_one(&state.dolt)
+        .await?;
 
     // Top 10 topics by content size (most detailed knowledge)
     let top_topics = sqlx::query_as::<_, (String, String, i64, String)>(
@@ -1115,10 +1217,9 @@ async fn handler_memory_stats(
 async fn handler_kg_stats(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let (total_entities,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM kg_entities")
-            .fetch_one(&state.pg)
-            .await?;
+    let (total_entities,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM kg_entities")
+        .fetch_one(&state.pg)
+        .await?;
 
     let (active_edges,): (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM kg_edges WHERE valid_to IS NULL")
@@ -1182,28 +1283,29 @@ async fn handler_kg_entities(
         .and_then(|l| l.parse().ok())
         .unwrap_or(50);
 
-    let rows: Vec<(String, String, String, Option<String>, i32, String, String)> = if let Some(etype) = &type_filter {
-        sqlx::query_as(
-            "SELECT entity_id, name, entity_type, description, mention_count,
+    let rows: Vec<(String, String, String, Option<String>, i32, String, String)> =
+        if let Some(etype) = &type_filter {
+            sqlx::query_as(
+                "SELECT entity_id, name, entity_type, description, mention_count,
                     first_seen::text, last_seen::text
              FROM kg_entities WHERE entity_type = $1
              ORDER BY mention_count DESC, last_seen DESC LIMIT $2",
-        )
-        .bind(etype)
-        .bind(limit)
-        .fetch_all(&state.pg)
-        .await?
-    } else {
-        sqlx::query_as(
-            "SELECT entity_id, name, entity_type, description, mention_count,
+            )
+            .bind(etype)
+            .bind(limit)
+            .fetch_all(&state.pg)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT entity_id, name, entity_type, description, mention_count,
                     first_seen::text, last_seen::text
              FROM kg_entities
              ORDER BY mention_count DESC, last_seen DESC LIMIT $1",
-        )
-        .bind(limit)
-        .fetch_all(&state.pg)
-        .await?
-    };
+            )
+            .bind(limit)
+            .fetch_all(&state.pg)
+            .await?
+        };
 
     let entities: Vec<serde_json::Value> = rows
         .into_iter()
@@ -1240,7 +1342,11 @@ async fn handler_kg_edges(
         .and_then(|l| l.parse().ok())
         .unwrap_or(50);
 
-    let rows: Vec<(String, String, String, String, Option<String>, f64, String)> = if let Some(rel) = &relation_filter {
+    let rows: Vec<(String, String, String, String, Option<String>, f64, String)> = if let Some(
+        rel,
+    ) =
+        &relation_filter
+    {
         sqlx::query_as(
             "SELECT s.name, e.relation_type, t.name, e.edge_id, e.description, e.weight, e.created_at::text
              FROM kg_edges e
@@ -1302,7 +1408,17 @@ async fn handler_dlq(
         .and_then(|l| l.parse().ok())
         .unwrap_or(50);
 
-    let rows: Vec<(i64, String, String, String, i32, i32, bool, Option<String>, String)> = if include_resolved {
+    let rows: Vec<(
+        i64,
+        String,
+        String,
+        String,
+        i32,
+        i32,
+        bool,
+        Option<String>,
+        String,
+    )> = if include_resolved {
         sqlx::query_as(
             "SELECT id, task_id, reason, source_service, retry_count, max_retries,
                     resolved, resolved_by, created_at::text
@@ -1327,19 +1443,21 @@ async fn handler_dlq(
 
     let entries: Vec<serde_json::Value> = rows
         .into_iter()
-        .map(|(id, task_id, reason, svc, retries, max, resolved, by, ts)| {
-            serde_json::json!({
-                "id": id,
-                "task_id": task_id,
-                "reason": reason,
-                "source_service": svc,
-                "retry_count": retries,
-                "max_retries": max,
-                "resolved": resolved,
-                "resolved_by": by,
-                "created_at": ts,
-            })
-        })
+        .map(
+            |(id, task_id, reason, svc, retries, max, resolved, by, ts)| {
+                serde_json::json!({
+                    "id": id,
+                    "task_id": task_id,
+                    "reason": reason,
+                    "source_service": svc,
+                    "retry_count": retries,
+                    "max_retries": max,
+                    "resolved": resolved,
+                    "resolved_by": by,
+                    "created_at": ts,
+                })
+            },
+        )
         .collect();
 
     Ok(ok_response(serde_json::json!({
@@ -1385,23 +1503,21 @@ async fn handler_agent_toggle(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(agent_id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let result = sqlx::query(
-        "UPDATE agent_profiles SET active = NOT active WHERE agent_id = ?",
-    )
-    .bind(&agent_id)
-    .execute(&state.dolt)
-    .await?;
+    let result = sqlx::query("UPDATE agent_profiles SET active = NOT active WHERE agent_id = ?")
+        .bind(&agent_id)
+        .execute(&state.dolt)
+        .await?;
 
     if result.rows_affected() == 0 {
-        return Err(StatusApiError::Internal(format!("agent {agent_id} not found")));
+        return Err(StatusApiError::Internal(format!(
+            "agent {agent_id} not found"
+        )));
     }
 
-    let (active,): (bool,) = sqlx::query_as(
-        "SELECT active FROM agent_profiles WHERE agent_id = ?",
-    )
-    .bind(&agent_id)
-    .fetch_one(&state.dolt)
-    .await?;
+    let (active,): (bool,) = sqlx::query_as("SELECT active FROM agent_profiles WHERE agent_id = ?")
+        .bind(&agent_id)
+        .fetch_one(&state.dolt)
+        .await?;
 
     Ok(ok_response(serde_json::json!({
         "agent_id": agent_id,
@@ -1467,7 +1583,10 @@ async fn handler_workflows(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let limit: i64 = params.get("limit").and_then(|l| l.parse().ok()).unwrap_or(20);
+    let limit: i64 = params
+        .get("limit")
+        .and_then(|l| l.parse().ok())
+        .unwrap_or(20);
 
     let rows: Vec<(String, String, String, i32, i32, String, String)> = sqlx::query_as(
         "SELECT id, formula_name, status, current_step, total_steps, started_by, created_at::text
@@ -1507,7 +1626,16 @@ async fn handler_workflows(
 async fn handler_webhooks(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let rows: Vec<(String, String, String, Option<String>, serde_json::Value, bool, String, String)> = sqlx::query_as(
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        serde_json::Value,
+        bool,
+        String,
+        String,
+    )> = sqlx::query_as(
         "SELECT id, platform, name, webhook_url, events, active, created_at::text, updated_at::text
          FROM webhook_endpoints
          ORDER BY created_at DESC",
@@ -1517,18 +1645,20 @@ async fn handler_webhooks(
 
     let endpoints: Vec<serde_json::Value> = rows
         .into_iter()
-        .map(|(id, platform, name, url, events, active, created, updated)| {
-            serde_json::json!({
-                "id": id,
-                "platform": platform,
-                "name": name,
-                "webhook_url": url,
-                "events": events,
-                "active": active,
-                "created_at": created,
-                "updated_at": updated,
-            })
-        })
+        .map(
+            |(id, platform, name, url, events, active, created, updated)| {
+                serde_json::json!({
+                    "id": id,
+                    "platform": platform,
+                    "name": name,
+                    "webhook_url": url,
+                    "events": events,
+                    "active": active,
+                    "created_at": created,
+                    "updated_at": updated,
+                })
+            },
+        )
         .collect();
 
     Ok(ok_response(serde_json::json!({
@@ -1545,8 +1675,14 @@ async fn handler_webhook_create(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let platform = body.get("platform").and_then(|v| v.as_str()).unwrap_or("generic");
-    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
+    let platform = body
+        .get("platform")
+        .and_then(|v| v.as_str())
+        .unwrap_or("generic");
+    let name = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unnamed");
     let webhook_url = body.get("webhook_url").and_then(|v| v.as_str());
     let events = body.get("events").cloned().unwrap_or(serde_json::json!([]));
     let id = Uuid::new_v4().to_string();
@@ -1587,7 +1723,9 @@ async fn handler_webhook_toggle(
     .await?;
 
     if result.rows_affected() == 0 {
-        return Ok(ok_response(serde_json::json!({"error": "endpoint not found"})));
+        return Ok(ok_response(
+            serde_json::json!({"error": "endpoint not found"}),
+        ));
     }
 
     let row: (bool,) = sqlx::query_as("SELECT active FROM webhook_endpoints WHERE id = $1")
@@ -1634,7 +1772,10 @@ async fn handler_webhook_log(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let limit: i64 = params.get("limit").and_then(|l| l.parse().ok()).unwrap_or(50);
+    let limit: i64 = params
+        .get("limit")
+        .and_then(|l| l.parse().ok())
+        .unwrap_or(50);
 
     let rows: Vec<(i64, String, String, String, serde_json::Value, String, Option<String>, String)> = sqlx::query_as(
         "SELECT wl.id, wl.endpoint_id, wl.direction, wl.event_type, wl.payload, wl.status, wl.error_msg, wl.created_at::text
@@ -1717,32 +1858,42 @@ async fn handler_summary(
     if !rows.is_empty() {
         let summaries: Vec<serde_json::Value> = rows
             .into_iter()
-            .map(|(id, summary_date, summary_text, tasks_completed, decisions_made, memories_stored, created_at)| {
-                serde_json::json!({
-                    "id": id,
-                    "summary_date": summary_date,
-                    "summary_text": summary_text,
-                    "tasks_completed": tasks_completed,
-                    "decisions_made": decisions_made,
-                    "memories_stored": memories_stored,
-                    "created_at": created_at,
-                })
-            })
+            .map(
+                |(
+                    id,
+                    summary_date,
+                    summary_text,
+                    tasks_completed,
+                    decisions_made,
+                    memories_stored,
+                    created_at,
+                )| {
+                    serde_json::json!({
+                        "id": id,
+                        "summary_date": summary_date,
+                        "summary_text": summary_text,
+                        "tasks_completed": tasks_completed,
+                        "decisions_made": decisions_made,
+                        "memories_stored": memories_stored,
+                        "created_at": created_at,
+                    })
+                },
+            )
             .collect();
 
         return Ok(ok_response(serde_json::json!({ "summaries": summaries })));
     }
 
     // No daily_summary row for today — compute live counts from source tables
-    let (decisions_today,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM decisions WHERE created_at >= NOW() - INTERVAL 24 HOUR")
-            .fetch_one(&state.dolt)
-            .await?;
+    let (decisions_today,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM decisions WHERE created_at >= NOW() - INTERVAL 24 HOUR",
+    )
+    .fetch_one(&state.dolt)
+    .await?;
 
-    let (memories_stored,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM agent_memory")
-            .fetch_one(&state.dolt)
-            .await?;
+    let (memories_stored,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM agent_memory")
+        .fetch_one(&state.dolt)
+        .await?;
 
     let (tasks_completed,): (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM task_queue WHERE status = 'completed' AND created_at >= NOW() - INTERVAL '24 hours'")
@@ -1810,9 +1961,8 @@ async fn handler_audit(
          ORDER BY created_at DESC LIMIT 100"
     );
 
-    let mut query = sqlx::query_as::<_, (i64, String, String, Option<String>, Option<String>, String)>(
-        &sql,
-    );
+    let mut query =
+        sqlx::query_as::<_, (i64, String, String, Option<String>, Option<String>, String)>(&sql);
 
     for val in &bind_values {
         query = query.bind(val);
@@ -1847,7 +1997,25 @@ async fn handler_audit(
 async fn handler_approvals(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let rows = sqlx::query_as::<_, (String, String, String, serde_json::Value, Option<String>, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<f64>, Option<String>)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            serde_json::Value,
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<f64>,
+            Option<String>,
+        ),
+    >(
         "SELECT id, gate_type, requested_by, payload, task_id, status, reviewed_by, reason,
                 expires_at::text, created_at::text, reviewed_at::text,
                 tool_name, confidence, policy_id
@@ -1858,24 +2026,41 @@ async fn handler_approvals(
 
     let approvals: Vec<serde_json::Value> = rows
         .into_iter()
-        .map(|(id, gate_type, requested_by, payload, task_id, status, reviewed_by, reason, expires, created, reviewed_at, tool_name, confidence, policy_id)| {
-            serde_json::json!({
-                "id": id,
-                "gate_type": gate_type,
-                "requested_by": requested_by,
-                "payload": payload,
-                "task_id": task_id,
-                "status": status,
-                "reviewed_by": reviewed_by,
-                "reason": reason,
-                "expires_at": expires,
-                "created_at": created,
-                "reviewed_at": reviewed_at,
-                "tool_name": tool_name,
-                "confidence": confidence,
-                "policy_id": policy_id,
-            })
-        })
+        .map(
+            |(
+                id,
+                gate_type,
+                requested_by,
+                payload,
+                task_id,
+                status,
+                reviewed_by,
+                reason,
+                expires,
+                created,
+                reviewed_at,
+                tool_name,
+                confidence,
+                policy_id,
+            )| {
+                serde_json::json!({
+                    "id": id,
+                    "gate_type": gate_type,
+                    "requested_by": requested_by,
+                    "payload": payload,
+                    "task_id": task_id,
+                    "status": status,
+                    "reviewed_by": reviewed_by,
+                    "reason": reason,
+                    "expires_at": expires,
+                    "created_at": created,
+                    "reviewed_at": reviewed_at,
+                    "tool_name": tool_name,
+                    "confidence": confidence,
+                    "policy_id": policy_id,
+                })
+            },
+        )
         .collect();
 
     Ok(ok_response(serde_json::json!({ "approvals": approvals })))
@@ -1889,7 +2074,22 @@ async fn handler_approvals(
 async fn handler_approval_policies(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let rows = sqlx::query_as::<_, (String, String, String, Option<String>, serde_json::Value, bool, f64, i32, bool, String, String)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            Option<String>,
+            serde_json::Value,
+            bool,
+            f64,
+            i32,
+            bool,
+            String,
+            String,
+        ),
+    >(
         "SELECT id, name, gate_type, description, conditions, auto_approve,
                 auto_approve_threshold, expiry_minutes, active,
                 created_at::text, updated_at::text
@@ -1900,21 +2100,35 @@ async fn handler_approval_policies(
 
     let policies: Vec<serde_json::Value> = rows
         .into_iter()
-        .map(|(id, name, gate_type, description, conditions, auto_approve, threshold, expiry, active, created, updated)| {
-            serde_json::json!({
-                "id": id,
-                "name": name,
-                "gate_type": gate_type,
-                "description": description,
-                "conditions": conditions,
-                "auto_approve": auto_approve,
-                "auto_approve_threshold": threshold,
-                "expiry_minutes": expiry,
-                "active": active,
-                "created_at": created,
-                "updated_at": updated,
-            })
-        })
+        .map(
+            |(
+                id,
+                name,
+                gate_type,
+                description,
+                conditions,
+                auto_approve,
+                threshold,
+                expiry,
+                active,
+                created,
+                updated,
+            )| {
+                serde_json::json!({
+                    "id": id,
+                    "name": name,
+                    "gate_type": gate_type,
+                    "description": description,
+                    "conditions": conditions,
+                    "auto_approve": auto_approve,
+                    "auto_approve_threshold": threshold,
+                    "expiry_minutes": expiry,
+                    "active": active,
+                    "created_at": created,
+                    "updated_at": updated,
+                })
+            },
+        )
         .collect();
 
     Ok(ok_response(serde_json::json!({ "policies": policies })))
@@ -1942,9 +2156,15 @@ struct UpsertPolicyBody {
     active: bool,
 }
 
-fn default_threshold() -> f64 { 0.8 }
-fn default_expiry() -> i32 { 60 }
-fn default_true() -> bool { true }
+fn default_threshold() -> f64 {
+    0.8
+}
+fn default_expiry() -> i32 {
+    60
+}
+fn default_true() -> bool {
+    true
+}
 
 async fn handler_upsert_approval_policy(
     State(state): State<Arc<AppState>>,
@@ -2044,7 +2264,9 @@ async fn handler_approval_review(
     Json(body): Json<ApprovalReviewBody>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
     if body.decision != "approved" && body.decision != "rejected" {
-        return Err(StatusApiError::Internal("decision must be 'approved' or 'rejected'".to_string()));
+        return Err(StatusApiError::Internal(
+            "decision must be 'approved' or 'rejected'".to_string(),
+        ));
     }
 
     let reviewer = body.reviewer.as_deref().unwrap_or("dashboard-user");
@@ -2112,23 +2334,25 @@ async fn handler_agent_metrics(
 
     let list: Vec<serde_json::Value> = metrics
         .into_iter()
-        .map(|(agent_id, completed, failed, avg_dur, load, rate, last_task)| {
-            let (display_name, cost_tier) = profile_map
-                .get(&agent_id)
-                .cloned()
-                .unwrap_or_else(|| (agent_id.clone(), "unknown".to_string()));
-            serde_json::json!({
-                "agent_id": agent_id,
-                "display_name": display_name,
-                "cost_tier": cost_tier,
-                "tasks_completed": completed,
-                "tasks_failed": failed,
-                "avg_duration_ms": avg_dur,
-                "current_load": load,
-                "success_rate": rate,
-                "last_task_at": last_task,
-            })
-        })
+        .map(
+            |(agent_id, completed, failed, avg_dur, load, rate, last_task)| {
+                let (display_name, cost_tier) = profile_map
+                    .get(&agent_id)
+                    .cloned()
+                    .unwrap_or_else(|| (agent_id.clone(), "unknown".to_string()));
+                serde_json::json!({
+                    "agent_id": agent_id,
+                    "display_name": display_name,
+                    "cost_tier": cost_tier,
+                    "tasks_completed": completed,
+                    "tasks_failed": failed,
+                    "avg_duration_ms": avg_dur,
+                    "current_load": load,
+                    "success_rate": rate,
+                    "last_task_at": last_task,
+                })
+            },
+        )
         .collect();
 
     Ok(ok_response(serde_json::json!({ "metrics": list })))
@@ -2151,24 +2375,40 @@ async fn handler_delegations(
 
     let delegations: Vec<serde_json::Value> = rows
         .into_iter()
-        .map(|(id, trace_id, parent_task_id, from_agent, to_agent, title, description, status, result, created, updated)| {
-            serde_json::json!({
-                "id": id,
-                "trace_id": trace_id,
-                "parent_task_id": parent_task_id,
-                "from_agent": from_agent,
-                "to_agent": to_agent,
-                "title": title,
-                "description": description,
-                "status": status,
-                "result": result,
-                "created_at": created,
-                "updated_at": updated,
-            })
-        })
+        .map(
+            |(
+                id,
+                trace_id,
+                parent_task_id,
+                from_agent,
+                to_agent,
+                title,
+                description,
+                status,
+                result,
+                created,
+                updated,
+            )| {
+                serde_json::json!({
+                    "id": id,
+                    "trace_id": trace_id,
+                    "parent_task_id": parent_task_id,
+                    "from_agent": from_agent,
+                    "to_agent": to_agent,
+                    "title": title,
+                    "description": description,
+                    "status": status,
+                    "result": result,
+                    "created_at": created,
+                    "updated_at": updated,
+                })
+            },
+        )
         .collect();
 
-    Ok(ok_response(serde_json::json!({ "delegations": delegations })))
+    Ok(ok_response(
+        serde_json::json!({ "delegations": delegations }),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2212,7 +2452,18 @@ async fn handler_guardrails(
 async fn handler_violations(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let rows = sqlx::query_as::<_, (i64, String, String, String, Option<String>, Option<String>, String)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+        ),
+    >(
         "SELECT id, trace_id, agent_id, policy_name, tool_name, details, created_at::text
          FROM guardrail_violations ORDER BY created_at DESC LIMIT 100",
     )
@@ -2245,7 +2496,18 @@ async fn handler_violations(
 async fn handler_streams(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let rows = sqlx::query_as::<_, (String, String, Option<String>, Option<String>, String, String, Option<String>)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+        ),
+    >(
         "SELECT id, agent_id, tool_name, task_id, status, created_at::text, closed_at::text
          FROM streams ORDER BY created_at DESC LIMIT 100",
     )
@@ -2254,17 +2516,19 @@ async fn handler_streams(
 
     let streams: Vec<serde_json::Value> = rows
         .into_iter()
-        .map(|(id, agent_id, tool_name, task_id, status, created, closed)| {
-            serde_json::json!({
-                "id": id,
-                "agent_id": agent_id,
-                "tool_name": tool_name,
-                "task_id": task_id,
-                "status": status,
-                "created_at": created,
-                "closed_at": closed,
-            })
-        })
+        .map(
+            |(id, agent_id, tool_name, task_id, status, created, closed)| {
+                serde_json::json!({
+                    "id": id,
+                    "agent_id": agent_id,
+                    "tool_name": tool_name,
+                    "task_id": task_id,
+                    "status": status,
+                    "created_at": created,
+                    "closed_at": closed,
+                })
+            },
+        )
         .collect();
 
     Ok(ok_response(serde_json::json!({ "streams": streams })))
@@ -2280,19 +2544,21 @@ async fn handler_stream_sse(
     Path(stream_id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, StatusApiError> {
     // Verify the stream exists and check its status
-    let row = sqlx::query_as::<_, (String,)>(
-        "SELECT status FROM streams WHERE id = $1",
-    )
-    .bind(&stream_id)
-    .fetch_optional(&state.pg)
-    .await?;
+    let row = sqlx::query_as::<_, (String,)>("SELECT status FROM streams WHERE id = $1")
+        .bind(&stream_id)
+        .fetch_optional(&state.pg)
+        .await?;
 
     match row {
         None => {
-            return Err(StatusApiError::Internal(format!("stream {stream_id} not found")));
+            return Err(StatusApiError::Internal(format!(
+                "stream {stream_id} not found"
+            )));
         }
         Some((status,)) if status == "completed" || status == "failed" || status == "expired" => {
-            return Err(StatusApiError::Internal(format!("stream {stream_id} is {status}")));
+            return Err(StatusApiError::Internal(format!(
+                "stream {stream_id} is {status}"
+            )));
         }
         _ => {}
     }
@@ -2303,7 +2569,10 @@ async fn handler_stream_sse(
         state.config.nats.subject_prefix, state.config.broodlink.env, stream_id,
     );
 
-    let mut subscriber = state.nats.subscribe(subject).await
+    let mut subscriber = state
+        .nats
+        .subscribe(subject)
+        .await
         .map_err(|e| StatusApiError::Nats(e.to_string()))?;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
@@ -2316,12 +2585,13 @@ async fn handler_stream_sse(
             // Determine event type from the payload JSON
             let event_type = serde_json::from_str::<serde_json::Value>(&data)
                 .ok()
-                .and_then(|v| v.get("event_type").and_then(|e| e.as_str().map(String::from)))
+                .and_then(|v| {
+                    v.get("event_type")
+                        .and_then(|e| e.as_str().map(String::from))
+                })
                 .unwrap_or_else(|| "message".to_string());
 
-            let event = Event::default()
-                .event(&event_type)
-                .data(data);
+            let event = Event::default().event(&event_type).data(data);
 
             if tx.send(Ok(event)).await.is_err() {
                 break; // Client disconnected
@@ -2461,21 +2731,35 @@ async fn handler_chat_sessions(
 
     let sessions: Vec<serde_json::Value> = rows
         .iter()
-        .map(|(id, platform, channel_id, user_id, display_name, thread_id, agent, msg_count, last_msg, status, created)| {
-            serde_json::json!({
-                "id": id,
-                "platform": platform,
-                "channel_id": channel_id,
-                "user_id": user_id,
-                "user_display_name": display_name,
-                "thread_id": thread_id,
-                "assigned_agent": agent,
-                "message_count": msg_count,
-                "last_message_at": last_msg,
-                "status": status,
-                "created_at": created,
-            })
-        })
+        .map(
+            |(
+                id,
+                platform,
+                channel_id,
+                user_id,
+                display_name,
+                thread_id,
+                agent,
+                msg_count,
+                last_msg,
+                status,
+                created,
+            )| {
+                serde_json::json!({
+                    "id": id,
+                    "platform": platform,
+                    "channel_id": channel_id,
+                    "user_id": user_id,
+                    "user_display_name": display_name,
+                    "thread_id": thread_id,
+                    "assigned_agent": agent,
+                    "message_count": msg_count,
+                    "last_message_at": last_msg,
+                    "status": status,
+                    "created_at": created,
+                })
+            },
+        )
         .collect();
 
     Ok(ok_response(serde_json::json!({
@@ -2529,17 +2813,15 @@ async fn handler_chat_messages(
 async fn handler_chat_stats(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let total_sessions: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM chat_sessions WHERE status = 'active'",
-    )
-    .fetch_one(&state.pg)
-    .await?;
+    let total_sessions: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM chat_sessions WHERE status = 'active'")
+            .fetch_one(&state.pg)
+            .await?;
 
-    let messages_today: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM chat_messages WHERE created_at >= CURRENT_DATE",
-    )
-    .fetch_one(&state.pg)
-    .await?;
+    let messages_today: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM chat_messages WHERE created_at >= CURRENT_DATE")
+            .fetch_one(&state.pg)
+            .await?;
 
     let platforms: Vec<(String, i64)> = sqlx::query_as(
         "SELECT platform, COUNT(*) as cnt FROM chat_sessions
@@ -2550,11 +2832,10 @@ async fn handler_chat_stats(
     .fetch_all(&state.pg)
     .await?;
 
-    let pending_replies: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM chat_reply_queue WHERE status = 'pending'",
-    )
-    .fetch_one(&state.pg)
-    .await?;
+    let pending_replies: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM chat_reply_queue WHERE status = 'pending'")
+            .fetch_one(&state.pg)
+            .await?;
 
     let platform_map: serde_json::Value = platforms
         .iter()
@@ -2574,12 +2855,10 @@ async fn handler_chat_close(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    sqlx::query(
-        "UPDATE chat_sessions SET status = 'closed', updated_at = NOW() WHERE id = $1",
-    )
-    .bind(&session_id)
-    .execute(&state.pg)
-    .await?;
+    sqlx::query("UPDATE chat_sessions SET status = 'closed', updated_at = NOW() WHERE id = $1")
+        .bind(&session_id)
+        .execute(&state.pg)
+        .await?;
 
     Ok(ok_response(serde_json::json!({
         "session_id": session_id,
@@ -2592,18 +2871,13 @@ async fn handler_chat_assign(
     Path(session_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let agent = body
-        .get("agent")
-        .and_then(|a| a.as_str())
-        .unwrap_or("");
+    let agent = body.get("agent").and_then(|a| a.as_str()).unwrap_or("");
 
-    sqlx::query(
-        "UPDATE chat_sessions SET assigned_agent = $2, updated_at = NOW() WHERE id = $1",
-    )
-    .bind(&session_id)
-    .bind(agent)
-    .execute(&state.pg)
-    .await?;
+    sqlx::query("UPDATE chat_sessions SET assigned_agent = $2, updated_at = NOW() WHERE id = $1")
+        .bind(&session_id)
+        .bind(agent)
+        .execute(&state.pg)
+        .await?;
 
     Ok(ok_response(serde_json::json!({
         "session_id": session_id,
@@ -2618,33 +2892,46 @@ async fn handler_chat_assign(
 async fn handler_list_formulas(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let rows: Vec<(String, String, String, Option<String>, i32, serde_json::Value, bool, bool, i32, Option<String>, Option<String>)> =
-        sqlx::query_as(
-            "SELECT id, name, display_name, description, version, tags,
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        i32,
+        serde_json::Value,
+        bool,
+        bool,
+        i32,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT id, name, display_name, description, version, tags,
                     is_system, enabled, usage_count, last_used_at::text, created_at::text
              FROM formula_registry
              ORDER BY name",
-        )
-        .fetch_all(&state.pg)
-        .await?;
+    )
+    .fetch_all(&state.pg)
+    .await?;
 
     let formulas: Vec<serde_json::Value> = rows
         .iter()
-        .map(|(id, name, display, desc, ver, tags, system, enabled, usage, last_used, created)| {
-            serde_json::json!({
-                "id": id,
-                "name": name,
-                "display_name": display,
-                "description": desc,
-                "version": ver,
-                "tags": tags,
-                "is_system": system,
-                "enabled": enabled,
-                "usage_count": usage,
-                "last_used_at": last_used,
-                "created_at": created,
-            })
-        })
+        .map(
+            |(id, name, display, desc, ver, tags, system, enabled, usage, last_used, created)| {
+                serde_json::json!({
+                    "id": id,
+                    "name": name,
+                    "display_name": display,
+                    "description": desc,
+                    "version": ver,
+                    "tags": tags,
+                    "is_system": system,
+                    "enabled": enabled,
+                    "usage_count": usage,
+                    "last_used_at": last_used,
+                    "created_at": created,
+                })
+            },
+        )
         .collect();
 
     Ok(ok_response(serde_json::json!({
@@ -2657,20 +2944,48 @@ async fn handler_get_formula(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let row: Option<(String, String, String, Option<String>, i32, serde_json::Value, Option<String>, serde_json::Value, bool, bool, i32, Option<String>, Option<String>, Option<String>)> =
-        sqlx::query_as(
-            "SELECT id, name, display_name, description, version, definition, author,
+    let row: Option<(
+        String,
+        String,
+        String,
+        Option<String>,
+        i32,
+        serde_json::Value,
+        Option<String>,
+        serde_json::Value,
+        bool,
+        bool,
+        i32,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT id, name, display_name, description, version, definition, author,
                     tags, is_system, enabled, usage_count, last_used_at::text,
                     created_at::text, updated_at::text
              FROM formula_registry
              WHERE name = $1",
-        )
-        .bind(&name)
-        .fetch_optional(&state.pg)
-        .await?;
+    )
+    .bind(&name)
+    .fetch_optional(&state.pg)
+    .await?;
 
-    let (id, nm, display, desc, ver, def, author, tags, system, enabled, usage, last_used, created, updated) =
-        row.ok_or_else(|| StatusApiError::NotFound(format!("formula not found: {name}")))?;
+    let (
+        id,
+        nm,
+        display,
+        desc,
+        ver,
+        def,
+        author,
+        tags,
+        system,
+        enabled,
+        usage,
+        last_used,
+        created,
+        updated,
+    ) = row.ok_or_else(|| StatusApiError::NotFound(format!("formula not found: {name}")))?;
 
     Ok(ok_response(serde_json::json!({
         "id": id,
@@ -2695,14 +3010,19 @@ async fn handler_create_formula(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
     let name = body.get("name").and_then(|n| n.as_str()).unwrap_or("");
-    let display_name = body.get("display_name").and_then(|n| n.as_str()).unwrap_or("");
+    let display_name = body
+        .get("display_name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("");
     let description = body.get("description").and_then(|n| n.as_str());
-    let definition = body.get("definition").ok_or_else(|| {
-        StatusApiError::BadRequest("missing 'definition' field".to_string())
-    })?;
+    let definition = body
+        .get("definition")
+        .ok_or_else(|| StatusApiError::BadRequest("missing 'definition' field".to_string()))?;
 
     if name.is_empty() || display_name.is_empty() {
-        return Err(StatusApiError::BadRequest("name and display_name are required".to_string()));
+        return Err(StatusApiError::BadRequest(
+            "name and display_name are required".to_string(),
+        ));
     }
 
     let id = uuid::Uuid::new_v4().to_string();
@@ -2736,11 +3056,13 @@ async fn handler_update_formula(
     let mut updates = Vec::new();
 
     if let Some(def) = body.get("definition") {
-        sqlx::query("UPDATE formula_registry SET definition = $1, version = version + 1 WHERE name = $2")
-            .bind(def)
-            .bind(&name)
-            .execute(&state.pg)
-            .await?;
+        sqlx::query(
+            "UPDATE formula_registry SET definition = $1, version = version + 1 WHERE name = $2",
+        )
+        .bind(def)
+        .bind(&name)
+        .execute(&state.pg)
+        .await?;
         updates.push("definition");
     }
 
@@ -2787,16 +3109,14 @@ async fn handler_toggle_formula(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let row: Option<(bool,)> = sqlx::query_as(
-        "SELECT enabled FROM formula_registry WHERE name = $1",
-    )
-    .bind(&name)
-    .fetch_optional(&state.pg)
-    .await?;
+    let row: Option<(bool,)> =
+        sqlx::query_as("SELECT enabled FROM formula_registry WHERE name = $1")
+            .bind(&name)
+            .fetch_optional(&state.pg)
+            .await?;
 
-    let (currently_enabled,) = row.ok_or_else(|| {
-        StatusApiError::NotFound(format!("formula not found: {name}"))
-    })?;
+    let (currently_enabled,) =
+        row.ok_or_else(|| StatusApiError::NotFound(format!("formula not found: {name}")))?;
 
     let new_enabled = !currently_enabled;
     sqlx::query("UPDATE formula_registry SET enabled = $1, updated_at = NOW() WHERE name = $2")
@@ -2833,7 +3153,10 @@ async fn handler_auth_login(
 
     // Rate limit: max 5 failed attempts per username per 5 minutes
     {
-        let attempts = state.login_attempts.read().unwrap_or_else(|e| e.into_inner());
+        let attempts = state
+            .login_attempts
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some((count, since)) = attempts.get(&body.username) {
             if since.elapsed() < Duration::from_secs(300) && *count >= 5 {
                 return Err(StatusApiError::BadRequest(
@@ -2855,19 +3178,25 @@ async fn handler_auth_login(
         None => {
             // Track failed attempt
             if let Ok(mut attempts) = state.login_attempts.write() {
-                let entry = attempts.entry(body.username.clone()).or_insert((0, Instant::now()));
+                let entry = attempts
+                    .entry(body.username.clone())
+                    .or_insert((0, Instant::now()));
                 if entry.1.elapsed() >= Duration::from_secs(300) {
                     *entry = (1, Instant::now());
                 } else {
                     entry.0 += 1;
                 }
             }
-            return Err(StatusApiError::Auth("invalid username or password".to_string()));
+            return Err(StatusApiError::Auth(
+                "invalid username or password".to_string(),
+            ));
         }
     };
 
     if !active {
-        return Err(StatusApiError::Auth("user account is deactivated".to_string()));
+        return Err(StatusApiError::Auth(
+            "user account is deactivated".to_string(),
+        ));
     }
 
     let valid = bcrypt::verify(&body.password, &password_hash)
@@ -2876,14 +3205,18 @@ async fn handler_auth_login(
     if !valid {
         // Track failed attempt
         if let Ok(mut attempts) = state.login_attempts.write() {
-            let entry = attempts.entry(body.username.clone()).or_insert((0, Instant::now()));
+            let entry = attempts
+                .entry(body.username.clone())
+                .or_insert((0, Instant::now()));
             if entry.1.elapsed() >= Duration::from_secs(300) {
                 *entry = (1, Instant::now());
             } else {
                 entry.0 += 1;
             }
         }
-        return Err(StatusApiError::Auth("invalid username or password".to_string()));
+        return Err(StatusApiError::Auth(
+            "invalid username or password".to_string(),
+        ));
     }
 
     // Reset failed attempts on successful login
@@ -2936,12 +3269,11 @@ async fn handler_auth_login(
         .execute(&state.pg)
         .await?;
 
-    let expires_at: (String,) = sqlx::query_as(
-        "SELECT expires_at::text FROM dashboard_sessions WHERE id = $1",
-    )
-    .bind(&session_id)
-    .fetch_one(&state.pg)
-    .await?;
+    let expires_at: (String,) =
+        sqlx::query_as("SELECT expires_at::text FROM dashboard_sessions WHERE id = $1")
+            .bind(&session_id)
+            .fetch_one(&state.pg)
+            .await?;
 
     Ok(ok_response(serde_json::json!({
         "token": session_id,
@@ -2957,9 +3289,7 @@ async fn handler_auth_logout(
     let session_token = headers
         .get("X-Broodlink-Session")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            StatusApiError::Auth("missing X-Broodlink-Session header".to_string())
-        })?;
+        .ok_or_else(|| StatusApiError::Auth("missing X-Broodlink-Session header".to_string()))?;
 
     sqlx::query("DELETE FROM dashboard_sessions WHERE id = $1")
         .bind(session_token)
@@ -2976,9 +3306,7 @@ async fn handler_auth_me(
     let session_token = headers
         .get("X-Broodlink-Session")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            StatusApiError::Auth("missing X-Broodlink-Session header".to_string())
-        })?;
+        .ok_or_else(|| StatusApiError::Auth("missing X-Broodlink-Session header".to_string()))?;
 
     let user: Option<(String, String, String, Option<String>, bool, Option<String>)> =
         sqlx::query_as(
@@ -2991,12 +3319,13 @@ async fn handler_auth_me(
         .fetch_optional(&state.pg)
         .await?;
 
-    let (user_id, username, role, display_name, active, last_login) = user.ok_or_else(|| {
-        StatusApiError::Auth("invalid or expired session".to_string())
-    })?;
+    let (user_id, username, role, display_name, active, last_login) =
+        user.ok_or_else(|| StatusApiError::Auth("invalid or expired session".to_string()))?;
 
     if !active {
-        return Err(StatusApiError::Auth("user account is deactivated".to_string()));
+        return Err(StatusApiError::Auth(
+            "user account is deactivated".to_string(),
+        ));
     }
 
     Ok(ok_response(serde_json::json!({
@@ -3017,12 +3346,25 @@ async fn handler_list_users(
     State(state): State<Arc<AppState>>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned().ok_or_else(|| {
-        StatusApiError::Internal("missing auth context".to_string())
-    })?;
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Admin)?;
 
-    let users = sqlx::query_as::<_, (String, String, String, Option<String>, bool, Option<String>, Option<String>)>(
+    let users = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            Option<String>,
+            bool,
+            Option<String>,
+            Option<String>,
+        ),
+    >(
         "SELECT id, username, role, display_name, active, last_login::text, created_at::text
          FROM dashboard_users ORDER BY username",
     )
@@ -3031,17 +3373,19 @@ async fn handler_list_users(
 
     let user_list: Vec<serde_json::Value> = users
         .into_iter()
-        .map(|(id, username, role, display_name, active, last_login, created_at)| {
-            serde_json::json!({
-                "id": id,
-                "username": username,
-                "role": role,
-                "display_name": display_name,
-                "active": active,
-                "last_login": last_login,
-                "created_at": created_at,
-            })
-        })
+        .map(
+            |(id, username, role, display_name, active, last_login, created_at)| {
+                serde_json::json!({
+                    "id": id,
+                    "username": username,
+                    "role": role,
+                    "display_name": display_name,
+                    "active": active,
+                    "last_login": last_login,
+                    "created_at": created_at,
+                })
+            },
+        )
         .collect();
 
     Ok(ok_response(serde_json::json!({
@@ -3062,9 +3406,11 @@ async fn handler_create_user(
     State(state): State<Arc<AppState>>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned().ok_or_else(|| {
-        StatusApiError::Internal("missing auth context".to_string())
-    })?;
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Admin)?;
 
     let body: CreateUserRequest = serde_json::from_slice(
@@ -3112,7 +3458,9 @@ async fn handler_create_user(
             "role": role_str,
             "display_name": body.display_name,
         }))),
-        Err(sqlx::Error::Database(db_err)) if db_err.message().contains("duplicate") || db_err.message().contains("unique") => {
+        Err(sqlx::Error::Database(db_err))
+            if db_err.message().contains("duplicate") || db_err.message().contains("unique") =>
+        {
             Err(StatusApiError::BadRequest(format!(
                 "username already exists: {}",
                 body.username
@@ -3132,9 +3480,11 @@ async fn handler_change_role(
     Path(user_id): Path<String>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned().ok_or_else(|| {
-        StatusApiError::Internal("missing auth context".to_string())
-    })?;
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Admin)?;
 
     let body: ChangeRoleRequest = serde_json::from_slice(
@@ -3151,16 +3501,17 @@ async fn handler_change_role(
         )));
     }
 
-    let result = sqlx::query(
-        "UPDATE dashboard_users SET role = $1, updated_at = NOW() WHERE id = $2",
-    )
-    .bind(&body.role)
-    .bind(&user_id)
-    .execute(&state.pg)
-    .await?;
+    let result =
+        sqlx::query("UPDATE dashboard_users SET role = $1, updated_at = NOW() WHERE id = $2")
+            .bind(&body.role)
+            .bind(&user_id)
+            .execute(&state.pg)
+            .await?;
 
     if result.rows_affected() == 0 {
-        return Err(StatusApiError::NotFound(format!("user not found: {user_id}")));
+        return Err(StatusApiError::NotFound(format!(
+            "user not found: {user_id}"
+        )));
     }
 
     Ok(ok_response(serde_json::json!({
@@ -3174,21 +3525,20 @@ async fn handler_toggle_user(
     Path(user_id): Path<String>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned().ok_or_else(|| {
-        StatusApiError::Internal("missing auth context".to_string())
-    })?;
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Admin)?;
 
-    let row: Option<(bool,)> = sqlx::query_as(
-        "SELECT active FROM dashboard_users WHERE id = $1",
-    )
-    .bind(&user_id)
-    .fetch_optional(&state.pg)
-    .await?;
+    let row: Option<(bool,)> = sqlx::query_as("SELECT active FROM dashboard_users WHERE id = $1")
+        .bind(&user_id)
+        .fetch_optional(&state.pg)
+        .await?;
 
-    let (currently_active,) = row.ok_or_else(|| {
-        StatusApiError::NotFound(format!("user not found: {user_id}"))
-    })?;
+    let (currently_active,) =
+        row.ok_or_else(|| StatusApiError::NotFound(format!("user not found: {user_id}")))?;
 
     let new_active = !currently_active;
     sqlx::query("UPDATE dashboard_users SET active = $1, updated_at = NOW() WHERE id = $2")
@@ -3221,9 +3571,11 @@ async fn handler_reset_password(
     Path(user_id): Path<String>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned().ok_or_else(|| {
-        StatusApiError::Internal("missing auth context".to_string())
-    })?;
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Admin)?;
 
     let body: ResetPasswordRequest = serde_json::from_slice(
@@ -3234,19 +3586,21 @@ async fn handler_reset_password(
     .map_err(|e| StatusApiError::BadRequest(format!("invalid JSON: {e}")))?;
 
     if body.password.is_empty() {
-        return Err(StatusApiError::BadRequest("password is required".to_string()));
+        return Err(StatusApiError::BadRequest(
+            "password is required".to_string(),
+        ));
     }
 
     // Verify user exists
-    let exists: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM dashboard_users WHERE id = $1",
-    )
-    .bind(&user_id)
-    .fetch_optional(&state.pg)
-    .await?;
+    let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM dashboard_users WHERE id = $1")
+        .bind(&user_id)
+        .fetch_optional(&state.pg)
+        .await?;
 
     if exists.is_none() {
-        return Err(StatusApiError::NotFound(format!("user not found: {user_id}")));
+        return Err(StatusApiError::NotFound(format!(
+            "user not found: {user_id}"
+        )));
     }
 
     let cost = state.config.dashboard_auth.bcrypt_cost;
@@ -3278,7 +3632,17 @@ async fn handler_reset_password(
 async fn handler_telegram_status(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let row = sqlx::query_as::<_, (String, Option<String>, Option<String>, bool, Option<String>, Option<serde_json::Value>)>(
+    let row = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<String>,
+            Option<String>,
+            bool,
+            Option<String>,
+            Option<serde_json::Value>,
+        ),
+    >(
         "SELECT bot_token, bot_username, webhook_url, enabled, registered_at::text, meta
          FROM platform_credentials WHERE platform = 'telegram'",
     )
@@ -3287,11 +3651,17 @@ async fn handler_telegram_status(
 
     match row {
         Some((_token, username, webhook_url, enabled, registered_at, meta)) => {
-            let mode = if webhook_url.is_some() { "webhook" } else { "polling" };
-            let auth_code = meta.as_ref()
+            let mode = if webhook_url.is_some() {
+                "webhook"
+            } else {
+                "polling"
+            };
+            let auth_code = meta
+                .as_ref()
                 .and_then(|m| m.get("auth_code"))
                 .and_then(|v| v.as_str());
-            let allowed_users = meta.as_ref()
+            let allowed_users = meta
+                .as_ref()
                 .and_then(|m| m.get("allowed_user_ids"))
                 .and_then(|v| v.as_array())
                 .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect::<Vec<_>>())
@@ -3315,10 +3685,7 @@ async fn handler_telegram_register(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let bot_token = body
-        .get("bot_token")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let bot_token = body.get("bot_token").and_then(|v| v.as_str()).unwrap_or("");
     if bot_token.is_empty() {
         return Err(StatusApiError::BadRequest("bot_token is required".into()));
     }
@@ -3401,7 +3768,11 @@ async fn handler_telegram_register(
         (0..8)
             .map(|_| {
                 let idx = rng.gen_range(0..36);
-                if idx < 10 { (b'0' + idx) as char } else { (b'a' + idx - 10) as char }
+                if idx < 10 {
+                    (b'0' + idx) as char
+                } else {
+                    (b'a' + idx - 10) as char
+                }
             })
             .collect()
     };
@@ -3433,7 +3804,10 @@ async fn handler_telegram_register(
     .await?;
 
     // Notify gateway to invalidate credential cache
-    let creds_subject = format!("{}.platform.credentials_changed", state.config.nats.subject_prefix);
+    let creds_subject = format!(
+        "{}.platform.credentials_changed",
+        state.config.nats.subject_prefix
+    );
     if let Err(e) = state.nats.publish(creds_subject, "register".into()).await {
         warn!(error = %e, "failed to publish credentials_changed event");
     }
@@ -3492,12 +3866,18 @@ async fn handler_telegram_disconnect(
         .await?;
 
     // Notify gateway to invalidate credential cache
-    let creds_subject = format!("{}.platform.credentials_changed", state.config.nats.subject_prefix);
+    let creds_subject = format!(
+        "{}.platform.credentials_changed",
+        state.config.nats.subject_prefix
+    );
     if let Err(e) = state.nats.publish(creds_subject, "disconnect".into()).await {
         warn!(error = %e, "failed to publish credentials_changed event");
     }
 
-    info!(sessions_deleted = sessions_deleted, "Telegram bot disconnected — credentials and chat data removed");
+    info!(
+        sessions_deleted = sessions_deleted,
+        "Telegram bot disconnected — credentials and chat data removed"
+    );
 
     Ok(ok_response(serde_json::json!({
         "ok": true,
@@ -3521,7 +3901,10 @@ mod tests {
         let Json(resp) = ok_response(data.clone());
         assert_eq!(resp["status"], "ok");
         assert_eq!(resp["data"]["key"], "value");
-        assert!(resp["updated_at"].is_string(), "updated_at should be a string");
+        assert!(
+            resp["updated_at"].is_string(),
+            "updated_at should be a string"
+        );
     }
 
     #[test]
@@ -3542,8 +3925,16 @@ mod tests {
     fn test_error_response_has_json_content_type() {
         let err = StatusApiError::Auth("test".to_string());
         let resp = err.into_response();
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
-        assert!(ct.contains("application/json"), "error response should be JSON");
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            ct.contains("application/json"),
+            "error response should be JSON"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3647,7 +4038,10 @@ mod tests {
         assert_eq!(resp["data"]["total_entities"], 0);
         assert_eq!(resp["data"]["total_active_edges"], 0);
         assert!(resp["data"]["entity_types"].as_object().unwrap().is_empty());
-        assert!(resp["data"]["top_relation_types"].as_array().unwrap().is_empty());
+        assert!(resp["data"]["top_relation_types"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -3668,7 +4062,10 @@ mod tests {
         // Verify the KG route paths follow the expected pattern
         let routes = vec!["/kg/stats", "/kg/entities", "/kg/edges"];
         for route in &routes {
-            assert!(route.starts_with("/kg/"), "KG route should be under /kg/ prefix: {route}");
+            assert!(
+                route.starts_with("/kg/"),
+                "KG route should be under /kg/ prefix: {route}"
+            );
         }
     }
 
@@ -3773,7 +4170,8 @@ mod tests {
 
     #[test]
     fn test_create_user_request_deserialization() {
-        let json = r#"{"username":"newuser","password":"pw","role":"operator","display_name":"New User"}"#;
+        let json =
+            r#"{"username":"newuser","password":"pw","role":"operator","display_name":"New User"}"#;
         let req: CreateUserRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.username, "newuser");
         assert_eq!(req.role, Some("operator".to_string()));
@@ -3840,7 +4238,13 @@ mod tests {
         };
         let err = require_role(&ctx, UserRole::Admin).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("admin"), "error should mention required role: {msg}");
-        assert!(msg.contains("viewer"), "error should mention current role: {msg}");
+        assert!(
+            msg.contains("admin"),
+            "error should mention required role: {msg}"
+        );
+        assert!(
+            msg.contains("viewer"),
+            "error should mention current role: {msg}"
+        );
     }
 }

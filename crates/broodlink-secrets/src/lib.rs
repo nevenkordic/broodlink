@@ -19,9 +19,6 @@
  * <https://www.gnu.org/licenses/>.
  */
 
-#![deny(clippy::unwrap_used)]
-#![deny(clippy::expect_used)]
-#![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
 use std::collections::HashMap;
@@ -208,13 +205,7 @@ impl SecretsProvider for InfisicalProvider {
                 tokio::time::sleep(delay).await;
             }
 
-            match self
-                .client
-                .get(&url)
-                .bearer_auth(&self.token)
-                .send()
-                .await
-            {
+            match self.client.get(&url).bearer_auth(&self.token).send().await {
                 Ok(resp) => {
                     if resp.status() == reqwest::StatusCode::NOT_FOUND {
                         return Err(SecretsError::NotFound(key.to_string()));
@@ -288,6 +279,8 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// # Errors
+/// Returns `SecretsError` if the provider name is unknown or required parameters are missing.
 pub fn create_provider(
     provider: &str,
     sops_file: Option<&str>,
@@ -339,14 +332,20 @@ mod tests {
             None,
             None,
         );
-        assert!(result.is_ok(), "sops provider with valid args should succeed");
+        assert!(
+            result.is_ok(),
+            "sops provider with valid args should succeed"
+        );
     }
 
     #[test]
     fn test_sops_missing_sops_file() {
         let result = create_provider("sops", None, Some("key.txt"), None, None);
         match result {
-            Err(e) => assert!(e.to_string().contains("sops_file"), "error should mention sops_file"),
+            Err(e) => assert!(
+                e.to_string().contains("sops_file"),
+                "error should mention sops_file"
+            ),
             Ok(_) => panic!("sops without sops_file should fail"),
         }
     }
@@ -355,7 +354,10 @@ mod tests {
     fn test_sops_missing_age_identity() {
         let result = create_provider("sops", Some("secrets.json"), None, None, None);
         match result {
-            Err(e) => assert!(e.to_string().contains("age_identity"), "error should mention age_identity"),
+            Err(e) => assert!(
+                e.to_string().contains("age_identity"),
+                "error should mention age_identity"
+            ),
             Ok(_) => panic!("sops without age_identity should fail"),
         }
     }
@@ -364,7 +366,10 @@ mod tests {
     fn test_unknown_provider() {
         let result = create_provider("vault", None, None, None, None);
         match result {
-            Err(e) => assert!(e.to_string().contains("unknown provider"), "error should say unknown provider"),
+            Err(e) => assert!(
+                e.to_string().contains("unknown provider"),
+                "error should say unknown provider"
+            ),
             Ok(_) => panic!("unknown provider should fail"),
         }
     }

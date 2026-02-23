@@ -77,12 +77,22 @@ impl JsonRpcErrorResponse {
 }
 
 /// Serialize either a success or error response.
-pub fn serialize_response(id: Option<serde_json::Value>, result: Result<serde_json::Value, (i32, String)>) -> String {
+pub fn serialize_response(
+    id: Option<serde_json::Value>,
+    result: Result<serde_json::Value, (i32, String)>,
+) -> String {
     match result {
-        Ok(data) => serde_json::to_string(&JsonRpcResponse::success(id, data))
-            .unwrap_or_else(|_| r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"serialization failed"}}"#.to_string()),
+        Ok(data) => {
+            serde_json::to_string(&JsonRpcResponse::success(id, data)).unwrap_or_else(|_| {
+                r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"serialization failed"}}"#
+                    .to_string()
+            })
+        }
         Err((code, msg)) => serde_json::to_string(&JsonRpcErrorResponse::error(id, code, msg))
-            .unwrap_or_else(|_| r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"serialization failed"}}"#.to_string()),
+            .unwrap_or_else(|_| {
+                r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"serialization failed"}}"#
+                    .to_string()
+            }),
     }
 }
 
@@ -109,7 +119,8 @@ mod tests {
 
     #[test]
     fn test_success_response() {
-        let resp = JsonRpcResponse::success(Some(serde_json::json!(1)), serde_json::json!({"tools": []}));
+        let resp =
+            JsonRpcResponse::success(Some(serde_json::json!(1)), serde_json::json!({"tools": []}));
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["jsonrpc"], "2.0");
         assert_eq!(json["id"], 1);
@@ -118,7 +129,11 @@ mod tests {
 
     #[test]
     fn test_error_response() {
-        let resp = JsonRpcErrorResponse::error(Some(serde_json::json!(1)), METHOD_NOT_FOUND, "unknown method");
+        let resp = JsonRpcErrorResponse::error(
+            Some(serde_json::json!(1)),
+            METHOD_NOT_FOUND,
+            "unknown method",
+        );
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["error"]["code"], METHOD_NOT_FOUND);
         assert_eq!(json["error"]["message"], "unknown method");
@@ -126,14 +141,20 @@ mod tests {
 
     #[test]
     fn test_serialize_response_ok() {
-        let s = serialize_response(Some(serde_json::json!(1)), Ok(serde_json::json!({"ok": true})));
+        let s = serialize_response(
+            Some(serde_json::json!(1)),
+            Ok(serde_json::json!({"ok": true})),
+        );
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["result"]["ok"], true);
     }
 
     #[test]
     fn test_serialize_response_err() {
-        let s = serialize_response(Some(serde_json::json!(2)), Err((INTERNAL_ERROR, "boom".to_string())));
+        let s = serialize_response(
+            Some(serde_json::json!(2)),
+            Err((INTERNAL_ERROR, "boom".to_string())),
+        );
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["error"]["code"], INTERNAL_ERROR);
     }

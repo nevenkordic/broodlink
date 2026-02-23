@@ -20,3 +20,6 @@ uuid = { workspace = true }
 broodlink-telemetry = { path = "../../crates/broodlink-telemetry" }
 futures = { workspace = true }
 tokio-stream = { workspace = true }
+
+[lints]
+workspace = true

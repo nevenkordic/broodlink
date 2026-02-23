@@ -1,5 +1,5 @@
 #!/bin/bash
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 export BROODLINK_CONFIG="./config.toml"
 # Source .env — each line becomes an exported env var
 if [ -f .env ]; then

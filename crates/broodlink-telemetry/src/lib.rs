@@ -19,9 +19,6 @@
  * <https://www.gnu.org/licenses/>.
  */
 
-#![deny(clippy::unwrap_used)]
-#![deny(clippy::expect_used)]
-#![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
 use broodlink_config::TelemetryConfig;
@@ -39,15 +36,15 @@ pub enum TelemetryError {
     Setup(String),
 }
 
-/// Guard that shuts down the OTel trace pipeline on drop.
+/// Guard that shuts down the `OTel` trace pipeline on drop.
 /// Must be held for the lifetime of the application.
 pub struct TelemetryGuard {
-    _provider: Option<opentelemetry_sdk::trace::TracerProvider>,
+    provider: Option<opentelemetry_sdk::trace::TracerProvider>,
 }
 
 impl Drop for TelemetryGuard {
     fn drop(&mut self) {
-        if let Some(ref provider) = self._provider {
+        if let Some(ref provider) = self.provider {
             if let Err(e) = provider.shutdown() {
                 eprintln!("telemetry shutdown error: {e}");
             }
@@ -59,11 +56,11 @@ impl Drop for TelemetryGuard {
 ///
 /// When `config.enabled` is false (the default), sets up fmt-only output
 /// identical to the existing behavior. When true, adds an OTLP export layer
-/// and installs the W3C TraceContext propagator for cross-service correlation.
+/// and installs the W3C `TraceContext` propagator for cross-service correlation.
 ///
 /// # Errors
 ///
-/// Returns `TelemetryError` if the OTLP exporter cannot be created
+/// Returns [`TelemetryError`] if the OTLP exporter cannot be created
 /// (only when `enabled=true`).
 pub fn init_telemetry(
     service_name: &str,
@@ -97,9 +94,10 @@ pub fn init_telemetry(
             opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(config.sample_rate)
         };
 
-        let resource = opentelemetry_sdk::Resource::new(vec![
-            KeyValue::new("service.name", service_name.to_string()),
-        ]);
+        let resource = opentelemetry_sdk::Resource::new(vec![KeyValue::new(
+            "service.name",
+            service_name.to_string(),
+        )]);
 
         let provider = opentelemetry_sdk::trace::TracerProvider::builder()
             .with_batch_exporter(exporter, Tokio)
@@ -117,7 +115,7 @@ pub fn init_telemetry(
             .init();
 
         Ok(TelemetryGuard {
-            _provider: Some(provider),
+            provider: Some(provider),
         })
     } else {
         tracing_subscriber::registry()
@@ -125,7 +123,7 @@ pub fn init_telemetry(
             .with(fmt_layer)
             .init();
 
-        Ok(TelemetryGuard { _provider: None })
+        Ok(TelemetryGuard { provider: None })
     }
 }
 
@@ -159,17 +157,15 @@ impl opentelemetry::propagation::Injector for HeaderInjector<'_> {
     }
 }
 
-/// Extract W3C TraceContext from incoming HTTP headers and return an OTel context.
+/// Extract W3C `TraceContext` from incoming HTTP headers and return an `OTel` context.
 /// Use this in middleware to link incoming requests to the distributed trace.
 #[must_use]
 pub fn extract_trace_context(headers: &http::HeaderMap) -> opentelemetry::Context {
     let extractor = HeaderExtractor(headers);
-    opentelemetry::global::get_text_map_propagator(|propagator| {
-        propagator.extract(&extractor)
-    })
+    opentelemetry::global::get_text_map_propagator(|propagator| propagator.extract(&extractor))
 }
 
-/// Inject W3C TraceContext headers (traceparent, tracestate) into outbound HTTP headers.
+/// Inject W3C `TraceContext` headers (`traceparent`, `tracestate`) into outbound HTTP headers.
 /// Use this before making outbound HTTP calls to propagate the trace.
 pub fn inject_trace_context(cx: &opentelemetry::Context, headers: &mut http::HeaderMap) {
     let mut injector = HeaderInjector(headers);
@@ -211,8 +207,8 @@ mod tests {
     }
 
     #[test]
-    fn test_guard_drop_without_provider() {
-        let guard = TelemetryGuard { _provider: None };
+    fn test_guard_drop_withoutprovider() {
+        let guard = TelemetryGuard { provider: None };
         drop(guard); // Must not panic
     }
 
@@ -226,8 +222,14 @@ mod tests {
     fn test_config_default_values_match_spec() {
         let config = TelemetryConfig::default();
         assert!(!config.enabled, "telemetry disabled by default");
-        assert_eq!(config.otlp_endpoint, "http://localhost:4317", "OTLP gRPC default port");
-        assert!((config.sample_rate - 1.0).abs() < f64::EPSILON, "sample all by default");
+        assert_eq!(
+            config.otlp_endpoint, "http://localhost:4317",
+            "OTLP gRPC default port"
+        );
+        assert!(
+            (config.sample_rate - 1.0).abs() < f64::EPSILON,
+            "sample all by default"
+        );
     }
 
     #[test]
@@ -251,9 +253,9 @@ sample_rate = 0.5
 
     #[test]
     fn test_header_injector_roundtrip() {
+        use opentelemetry::propagation::Injector;
         let mut headers = http::HeaderMap::new();
         let mut injector = HeaderInjector(&mut headers);
-        use opentelemetry::propagation::Injector;
         injector.set("traceparent", "00-abc123-def456-01".to_string());
         assert_eq!(
             headers.get("traceparent").and_then(|v| v.to_str().ok()),

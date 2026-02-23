@@ -9,7 +9,7 @@
 # Usage: bash scripts/backfill-knowledge-graph.sh
 set -euo pipefail
 
-BROOD_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+_BROOD_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Load Postgres password from environment or secrets
 PGPASSWORD="${BROODLINK_PG_PASSWORD:-broodlink_dev}"
@@ -26,6 +26,7 @@ echo "=== Broodlink Knowledge Graph Backfill ==="
 echo ""
 
 # Get all memory IDs from Dolt
+# shellcheck disable=SC2086
 MEMORY_IDS=$(mysql -h "$DOLT_HOST" -P "$DOLT_PORT" -u "$DOLT_USER" ${DOLT_PW_ARG:-} agent_ledger \
     -N -e "SELECT id FROM agent_memory ORDER BY id ASC" 2>/dev/null)
 
@@ -55,6 +56,7 @@ for MID in $MEMORY_IDS; do
     fi
 
     # Get memory content from Dolt as JSON
+    # shellcheck disable=SC2086
     ROW=$(mysql -h "$DOLT_HOST" -P "$DOLT_PORT" -u "$DOLT_USER" ${DOLT_PW_ARG:-} agent_ledger \
         -N -e "SELECT JSON_OBJECT(
             'topic', topic,
@@ -73,7 +75,7 @@ for MID in $MEMORY_IDS; do
     TRACE_ID=$(uuidgen 2>/dev/null || python3 -c "import uuid; print(uuid.uuid4())")
     PGPASSWORD=$PGPASSWORD psql -h "$PGHOST" -U "$PGUSER" -d "$PGDB" -q \
         -c "INSERT INTO outbox (trace_id, operation, payload, status, created_at)
-            VALUES ('$TRACE_ID', 'kg_extract', '$(echo "$ROW" | sed "s/'/''/g")'::jsonb, 'pending', NOW())" 2>/dev/null
+            VALUES ('$TRACE_ID', 'kg_extract', '${ROW//\'/\'\'}'::jsonb, 'pending', NOW())" 2>/dev/null
 
     QUEUED=$((QUEUED + 1))
 

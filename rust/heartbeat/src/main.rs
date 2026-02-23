@@ -19,9 +19,6 @@
  * <https://www.gnu.org/licenses/>.
  */
 
-#![deny(clippy::unwrap_used)]
-#![deny(clippy::expect_used)]
-#![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
 use std::process;
@@ -160,13 +157,19 @@ async fn main() {
         process::exit(1);
     });
 
-    let _telemetry_guard = broodlink_telemetry::init_telemetry(SERVICE_NAME, &boot_config.telemetry)
-        .unwrap_or_else(|e| {
-            eprintln!("fatal: telemetry init failed: {e}");
-            process::exit(1);
-        });
+    let _telemetry_guard =
+        broodlink_telemetry::init_telemetry(SERVICE_NAME, &boot_config.telemetry).unwrap_or_else(
+            |e| {
+                eprintln!("fatal: telemetry init failed: {e}");
+                process::exit(1);
+            },
+        );
 
-    info!(service = SERVICE_NAME, version = SERVICE_VERSION, "starting");
+    info!(
+        service = SERVICE_NAME,
+        version = SERVICE_VERSION,
+        "starting"
+    );
 
     let state = match init_state().await {
         Ok(s) => s,
@@ -354,7 +357,12 @@ async fn run_cycle(state: &AppState) -> Result<(), BroodlinkError> {
     // -----------------------------------------------------------------------
     // 5b. Mark stale agents inactive
     // -----------------------------------------------------------------------
-    let agents_deactivated = match deactivate_stale_agents(&state.dolt, state.config.heartbeat.stale_agent_minutes).await {
+    let agents_deactivated = match deactivate_stale_agents(
+        &state.dolt,
+        state.config.heartbeat.stale_agent_minutes,
+    )
+    .await
+    {
         Ok(n) => n,
         Err(e) => {
             warn!(error = %e, "agent deactivation failed");
@@ -370,11 +378,16 @@ async fn run_cycle(state: &AppState) -> Result<(), BroodlinkError> {
             if n > 0 {
                 info!(expired = n, "expired overdue approval gates");
                 let subj = format!("{prefix}.{env}.approvals.expired");
-                publish_nats(&state.nats, &subj, &serde_json::json!({
-                    "service": SERVICE_NAME,
-                    "expired_count": n,
-                    "timestamp": Utc::now().to_rfc3339(),
-                })).await;
+                publish_nats(
+                    &state.nats,
+                    &subj,
+                    &serde_json::json!({
+                        "service": SERVICE_NAME,
+                        "expired_count": n,
+                        "timestamp": Utc::now().to_rfc3339(),
+                    }),
+                )
+                .await;
             }
             n
         }
@@ -421,7 +434,11 @@ async fn run_cycle(state: &AppState) -> Result<(), BroodlinkError> {
     // -----------------------------------------------------------------------
     match kg_cleanup_cycle(&state.pg, &state.config).await {
         Ok(stats) => {
-            if stats.edges_decayed > 0 || stats.edges_expired > 0 || stats.entities_pruned > 0 || stats.orphans_removed > 0 {
+            if stats.edges_decayed > 0
+                || stats.edges_expired > 0
+                || stats.entities_pruned > 0
+                || stats.orphans_removed > 0
+            {
                 info!(
                     edges_decayed = stats.edges_decayed,
                     edges_expired = stats.edges_expired,
@@ -430,14 +447,19 @@ async fn run_cycle(state: &AppState) -> Result<(), BroodlinkError> {
                     "kg cleanup completed"
                 );
                 let subj = format!("{prefix}.{env}.kg.cleanup");
-                publish_nats(&state.nats, &subj, &serde_json::json!({
-                    "service": SERVICE_NAME,
-                    "edges_decayed": stats.edges_decayed,
-                    "edges_expired": stats.edges_expired,
-                    "entities_pruned": stats.entities_pruned,
-                    "orphans_removed": stats.orphans_removed,
-                    "timestamp": Utc::now().to_rfc3339(),
-                })).await;
+                publish_nats(
+                    &state.nats,
+                    &subj,
+                    &serde_json::json!({
+                        "service": SERVICE_NAME,
+                        "edges_decayed": stats.edges_decayed,
+                        "edges_expired": stats.edges_expired,
+                        "entities_pruned": stats.entities_pruned,
+                        "orphans_removed": stats.orphans_removed,
+                        "timestamp": Utc::now().to_rfc3339(),
+                    }),
+                )
+                .await;
             }
         }
         Err(e) => {
@@ -454,12 +476,17 @@ async fn run_cycle(state: &AppState) -> Result<(), BroodlinkError> {
                 if n > 0 {
                     info!(agents = n, "budget replenishment completed");
                     let subj = format!("{prefix}.{env}.budget.replenished");
-                    publish_nats(&state.nats, &subj, &serde_json::json!({
-                        "service": SERVICE_NAME,
-                        "agents_replenished": n,
-                        "amount": state.config.budget.daily_replenishment,
-                        "timestamp": Utc::now().to_rfc3339(),
-                    })).await;
+                    publish_nats(
+                        &state.nats,
+                        &subj,
+                        &serde_json::json!({
+                            "service": SERVICE_NAME,
+                            "agents_replenished": n,
+                            "amount": state.config.budget.daily_replenishment,
+                            "timestamp": Utc::now().to_rfc3339(),
+                        }),
+                    )
+                    .await;
                 }
             }
             Err(e) => {
@@ -472,7 +499,8 @@ async fn run_cycle(state: &AppState) -> Result<(), BroodlinkError> {
     // 5i. Outbound webhook notifications
     // -----------------------------------------------------------------------
     if state.config.webhooks.enabled {
-        if let Err(e) = deliver_outbound_notifications(&state.dolt, &state.pg, &state.config).await {
+        if let Err(e) = deliver_outbound_notifications(&state.dolt, &state.pg, &state.config).await
+        {
             warn!(error = %e, "outbound webhook delivery failed");
         }
     }
@@ -500,7 +528,10 @@ async fn run_cycle(state: &AppState) -> Result<(), BroodlinkError> {
         match dashboard_session_cleanup(&state.pg, &state.config).await {
             Ok(deleted) => {
                 if deleted > 0 {
-                    info!(expired_sessions = deleted, "dashboard session cleanup completed");
+                    info!(
+                        expired_sessions = deleted,
+                        "dashboard session cleanup completed"
+                    );
                 }
             }
             Err(e) => {
@@ -553,14 +584,7 @@ async fn run_cycle(state: &AppState) -> Result<(), BroodlinkError> {
     // -----------------------------------------------------------------------
     // 8. Write audit_log row (Postgres)
     // -----------------------------------------------------------------------
-    if let Err(e) = write_audit_log(
-        &state.pg,
-        &trace_id,
-        SERVICE_NAME,
-        cycle_duration_ms,
-    )
-    .await
-    {
+    if let Err(e) = write_audit_log(&state.pg, &trace_id, SERVICE_NAME, cycle_duration_ms).await {
         warn!(error = %e, "failed to write audit log");
     }
 
@@ -615,9 +639,7 @@ async fn count_dolt_writes(dolt: &MySqlPool) -> i64 {
 /// as a non-fatal warning.
 async fn dolt_commit(dolt: &MySqlPool, message: &str) -> Result<(), BroodlinkError> {
     // Stage all tables
-    sqlx::query("CALL DOLT_ADD('-A')")
-        .execute(dolt)
-        .await?;
+    sqlx::query("CALL DOLT_ADD('-A')").execute(dolt).await?;
 
     // Commit with message. Using `-m` flag.
     sqlx::query("CALL DOLT_COMMIT('-m', ?)")
@@ -817,16 +839,17 @@ async fn activate_recent_agents(dolt: &MySqlPool, pg: &PgPool) -> Result<u64, Br
 
 /// Mark agents as inactive if their `last_seen` timestamp is older than
 /// one hour.
-async fn deactivate_stale_agents(dolt: &MySqlPool, stale_minutes: u32) -> Result<u64, BroodlinkError> {
-    let result = sqlx::query(
-        &format!(
-            "UPDATE agent_profiles
+async fn deactivate_stale_agents(
+    dolt: &MySqlPool,
+    stale_minutes: u32,
+) -> Result<u64, BroodlinkError> {
+    let result = sqlx::query(&format!(
+        "UPDATE agent_profiles
              SET active = false
              WHERE active = true
                AND last_seen IS NOT NULL
                AND last_seen < NOW() - INTERVAL {stale_minutes} MINUTE"
-        ),
-    )
+    ))
     .execute(dolt)
     .await?;
 
@@ -871,11 +894,10 @@ async fn expire_approval_gates(pg: &PgPool) -> Result<u64, BroodlinkError> {
 /// `agent_metrics` (Postgres). Returns the number of agents updated.
 async fn compute_agent_metrics(dolt: &MySqlPool, pg: &PgPool) -> Result<usize, BroodlinkError> {
     // Get all active agents from Dolt
-    let active_agents: Vec<(String,)> = sqlx::query_as(
-        "SELECT agent_id FROM agent_profiles WHERE active = true",
-    )
-    .fetch_all(dolt)
-    .await?;
+    let active_agents: Vec<(String,)> =
+        sqlx::query_as("SELECT agent_id FROM agent_profiles WHERE active = true")
+            .fetch_all(dolt)
+            .await?;
 
     if active_agents.is_empty() {
         return Ok(0);
@@ -1103,13 +1125,12 @@ async fn sync_kg_unprocessed_memories(
     pg: &PgPool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Find max memory_id already linked in kg_entity_memories
-    let max_processed: Option<i64> = sqlx::query_as::<_, (Option<i64>,)>(
-        "SELECT MAX(memory_id) FROM kg_entity_memories",
-    )
-    .fetch_one(pg)
-    .await
-    .ok()
-    .and_then(|r| r.0);
+    let max_processed: Option<i64> =
+        sqlx::query_as::<_, (Option<i64>,)>("SELECT MAX(memory_id) FROM kg_entity_memories")
+            .fetch_one(pg)
+            .await
+            .ok()
+            .and_then(|r| r.0);
 
     let since_id = max_processed.unwrap_or(0);
 
@@ -1167,7 +1188,10 @@ async fn sync_kg_unprocessed_memories(
     }
 
     if queued > 0 {
-        info!(queued = queued, "queued unprocessed memories for kg extraction");
+        info!(
+            queued = queued,
+            "queued unprocessed memories for kg extraction"
+        );
     }
 
     Ok(())
@@ -1232,10 +1256,7 @@ async fn replenish_budgets(
     Ok(count)
 }
 
-async fn kg_cleanup_cycle(
-    pg: &PgPool,
-    config: &Config,
-) -> Result<KgCleanupStats, BroodlinkError> {
+async fn kg_cleanup_cycle(pg: &PgPool, config: &Config) -> Result<KgCleanupStats, BroodlinkError> {
     let ms = &config.memory_search;
     let decay_rate = ms.kg_edge_decay_rate;
     let ttl_days = ms.kg_entity_ttl_days;
@@ -1472,7 +1493,9 @@ async fn deliver_outbound_notifications(
 
     // Deliver each notification to matching endpoints
     let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(config.webhooks.delivery_timeout_secs))
+        .timeout(std::time::Duration::from_secs(
+            config.webhooks.delivery_timeout_secs,
+        ))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -1536,7 +1559,11 @@ async fn deliver_outbound_notifications(
     }
 
     if delivered > 0 {
-        info!(delivered = delivered, total_events = notifications.len(), "outbound webhooks delivered");
+        info!(
+            delivered = delivered,
+            total_events = notifications.len(),
+            "outbound webhooks delivered"
+        );
     }
 
     Ok(())
@@ -1547,10 +1574,7 @@ async fn deliver_outbound_notifications(
 // ---------------------------------------------------------------------------
 
 /// Close expired sessions and fail timed-out replies.
-async fn chat_cleanup(
-    pg: &PgPool,
-    config: &Config,
-) -> Result<(u64, u64), BroodlinkError> {
+async fn chat_cleanup(pg: &PgPool, config: &Config) -> Result<(u64, u64), BroodlinkError> {
     let timeout_hours = i64::from(config.chat.session_timeout_hours);
     let reply_timeout_secs = config.chat.reply_timeout_seconds as i64;
 
@@ -1586,10 +1610,7 @@ async fn chat_cleanup(
 // ---------------------------------------------------------------------------
 
 /// Delete expired dashboard sessions and enforce max sessions per user.
-async fn dashboard_session_cleanup(
-    pg: &PgPool,
-    config: &Config,
-) -> Result<u64, BroodlinkError> {
+async fn dashboard_session_cleanup(pg: &PgPool, config: &Config) -> Result<u64, BroodlinkError> {
     // Delete all expired sessions
     let expired = sqlx::query("DELETE FROM dashboard_sessions WHERE expires_at < NOW()")
         .execute(pg)
@@ -1632,11 +1653,7 @@ async fn dashboard_session_cleanup(
 }
 
 /// Publish a JSON payload to NATS (best-effort, logs warning on failure).
-async fn publish_nats<T: Serialize>(
-    nats: &async_nats::Client,
-    subject: &str,
-    payload: &T,
-) {
+async fn publish_nats<T: Serialize>(nats: &async_nats::Client, subject: &str, payload: &T) {
     match serde_json::to_vec(payload) {
         Ok(bytes) => {
             if let Err(e) = nats.publish(subject.to_string(), bytes.into()).await {

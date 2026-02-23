@@ -32,3 +32,6 @@ axum-server = { workspace = true }
 opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 regex = "1"
+
+[lints]
+workspace = true

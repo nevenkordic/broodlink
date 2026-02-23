@@ -22,3 +22,6 @@ reqwest = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
+
+[lints]
+workspace = true

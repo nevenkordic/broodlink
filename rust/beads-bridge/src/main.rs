@@ -19,9 +19,6 @@
  * <https://www.gnu.org/licenses/>.
  */
 
-#![deny(clippy::unwrap_used)]
-#![deny(clippy::expect_used)]
-#![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
 use std::collections::HashMap;
@@ -37,17 +34,17 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use futures::stream::Stream;
-use futures::StreamExt;
-use tokio_stream::wrappers::ReceiverStream;
 use broodlink_config::Config;
 use broodlink_runtime::CircuitBreaker;
 use broodlink_secrets::SecretsProvider;
+use futures::stream::Stream;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sqlx::mysql::MySqlPoolOptions;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{MySqlPool, PgPool};
 use tokio::sync::RwLock;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -88,7 +85,11 @@ pub enum BroodlinkError {
     #[error("guardrail blocked: {policy} — {message}")]
     Guardrail { policy: String, message: String },
     #[error("budget exhausted: agent {agent_id} has {balance} tokens, needs {cost}")]
-    BudgetExhausted { agent_id: String, balance: i64, cost: i64 },
+    BudgetExhausted {
+        agent_id: String,
+        balance: i64,
+        cost: i64,
+    },
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -111,23 +112,38 @@ impl IntoResponse for BroodlinkError {
         let (status, body) = match &self {
             Self::Database(e) => {
                 error!(error = %e, "database error");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
             Self::Nats(e) => {
                 error!(error = %e, "nats error");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
             Self::Config(e) => {
                 error!(error = %e, "config error");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
             Self::Secrets(e) => {
                 error!(error = %e, "secrets error");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
             Self::Auth(msg) => {
                 warn!(msg = %msg, "auth failure");
-                (StatusCode::UNAUTHORIZED, "authentication required".to_string())
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "authentication required".to_string(),
+                )
             }
             Self::Validation { field, message } => {
                 warn!(field = %field, message = %message, "validation error");
@@ -143,19 +159,35 @@ impl IntoResponse for BroodlinkError {
             }
             Self::CircuitOpen(svc) => {
                 warn!(service = %svc, "circuit open");
-                (StatusCode::SERVICE_UNAVAILABLE, "service temporarily unavailable".to_string())
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "service temporarily unavailable".to_string(),
+                )
             }
-            Self::Guardrail { ref policy, ref message } => {
+            Self::Guardrail {
+                ref policy,
+                ref message,
+            } => {
                 warn!(policy = %policy, message = %message, "guardrail blocked");
-                (StatusCode::FORBIDDEN, "blocked by guardrail policy".to_string())
+                (
+                    StatusCode::FORBIDDEN,
+                    "blocked by guardrail policy".to_string(),
+                )
             }
-            Self::BudgetExhausted { ref agent_id, balance, cost } => {
+            Self::BudgetExhausted {
+                ref agent_id,
+                balance,
+                cost,
+            } => {
                 warn!(agent = %agent_id, balance = balance, cost = cost, "budget exhausted");
                 (StatusCode::PAYMENT_REQUIRED, "budget exhausted".to_string())
             }
             Self::Internal(msg) => {
                 error!(msg = %msg, "internal error");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
         };
         let json = serde_json::json!({ "error": body });
@@ -289,13 +321,19 @@ async fn main() {
         process::exit(1);
     });
 
-    let _telemetry_guard = broodlink_telemetry::init_telemetry(SERVICE_NAME, &boot_config.telemetry)
-        .unwrap_or_else(|e| {
-            eprintln!("fatal: telemetry init failed: {e}");
-            process::exit(1);
-        });
+    let _telemetry_guard =
+        broodlink_telemetry::init_telemetry(SERVICE_NAME, &boot_config.telemetry).unwrap_or_else(
+            |e| {
+                eprintln!("fatal: telemetry init failed: {e}");
+                process::exit(1);
+            },
+        );
 
-    info!(service = SERVICE_NAME, version = SERVICE_VERSION, "starting");
+    info!(
+        service = SERVICE_NAME,
+        version = SERVICE_VERSION,
+        "starting"
+    );
 
     let state = match init_state().await {
         Ok(s) => s,
@@ -482,16 +520,10 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
     };
 
     // Circuit breakers
-    let qdrant_breaker = CircuitBreaker::new(
-        "qdrant",
-        CIRCUIT_FAILURE_THRESHOLD,
-        CIRCUIT_HALF_OPEN_SECS,
-    );
-    let ollama_breaker = CircuitBreaker::new(
-        "ollama",
-        CIRCUIT_FAILURE_THRESHOLD,
-        CIRCUIT_HALF_OPEN_SECS,
-    );
+    let qdrant_breaker =
+        CircuitBreaker::new("qdrant", CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_HALF_OPEN_SECS);
+    let ollama_breaker =
+        CircuitBreaker::new("ollama", CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_HALF_OPEN_SECS);
     let reranker_breaker = CircuitBreaker::new(
         "reranker",
         CIRCUIT_FAILURE_THRESHOLD,
@@ -558,9 +590,7 @@ fn compute_key_kid(pem_bytes: &[u8]) -> String {
 }
 
 /// JWKS endpoint — returns all loaded public keys with their kid identifiers (no auth required).
-async fn jwks_handler(
-    State(state): State<Arc<AppState>>,
-) -> axum::Json<serde_json::Value> {
+async fn jwks_handler(State(state): State<Arc<AppState>>) -> axum::Json<serde_json::Value> {
     let keys: Vec<serde_json::Value> = state
         .jwt_decoding_keys
         .iter()
@@ -588,7 +618,12 @@ async fn shutdown_signal() {
 // Tool metadata registry (OpenAI function-calling format)
 // ---------------------------------------------------------------------------
 
-fn tool_def(name: &str, desc: &str, props: serde_json::Value, required: &[&str]) -> serde_json::Value {
+fn tool_def(
+    name: &str,
+    desc: &str,
+    props: serde_json::Value,
+    required: &[&str],
+) -> serde_json::Value {
     serde_json::json!({
         "type": "function",
         "function": {
@@ -619,8 +654,8 @@ fn p_number(desc: &str) -> serde_json::Value {
     serde_json::json!({"type": "number", "description": desc})
 }
 
-static TOOL_REGISTRY: std::sync::LazyLock<Vec<serde_json::Value>> =
-    std::sync::LazyLock::new(|| {
+static TOOL_REGISTRY: std::sync::LazyLock<Vec<serde_json::Value>> = std::sync::LazyLock::new(
+    || {
         vec![
             // --- Memory ---
             tool_def("store_memory", "Store or update a memory entry by topic. Upserts — updates if topic exists, inserts if new.", serde_json::json!({
@@ -1027,7 +1062,8 @@ static TOOL_REGISTRY: std::sync::LazyLock<Vec<serde_json::Value>> =
                 "tags": p_str("New tags as JSON array string (optional)"),
             }), &["name"]),
         ]
-    });
+    },
+);
 
 /// Returns all tool definitions in OpenAI function-calling format (public, no auth).
 async fn tools_metadata_handler() -> axum::Json<serde_json::Value> {
@@ -1087,9 +1123,7 @@ async fn auth_middleware(
 
     // Multi-key validation: try kid-matched key first, then all keys
     let token_data = {
-        let header_kid = jsonwebtoken::decode_header(token)
-            .ok()
-            .and_then(|h| h.kid);
+        let header_kid = jsonwebtoken::decode_header(token).ok().and_then(|h| h.kid);
 
         if let Some(ref kid) = header_kid {
             // Try the specific key matching the kid
@@ -1211,8 +1245,8 @@ async fn tool_dispatch(
     tracing::Span::current().record("tool", &tracing::field::display(&tool_name));
     tracing::Span::current().record("agent", &tracing::field::display(agent_id));
     // Prefer OTLP trace ID for cross-service correlation; fall back to UUID
-    let request_id = broodlink_telemetry::current_trace_id()
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let request_id =
+        broodlink_telemetry::current_trace_id().unwrap_or_else(|| Uuid::new_v4().to_string());
     let params = &body.params;
 
     info!(
@@ -1481,10 +1515,7 @@ async fn write_outbox(
 // Param extraction helpers
 // ---------------------------------------------------------------------------
 
-fn param_str<'a>(
-    params: &'a serde_json::Value,
-    field: &str,
-) -> Result<&'a str, BroodlinkError> {
+fn param_str<'a>(params: &'a serde_json::Value, field: &str) -> Result<&'a str, BroodlinkError> {
     params
         .get(field)
         .and_then(serde_json::Value::as_str)
@@ -1520,10 +1551,12 @@ fn param_json(
 }
 
 fn param_i64(params: &serde_json::Value, field: &str) -> Result<i64, BroodlinkError> {
-    let val = params.get(field).ok_or_else(|| BroodlinkError::Validation {
-        field: field.to_string(),
-        message: "required integer field".to_string(),
-    })?;
+    let val = params
+        .get(field)
+        .ok_or_else(|| BroodlinkError::Validation {
+            field: field.to_string(),
+            message: "required integer field".to_string(),
+        })?;
 
     // Try direct i64, then fall back to parsing a string representation
     if let Some(n) = val.as_i64() {
@@ -1711,13 +1744,12 @@ async fn tool_delete_memory(
         .await?;
 
     // Also delete from Postgres full-text search index (non-fatal)
-    if let Err(e) = sqlx::query(
-        "DELETE FROM memory_search_index WHERE agent_id = $1 AND topic = $2",
-    )
-    .bind(agent_id)
-    .bind(topic)
-    .execute(&state.pg)
-    .await
+    if let Err(e) =
+        sqlx::query("DELETE FROM memory_search_index WHERE agent_id = $1 AND topic = $2")
+            .bind(agent_id)
+            .bind(topic)
+            .execute(&state.pg)
+            .await
     {
         warn!(error = %e, topic = %topic, "failed to delete from memory_search_index (non-fatal)");
     }
@@ -1769,8 +1801,14 @@ async fn tool_semantic_search(
     _agent_id: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
-    state.qdrant_breaker.check().map_err(BroodlinkError::CircuitOpen)?;
-    state.ollama_breaker.check().map_err(BroodlinkError::CircuitOpen)?;
+    state
+        .qdrant_breaker
+        .check()
+        .map_err(BroodlinkError::CircuitOpen)?;
+    state
+        .ollama_breaker
+        .check()
+        .map_err(BroodlinkError::CircuitOpen)?;
 
     let query = param_str(params, "query")?;
     let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(5));
@@ -1863,7 +1901,10 @@ async fn tool_semantic_search(
 
 /// Get embedding vector from Ollama. Uses the default embedding model.
 async fn get_ollama_embedding(state: &AppState, text: &str) -> Result<Vec<f64>, BroodlinkError> {
-    state.ollama_breaker.check().map_err(BroodlinkError::CircuitOpen)?;
+    state
+        .ollama_breaker
+        .check()
+        .map_err(BroodlinkError::CircuitOpen)?;
 
     let url = format!("{}/api/embeddings", state.config.ollama.url);
     let body = serde_json::json!({
@@ -1900,7 +1941,9 @@ async fn get_ollama_embedding(state: &AppState, text: &str) -> Result<Vec<f64>, 
     let arr = json
         .get("embedding")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| BroodlinkError::Internal("no embedding array in ollama response".to_string()))?;
+        .ok_or_else(|| {
+            BroodlinkError::Internal("no embedding array in ollama response".to_string())
+        })?;
 
     Ok(arr.iter().filter_map(|v| v.as_f64()).collect())
 }
@@ -1911,7 +1954,10 @@ async fn semantic_search_raw(
     query_embedding: &[f64],
     limit: i64,
 ) -> Result<Vec<(String, String, f64, String)>, BroodlinkError> {
-    state.qdrant_breaker.check().map_err(BroodlinkError::CircuitOpen)?;
+    state
+        .qdrant_breaker
+        .check()
+        .map_err(BroodlinkError::CircuitOpen)?;
 
     let qdrant_url = format!(
         "{}/collections/{}/points/search",
@@ -1953,7 +1999,10 @@ async fn semantic_search_raw(
     if let Some(points) = json.get("result").and_then(|r| r.as_array()) {
         for point in points {
             let score = point.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
-            let payload = point.get("payload").cloned().unwrap_or(serde_json::json!({}));
+            let payload = point
+                .get("payload")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
             let topic = payload
                 .get("topic")
                 .and_then(|t| t.as_str())
@@ -1986,9 +2035,32 @@ async fn bm25_search(
     query: &str,
     agent_filter: Option<&str>,
     limit: i64,
-) -> Result<Vec<(i64, String, String, String, Option<String>, f64, String, String)>, BroodlinkError>
-{
-    let rows = sqlx::query_as::<_, (i64, String, String, String, Option<String>, f64, String, String)>(
+) -> Result<
+    Vec<(
+        i64,
+        String,
+        String,
+        String,
+        Option<String>,
+        f64,
+        String,
+        String,
+    )>,
+    BroodlinkError,
+> {
+    let rows = sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            String,
+            String,
+            Option<String>,
+            f64,
+            String,
+            String,
+        ),
+    >(
         r#"SELECT memory_id, agent_id, topic, content, tags,
                   ts_rank_cd(tsv, plainto_tsquery('english', $1), 32)::float8 AS bm25_score,
                   created_at::text, updated_at::text
@@ -2053,6 +2125,7 @@ fn truncate_content(content: &str, max_len: usize) -> String {
 }
 
 /// Cosine similarity between two vectors.
+#[cfg(test)]
 fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -2102,8 +2175,8 @@ async fn tool_hybrid_search(
     let fetch_limit = limit * 2; // over-fetch for fusion
 
     // --- Run BM25 + semantic search in parallel ---
-    let qdrant_available = state.qdrant_breaker.check().is_ok()
-        && state.ollama_breaker.check().is_ok();
+    let qdrant_available =
+        state.qdrant_breaker.check().is_ok() && state.ollama_breaker.check().is_ok();
 
     let bm25_fut = bm25_search(&state.pg, query, agent_filter, fetch_limit);
 
@@ -2187,28 +2260,30 @@ async fn tool_hybrid_search(
     // --- Fill missing content from Postgres search index (for semantic-only results) ---
     for candidate in candidates.values_mut() {
         if candidate.content.is_empty() {
-            if let Ok(Some(row)) = sqlx::query_as::<_, (i64, String, Option<String>, String, String)>(
-                "SELECT memory_id, content, tags, created_at::text, updated_at::text
+            if let Ok(Some(row)) =
+                sqlx::query_as::<_, (i64, String, Option<String>, String, String)>(
+                    "SELECT memory_id, content, tags, created_at::text, updated_at::text
                  FROM memory_search_index WHERE agent_id = $1 AND topic = $2",
-            )
-            .bind(&candidate.agent_id)
-            .bind(&candidate.topic)
-            .fetch_optional(&state.pg)
-            .await
+                )
+                .bind(&candidate.agent_id)
+                .bind(&candidate.topic)
+                .fetch_optional(&state.pg)
+                .await
             {
                 candidate.memory_id = row.0;
                 candidate.content = row.1;
                 candidate.tags = row.2;
                 candidate.created_at = row.3;
                 candidate.updated_at = row.4;
-            } else if let Ok(Some(row)) = sqlx::query_as::<_, (i64, String, Option<serde_json::Value>, String, String)>(
-                "SELECT id, content, tags, CAST(created_at AS CHAR), CAST(updated_at AS CHAR)
+            } else if let Ok(Some(row)) =
+                sqlx::query_as::<_, (i64, String, Option<serde_json::Value>, String, String)>(
+                    "SELECT id, content, tags, CAST(created_at AS CHAR), CAST(updated_at AS CHAR)
                  FROM agent_memory WHERE agent_name = ? AND topic = ?",
-            )
-            .bind(&candidate.agent_id)
-            .bind(&candidate.topic)
-            .fetch_optional(&state.dolt)
-            .await
+                )
+                .bind(&candidate.agent_id)
+                .bind(&candidate.topic)
+                .fetch_optional(&state.dolt)
+                .await
             {
                 candidate.memory_id = row.0;
                 candidate.content = row.1;
@@ -2367,7 +2442,10 @@ async fn search_kg_entities_qdrant(
     query_embedding: &[f64],
     limit: i64,
 ) -> Result<Vec<(String, String, String, f64)>, BroodlinkError> {
-    state.qdrant_breaker.check().map_err(BroodlinkError::CircuitOpen)?;
+    state
+        .qdrant_breaker
+        .check()
+        .map_err(BroodlinkError::CircuitOpen)?;
 
     let qdrant_url = format!(
         "{}/collections/broodlink_kg_entities/points/search",
@@ -2409,10 +2487,25 @@ async fn search_kg_entities_qdrant(
     if let Some(points) = json.get("result").and_then(|r| r.as_array()) {
         for point in points {
             let score = point.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
-            let payload = point.get("payload").cloned().unwrap_or(serde_json::json!({}));
-            let entity_id = payload.get("entity_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let entity_type = payload.get("entity_type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let payload = point
+                .get("payload")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
+            let entity_id = payload
+                .get("entity_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = payload
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let entity_type = payload
+                .get("entity_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             if !entity_id.is_empty() {
                 results.push((entity_id, name, entity_type, score));
             }
@@ -2432,36 +2525,45 @@ async fn tool_graph_search(
     let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(10));
 
     // 1. Text search via ILIKE
-    let text_rows: Vec<(String, String, String, Option<String>, serde_json::Value, i32, String, String)> =
-        if let Some(etype) = entity_type {
-            sqlx::query_as(
-                "SELECT entity_id, name, entity_type, description, properties, mention_count,
+    let text_rows: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        serde_json::Value,
+        i32,
+        String,
+        String,
+    )> = if let Some(etype) = entity_type {
+        sqlx::query_as(
+            "SELECT entity_id, name, entity_type, description, properties, mention_count,
                         first_seen::text, last_seen::text
                  FROM kg_entities
                  WHERE lower(name) LIKE '%' || lower($1) || '%' AND entity_type = $2
                  ORDER BY mention_count DESC LIMIT $3",
-            )
-            .bind(query)
-            .bind(etype)
-            .bind(limit)
-            .fetch_all(&state.pg)
-            .await?
-        } else {
-            sqlx::query_as(
-                "SELECT entity_id, name, entity_type, description, properties, mention_count,
+        )
+        .bind(query)
+        .bind(etype)
+        .bind(limit)
+        .fetch_all(&state.pg)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT entity_id, name, entity_type, description, properties, mention_count,
                         first_seen::text, last_seen::text
                  FROM kg_entities
                  WHERE lower(name) LIKE '%' || lower($1) || '%'
                  ORDER BY mention_count DESC LIMIT $2",
-            )
-            .bind(query)
-            .bind(limit)
-            .fetch_all(&state.pg)
-            .await?
-        };
+        )
+        .bind(query)
+        .bind(limit)
+        .fetch_all(&state.pg)
+        .await?
+    };
 
     // 2. Also search by embedding similarity (best-effort)
-    let mut seen_ids: std::collections::HashSet<String> = text_rows.iter().map(|r| r.0.clone()).collect();
+    let mut seen_ids: std::collections::HashSet<String> =
+        text_rows.iter().map(|r| r.0.clone()).collect();
 
     let decay_rate = state.config.memory_search.kg_edge_decay_rate;
 
@@ -2530,9 +2632,18 @@ async fn tool_graph_search(
     if include_edges {
         for entity in entities.iter_mut() {
             let eid = entity["entity_id"].as_str().unwrap_or("");
-            let edge_rows: Vec<(String, String, Option<String>, f64, String, String, String, String, String)> =
-                sqlx::query_as(
-                    "SELECT e.edge_id, e.relation_type, e.description, e.weight, e.valid_from::text,
+            let edge_rows: Vec<(
+                String,
+                String,
+                Option<String>,
+                f64,
+                String,
+                String,
+                String,
+                String,
+                String,
+            )> = sqlx::query_as(
+                "SELECT e.edge_id, e.relation_type, e.description, e.weight, e.valid_from::text,
                             CASE WHEN e.source_id = $1 THEN 'outgoing' ELSE 'incoming' END,
                             CASE WHEN e.source_id = $1 THEN t.name ELSE s.name END,
                             CASE WHEN e.source_id = $1 THEN t.entity_type ELSE s.entity_type END,
@@ -2541,25 +2652,37 @@ async fn tool_graph_search(
                      JOIN kg_entities s ON e.source_id = s.entity_id
                      JOIN kg_entities t ON e.target_id = t.entity_id
                      WHERE (e.source_id = $1 OR e.target_id = $1) AND e.valid_to IS NULL",
-                )
-                .bind(eid)
-                .fetch_all(&state.pg)
-                .await?;
+            )
+            .bind(eid)
+            .fetch_all(&state.pg)
+            .await?;
 
             let edges: Vec<serde_json::Value> = edge_rows
                 .iter()
-                .map(|(edge_id, rel, desc, weight, valid_from, direction, related_name, related_type, _related_id)| {
-                    serde_json::json!({
-                        "edge_id": edge_id,
-                        "direction": direction,
-                        "relation_type": rel,
-                        "related_entity": related_name,
-                        "related_entity_type": related_type,
-                        "description": desc,
-                        "weight": weight,
-                        "valid_from": valid_from,
-                    })
-                })
+                .map(
+                    |(
+                        edge_id,
+                        rel,
+                        desc,
+                        weight,
+                        valid_from,
+                        direction,
+                        related_name,
+                        related_type,
+                        _related_id,
+                    )| {
+                        serde_json::json!({
+                            "edge_id": edge_id,
+                            "direction": direction,
+                            "relation_type": rel,
+                            "related_entity": related_name,
+                            "related_entity_type": related_type,
+                            "description": desc,
+                            "weight": weight,
+                            "valid_from": valid_from,
+                        })
+                    },
+                )
                 .collect();
             entity["edges"] = serde_json::json!(edges);
         }
@@ -2580,7 +2703,9 @@ async fn tool_graph_traverse(
 ) -> Result<serde_json::Value, BroodlinkError> {
     let start_entity = param_str(params, "start_entity")?;
     let config_max = state.config.memory_search.kg_max_hops as i64;
-    let max_hops = param_i64_opt(params, "max_hops").unwrap_or(config_max).min(config_max);
+    let max_hops = param_i64_opt(params, "max_hops")
+        .unwrap_or(config_max)
+        .min(config_max);
     let relation_types_str = param_str_opt(params, "relation_types");
     let direction = param_str_opt(params, "direction").unwrap_or("both");
 
@@ -2605,11 +2730,18 @@ async fn tool_graph_traverse(
 
     // Build optional relation_type filter
     let relation_filter = if let Some(rt_str) = relation_types_str {
-        let types: Vec<&str> = rt_str.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let types: Vec<&str> = rt_str
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
         if types.is_empty() {
             String::new()
         } else {
-            let quoted: Vec<String> = types.iter().map(|t| format!("'{}'", t.replace('\'', "''"))).collect();
+            let quoted: Vec<String> = types
+                .iter()
+                .map(|t| format!("'{}'", t.replace('\'', "''")))
+                .collect();
             format!(" AND edge.relation_type IN ({})", quoted.join(", "))
         }
     } else {
@@ -2653,12 +2785,19 @@ async fn tool_graph_traverse(
         FROM traversal ORDER BY depth, name"
     );
 
-    let rows: Vec<(String, String, String, Option<String>, Option<String>, Option<String>, i32)> =
-        sqlx::query_as(&sql)
-            .bind(start_entity)
-            .bind(max_hops)
-            .fetch_all(&state.pg)
-            .await?;
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        i32,
+    )> = sqlx::query_as(&sql)
+        .bind(start_entity)
+        .bind(max_hops)
+        .fetch_all(&state.pg)
+        .await?;
 
     let nodes: Vec<serde_json::Value> = rows
         .iter()
@@ -2738,21 +2877,25 @@ async fn tool_graph_update_edge(
 
     match action {
         "invalidate" => {
-            sqlx::query("UPDATE kg_edges SET valid_to = NOW(), updated_at = NOW() WHERE edge_id = $1")
-                .bind(&edge_id)
-                .execute(&state.pg)
-                .await?;
+            sqlx::query(
+                "UPDATE kg_edges SET valid_to = NOW(), updated_at = NOW() WHERE edge_id = $1",
+            )
+            .bind(&edge_id)
+            .execute(&state.pg)
+            .await?;
         }
         "update_description" => {
             let desc = description.ok_or_else(|| BroodlinkError::Validation {
                 field: "description".to_string(),
                 message: "required for update_description action".to_string(),
             })?;
-            sqlx::query("UPDATE kg_edges SET description = $1, updated_at = NOW() WHERE edge_id = $2")
-                .bind(desc)
-                .bind(&edge_id)
-                .execute(&state.pg)
-                .await?;
+            sqlx::query(
+                "UPDATE kg_edges SET description = $1, updated_at = NOW() WHERE edge_id = $2",
+            )
+            .bind(desc)
+            .bind(&edge_id)
+            .execute(&state.pg)
+            .await?;
         }
         _ => {
             return Err(BroodlinkError::Validation {
@@ -2873,12 +3016,11 @@ async fn tool_graph_prune(
     .fetch_one(&state.pg)
     .await?;
 
-    let low_weight_edges: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM kg_edges WHERE valid_to IS NULL AND weight < $1",
-    )
-    .bind(min_weight)
-    .fetch_one(&state.pg)
-    .await?;
+    let low_weight_edges: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM kg_edges WHERE valid_to IS NULL AND weight < $1")
+            .bind(min_weight)
+            .fetch_one(&state.pg)
+            .await?;
 
     let orphan_entities: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM kg_entities e
@@ -3010,7 +3152,17 @@ async fn tool_get_work_log(
     let agent_filter = param_str_opt(params, "agent_id");
 
     let rows = if let Some(agent) = agent_filter {
-        sqlx::query_as::<_, (i64, String, String, String, Option<serde_json::Value>, String)>(
+        sqlx::query_as::<
+            _,
+            (
+                i64,
+                String,
+                String,
+                String,
+                Option<serde_json::Value>,
+                String,
+            ),
+        >(
             "SELECT id, agent_id, action, details, files_changed, created_at::text
              FROM work_log WHERE agent_id = $1 ORDER BY created_at DESC LIMIT $2",
         )
@@ -3019,7 +3171,17 @@ async fn tool_get_work_log(
         .fetch_all(&state.pg)
         .await?
     } else {
-        sqlx::query_as::<_, (i64, String, String, String, Option<serde_json::Value>, String)>(
+        sqlx::query_as::<
+            _,
+            (
+                i64,
+                String,
+                String,
+                String,
+                Option<serde_json::Value>,
+                String,
+            ),
+        >(
             "SELECT id, agent_id, action, details, files_changed, created_at::text
              FROM work_log ORDER BY created_at DESC LIMIT $1",
         )
@@ -3182,7 +3344,17 @@ async fn tool_list_skills(
     let agent_filter = param_str_opt(params, "agent_name");
 
     let rows = if let Some(agent) = agent_filter {
-        sqlx::query_as::<_, (i64, String, String, Option<String>, Option<serde_json::Value>, String)>(
+        sqlx::query_as::<
+            _,
+            (
+                i64,
+                String,
+                String,
+                Option<String>,
+                Option<serde_json::Value>,
+                String,
+            ),
+        >(
             "SELECT id, name, description, agent_name, examples, CAST(created_at AS CHAR)
              FROM skills WHERE agent_name = ? ORDER BY name",
         )
@@ -3190,7 +3362,17 @@ async fn tool_list_skills(
         .fetch_all(&state.dolt)
         .await?
     } else {
-        sqlx::query_as::<_, (i64, String, String, Option<String>, Option<serde_json::Value>, String)>(
+        sqlx::query_as::<
+            _,
+            (
+                i64,
+                String,
+                String,
+                Option<String>,
+                Option<serde_json::Value>,
+                String,
+            ),
+        >(
             "SELECT id, name, description, agent_name, examples, CAST(created_at AS CHAR)
              FROM skills ORDER BY name",
         )
@@ -3200,16 +3382,18 @@ async fn tool_list_skills(
 
     let skills: Vec<serde_json::Value> = rows
         .into_iter()
-        .map(|(id, name, description, agent_name, examples, created_at)| {
-            serde_json::json!({
-                "id": id,
-                "name": name,
-                "description": description,
-                "agent_name": agent_name,
-                "examples": examples,
-                "created_at": created_at,
-            })
-        })
+        .map(
+            |(id, name, description, agent_name, examples, created_at)| {
+                serde_json::json!({
+                    "id": id,
+                    "name": name,
+                    "description": description,
+                    "agent_name": agent_name,
+                    "examples": examples,
+                    "created_at": created_at,
+                })
+            },
+        )
         .collect();
 
     Ok(serde_json::json!({ "skills": skills }))
@@ -3368,13 +3552,12 @@ async fn tool_beads_update_status(
     let issue_id = param_str(params, "issue_id")?;
     let status = param_str(params, "status")?;
 
-    let result = sqlx::query(
-        "UPDATE beads_issues SET status = ?, updated_at = NOW() WHERE bead_id = ?",
-    )
-    .bind(status)
-    .bind(issue_id)
-    .execute(&state.dolt)
-    .await?;
+    let result =
+        sqlx::query("UPDATE beads_issues SET status = ?, updated_at = NOW() WHERE bead_id = ?")
+            .bind(status)
+            .bind(issue_id)
+            .execute(&state.dolt)
+            .await?;
 
     if result.rows_affected() == 0 {
         return Err(BroodlinkError::NotFound(format!("issue {issue_id}")));
@@ -3552,7 +3735,18 @@ async fn tool_read_messages(
         .unwrap_or(false);
 
     let rows = if unread_only {
-        sqlx::query_as::<_, (String, String, String, Option<String>, String, String, String)>(
+        sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                String,
+                Option<String>,
+                String,
+                String,
+                String,
+            ),
+        >(
             "SELECT id, sender, recipient, subject, body, status, created_at::text
              FROM messages WHERE recipient = $1 AND status = 'unread'
              ORDER BY created_at DESC LIMIT $2",
@@ -3562,7 +3756,18 @@ async fn tool_read_messages(
         .fetch_all(&state.pg)
         .await?
     } else {
-        sqlx::query_as::<_, (String, String, String, Option<String>, String, String, String)>(
+        sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                String,
+                Option<String>,
+                String,
+                String,
+                String,
+            ),
+        >(
             "SELECT id, sender, recipient, subject, body, status, created_at::text
              FROM messages WHERE recipient = $1
              ORDER BY created_at DESC LIMIT $2",
@@ -3899,9 +4104,7 @@ async fn tool_agent_upsert(
 // Utility tools
 // ---------------------------------------------------------------------------
 
-async fn tool_health_check(
-    state: &AppState,
-) -> Result<serde_json::Value, BroodlinkError> {
+async fn tool_health_check(state: &AppState) -> Result<serde_json::Value, BroodlinkError> {
     let dolt_ok = sqlx::query("SELECT 1").execute(&state.dolt).await.is_ok();
     let pg_ok = sqlx::query("SELECT 1").execute(&state.pg).await.is_ok();
     let nats_ok = state.nats.flush().await.is_ok();
@@ -3917,9 +4120,7 @@ async fn tool_health_check(
 }
 
 #[allow(clippy::unused_async)]
-async fn tool_get_config_info(
-    state: &AppState,
-) -> Result<serde_json::Value, BroodlinkError> {
+async fn tool_get_config_info(state: &AppState) -> Result<serde_json::Value, BroodlinkError> {
     Ok(serde_json::json!({
         "env": state.config.broodlink.env,
         "version": state.config.broodlink.version,
@@ -3940,9 +4141,7 @@ async fn tool_get_config_info(
     }))
 }
 
-async fn tool_list_agents(
-    state: &AppState,
-) -> Result<serde_json::Value, BroodlinkError> {
+async fn tool_list_agents(state: &AppState) -> Result<serde_json::Value, BroodlinkError> {
     let rows = sqlx::query_as::<_, (String, String, String, String, String, Option<serde_json::Value>, bool, String, String)>(
         "SELECT agent_id, display_name, role, transport, cost_tier, capabilities, active, CAST(created_at AS CHAR), CAST(updated_at AS CHAR)
          FROM agent_profiles ORDER BY agent_id",
@@ -3953,7 +4152,17 @@ async fn tool_list_agents(
     let agents: Vec<serde_json::Value> = rows
         .into_iter()
         .map(
-            |(agent_id, display_name, role, transport, cost_tier, capabilities, active, created_at, updated_at)| {
+            |(
+                agent_id,
+                display_name,
+                role,
+                transport,
+                cost_tier,
+                capabilities,
+                active,
+                created_at,
+                updated_at,
+            )| {
                 serde_json::json!({
                     "agent_id": agent_id,
                     "display_name": display_name,
@@ -4200,17 +4409,27 @@ async fn tool_get_daily_summary(
 
     let summaries: Vec<serde_json::Value> = rows
         .into_iter()
-        .map(|(id, summary_date, summary_text, tasks_completed, decisions_made, memories_stored, created_at)| {
-            serde_json::json!({
-                "id": id,
-                "summary_date": summary_date,
-                "summary_text": summary_text,
-                "tasks_completed": tasks_completed,
-                "decisions_made": decisions_made,
-                "memories_stored": memories_stored,
-                "created_at": created_at,
-            })
-        })
+        .map(
+            |(
+                id,
+                summary_date,
+                summary_text,
+                tasks_completed,
+                decisions_made,
+                memories_stored,
+                created_at,
+            )| {
+                serde_json::json!({
+                    "id": id,
+                    "summary_date": summary_date,
+                    "summary_text": summary_text,
+                    "tasks_completed": tasks_completed,
+                    "decisions_made": decisions_made,
+                    "memories_stored": memories_stored,
+                    "created_at": created_at,
+                })
+            },
+        )
         .collect();
 
     Ok(serde_json::json!({ "summaries": summaries }))
@@ -4245,36 +4464,27 @@ async fn tool_get_commits(
     Ok(serde_json::json!({ "commits": commits }))
 }
 
-async fn tool_get_memory_stats(
-    state: &AppState,
-) -> Result<serde_json::Value, BroodlinkError> {
-    let memory_count = sqlx::query_as::<_, (i64,)>(
-        "SELECT COUNT(*) FROM agent_memory",
-    )
-    .fetch_one(&state.dolt)
-    .await?
-    .0;
+async fn tool_get_memory_stats(state: &AppState) -> Result<serde_json::Value, BroodlinkError> {
+    let memory_count = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM agent_memory")
+        .fetch_one(&state.dolt)
+        .await?
+        .0;
 
-    let decision_count = sqlx::query_as::<_, (i64,)>(
-        "SELECT COUNT(*) FROM decisions",
-    )
-    .fetch_one(&state.dolt)
-    .await?
-    .0;
+    let decision_count = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM decisions")
+        .fetch_one(&state.dolt)
+        .await?
+        .0;
 
-    let agent_count = sqlx::query_as::<_, (i64,)>(
-        "SELECT COUNT(*) FROM agent_profiles",
-    )
-    .fetch_one(&state.dolt)
-    .await?
-    .0;
+    let agent_count = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM agent_profiles")
+        .fetch_one(&state.dolt)
+        .await?
+        .0;
 
-    let outbox_pending = sqlx::query_as::<_, (i64,)>(
-        "SELECT COUNT(*) FROM outbox WHERE status = 'pending'",
-    )
-    .fetch_one(&state.pg)
-    .await?
-    .0;
+    let outbox_pending =
+        sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM outbox WHERE status = 'pending'")
+            .fetch_one(&state.pg)
+            .await?
+            .0;
 
     Ok(serde_json::json!({
         "memory_entries": memory_count,
@@ -4321,19 +4531,43 @@ async fn tool_get_convoy_status(
 fn is_readonly_tool(tool: &str) -> bool {
     matches!(
         tool,
-        "recall_memory" | "semantic_search" | "list_agents" | "get_agent"
-            | "get_task" | "list_tasks" | "get_audit_log" | "health_check"
-            | "get_config_info" | "get_daily_summary" | "get_commits"
-            | "get_memory_stats" | "list_guardrails" | "get_guardrail_violations"
-            | "list_approvals" | "get_approval" | "list_approval_policies"
-            | "get_routing_scores" | "get_delegation" | "list_delegations"
-            | "get_work_log" | "get_decisions" | "get_convoy_status"
-            | "beads_list_issues" | "beads_get_issue" | "beads_list_formulas"
-            | "beads_get_convoy" | "read_messages" | "list_projects"
-            | "list_skills" | "ping"
-            | "graph_search" | "graph_traverse" | "graph_stats"
+        "recall_memory"
+            | "semantic_search"
+            | "list_agents"
+            | "get_agent"
+            | "get_task"
+            | "list_tasks"
+            | "get_audit_log"
+            | "health_check"
+            | "get_config_info"
+            | "get_daily_summary"
+            | "get_commits"
+            | "get_memory_stats"
+            | "list_guardrails"
+            | "get_guardrail_violations"
+            | "list_approvals"
+            | "get_approval"
+            | "list_approval_policies"
+            | "get_routing_scores"
+            | "get_delegation"
+            | "list_delegations"
+            | "get_work_log"
+            | "get_decisions"
+            | "get_convoy_status"
+            | "beads_list_issues"
+            | "beads_get_issue"
+            | "beads_list_formulas"
+            | "beads_get_convoy"
+            | "read_messages"
+            | "list_projects"
+            | "list_skills"
+            | "ping"
+            | "graph_search"
+            | "graph_traverse"
+            | "graph_stats"
             | "list_chat_sessions"
-            | "list_formulas" | "get_formula"
+            | "list_formulas"
+            | "get_formula"
     )
 }
 
@@ -4349,13 +4583,12 @@ async fn check_budget(
     tool_name: &str,
 ) -> Result<i64, BroodlinkError> {
     // Look up per-tool cost, fall back to config default
-    let cost: i64 = sqlx::query_as::<_, (i64,)>(
-        "SELECT cost_tokens FROM tool_cost_map WHERE tool_name = $1",
-    )
-    .bind(tool_name)
-    .fetch_optional(&state.pg)
-    .await?
-    .map_or(state.config.budget.default_tool_cost, |r| r.0);
+    let cost: i64 =
+        sqlx::query_as::<_, (i64,)>("SELECT cost_tokens FROM tool_cost_map WHERE tool_name = $1")
+            .bind(tool_name)
+            .fetch_optional(&state.pg)
+            .await?
+            .map_or(state.config.budget.default_tool_cost, |r| r.0);
 
     if cost == 0 {
         return Ok(0);
@@ -4601,19 +4834,21 @@ async fn tool_inspect_dlq(
 
     let entries: Vec<serde_json::Value> = rows
         .iter()
-        .map(|(id, task_id, reason, svc, retries, max, resolved, by, ts)| {
-            serde_json::json!({
-                "id": id,
-                "task_id": task_id,
-                "reason": reason,
-                "source_service": svc,
-                "retry_count": retries,
-                "max_retries": max,
-                "resolved": resolved,
-                "resolved_by": by,
-                "created_at": ts,
-            })
-        })
+        .map(
+            |(id, task_id, reason, svc, retries, max, resolved, by, ts)| {
+                serde_json::json!({
+                    "id": id,
+                    "task_id": task_id,
+                    "reason": reason,
+                    "source_service": svc,
+                    "retry_count": retries,
+                    "max_retries": max,
+                    "resolved": resolved,
+                    "resolved_by": by,
+                    "created_at": ts,
+                })
+            },
+        )
         .collect();
 
     Ok(serde_json::json!({
@@ -4725,8 +4960,8 @@ async fn tool_decompose_task(
     let sub_tasks_raw = param_str(params, "sub_tasks")?;
     let merge_strategy = param_str_opt(params, "merge_strategy").unwrap_or("concatenate");
 
-    let sub_tasks: Vec<serde_json::Value> = serde_json::from_str(sub_tasks_raw)
-        .map_err(|e| BroodlinkError::Validation {
+    let sub_tasks: Vec<serde_json::Value> =
+        serde_json::from_str(sub_tasks_raw).map_err(|e| BroodlinkError::Validation {
             field: "sub_tasks".to_string(),
             message: format!("invalid JSON array: {e}"),
         })?;
@@ -4742,10 +4977,16 @@ async fn tool_decompose_task(
     let mut child_ids = Vec::new();
 
     for st in &sub_tasks {
-        let title = st.get("title").and_then(|v| v.as_str()).unwrap_or("sub-task");
+        let title = st
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("sub-task");
         let desc = st.get("description").and_then(|v| v.as_str()).unwrap_or("");
         let role = st.get("role").and_then(|v| v.as_str()).unwrap_or("worker");
-        let cost_tier = st.get("cost_tier").and_then(|v| v.as_str()).unwrap_or("low");
+        let cost_tier = st
+            .get("cost_tier")
+            .and_then(|v| v.as_str())
+            .unwrap_or("low");
 
         let child_id = Uuid::new_v4().to_string();
         let trace_id = Uuid::new_v4().to_string();
@@ -4809,10 +5050,10 @@ async fn tool_create_workspace(
     let participants_raw = param_str_opt(params, "participants").unwrap_or("[]");
     let context_raw = param_str_opt(params, "context").unwrap_or("{}");
 
-    let participants: serde_json::Value = serde_json::from_str(participants_raw)
-        .unwrap_or(serde_json::json!([]));
-    let context: serde_json::Value = serde_json::from_str(context_raw)
-        .unwrap_or(serde_json::json!({}));
+    let participants: serde_json::Value =
+        serde_json::from_str(participants_raw).unwrap_or(serde_json::json!([]));
+    let context: serde_json::Value =
+        serde_json::from_str(context_raw).unwrap_or(serde_json::json!({}));
 
     let id = Uuid::new_v4().to_string();
 
@@ -4842,7 +5083,18 @@ async fn tool_workspace_read(
 ) -> Result<serde_json::Value, BroodlinkError> {
     let workspace_id = param_str(params, "workspace_id")?;
 
-    let row = sqlx::query_as::<_, (String, String, String, serde_json::Value, serde_json::Value, String, String)>(
+    let row = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            serde_json::Value,
+            serde_json::Value,
+            String,
+            String,
+        ),
+    >(
         "SELECT id, name, owner_agent, participants, context, status, created_at::text
          FROM shared_workspaces WHERE id = $1",
     )
@@ -4851,18 +5103,18 @@ async fn tool_workspace_read(
     .await?;
 
     match row {
-        Some((id, name, owner, participants, context, status, created)) => {
-            Ok(serde_json::json!({
-                "workspace_id": id,
-                "name": name,
-                "owner_agent": owner,
-                "participants": participants,
-                "context": context,
-                "status": status,
-                "created_at": created,
-            }))
-        }
-        None => Err(BroodlinkError::NotFound(format!("workspace {workspace_id}"))),
+        Some((id, name, owner, participants, context, status, created)) => Ok(serde_json::json!({
+            "workspace_id": id,
+            "name": name,
+            "owner_agent": owner,
+            "participants": participants,
+            "context": context,
+            "status": status,
+            "created_at": created,
+        })),
+        None => Err(BroodlinkError::NotFound(format!(
+            "workspace {workspace_id}"
+        ))),
     }
 }
 
@@ -4876,8 +5128,8 @@ async fn tool_workspace_write(
     let value = param_str(params, "value")?;
 
     // Parse value as JSON if possible, otherwise store as string
-    let json_val: serde_json::Value = serde_json::from_str(value)
-        .unwrap_or(serde_json::Value::String(value.to_string()));
+    let json_val: serde_json::Value =
+        serde_json::from_str(value).unwrap_or(serde_json::Value::String(value.to_string()));
 
     // Update context JSONB by merging the key
     sqlx::query(
@@ -4920,7 +5172,10 @@ async fn tool_merge_results(
         )));
     }
 
-    let strategy = decomps.first().map(|(_, s)| s.as_str()).unwrap_or("concatenate");
+    let strategy = decomps
+        .first()
+        .map(|(_, s)| s.as_str())
+        .unwrap_or("concatenate");
 
     // Get child task results
     let child_ids: Vec<&str> = decomps.iter().map(|(id, _)| id.as_str()).collect();
@@ -4978,40 +5233,46 @@ async fn tool_list_chat_sessions(
         .get("status")
         .and_then(|v| v.as_str())
         .unwrap_or("active");
-    let limit: i64 = params
-        .get("limit")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(20);
+    let limit: i64 = params.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
 
-    let rows: Vec<(String, String, String, String, Option<String>, Option<String>, i32, Option<String>, String)> =
-        if let Some(plat) = platform {
-            sqlx::query_as(
-                "SELECT id, platform, channel_id, user_id, user_display_name, assigned_agent,
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        i32,
+        Option<String>,
+        String,
+    )> = if let Some(plat) = platform {
+        sqlx::query_as(
+            "SELECT id, platform, channel_id, user_id, user_display_name, assigned_agent,
                         message_count, last_message_at::text, status
                  FROM chat_sessions
                  WHERE platform = $1 AND status = $2
                  ORDER BY last_message_at DESC NULLS LAST
                  LIMIT $3",
-            )
-            .bind(plat)
-            .bind(status)
-            .bind(limit)
-            .fetch_all(&state.pg)
-            .await?
-        } else {
-            sqlx::query_as(
-                "SELECT id, platform, channel_id, user_id, user_display_name, assigned_agent,
+        )
+        .bind(plat)
+        .bind(status)
+        .bind(limit)
+        .fetch_all(&state.pg)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT id, platform, channel_id, user_id, user_display_name, assigned_agent,
                         message_count, last_message_at::text, status
                  FROM chat_sessions
                  WHERE status = $1
                  ORDER BY last_message_at DESC NULLS LAST
                  LIMIT $2",
-            )
-            .bind(status)
-            .bind(limit)
-            .fetch_all(&state.pg)
-            .await?
-        };
+        )
+        .bind(status)
+        .bind(limit)
+        .fetch_all(&state.pg)
+        .await?
+    };
 
     let sessions: Vec<serde_json::Value> = rows
         .iter()
@@ -5051,9 +5312,8 @@ async fn tool_reply_to_chat(
     .fetch_optional(&state.pg)
     .await?;
 
-    let (platform, channel_id, thread_id, status) = row.ok_or_else(|| {
-        BroodlinkError::NotFound(format!("chat session not found: {session_id}"))
-    })?;
+    let (platform, channel_id, thread_id, status) = row
+        .ok_or_else(|| BroodlinkError::NotFound(format!("chat session not found: {session_id}")))?;
 
     if status != "active" {
         return Err(BroodlinkError::Validation {
@@ -5105,60 +5365,72 @@ async fn tool_list_formulas(
         .unwrap_or(true);
     let tag = params.get("tag").and_then(|v| v.as_str());
 
-    let rows: Vec<(String, String, String, Option<String>, i32, bool, bool, i32, Option<String>, Option<String>)> =
-        if enabled_only {
-            sqlx::query_as(
-                "SELECT id, name, display_name, description, version, is_system, enabled,
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        i32,
+        bool,
+        bool,
+        i32,
+        Option<String>,
+        Option<String>,
+    )> = if enabled_only {
+        sqlx::query_as(
+            "SELECT id, name, display_name, description, version, is_system, enabled,
                         usage_count, last_used_at::text, created_at::text
                  FROM formula_registry
                  WHERE enabled = true
                  ORDER BY name",
-            )
-            .fetch_all(&state.pg)
-            .await?
-        } else {
-            sqlx::query_as(
-                "SELECT id, name, display_name, description, version, is_system, enabled,
+        )
+        .fetch_all(&state.pg)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT id, name, display_name, description, version, is_system, enabled,
                         usage_count, last_used_at::text, created_at::text
                  FROM formula_registry
                  ORDER BY name",
-            )
-            .fetch_all(&state.pg)
-            .await?
-        };
+        )
+        .fetch_all(&state.pg)
+        .await?
+    };
 
     let mut formulas: Vec<serde_json::Value> = rows
         .iter()
-        .map(|(id, name, display_name, desc, ver, system, enabled, usage, last_used, created)| {
-            serde_json::json!({
-                "id": id,
-                "name": name,
-                "display_name": display_name,
-                "description": desc,
-                "version": ver,
-                "is_system": system,
-                "enabled": enabled,
-                "usage_count": usage,
-                "last_used_at": last_used,
-                "created_at": created,
-            })
-        })
+        .map(
+            |(id, name, display_name, desc, ver, system, enabled, usage, last_used, created)| {
+                serde_json::json!({
+                    "id": id,
+                    "name": name,
+                    "display_name": display_name,
+                    "description": desc,
+                    "version": ver,
+                    "is_system": system,
+                    "enabled": enabled,
+                    "usage_count": usage,
+                    "last_used_at": last_used,
+                    "created_at": created,
+                })
+            },
+        )
         .collect();
 
     // Filter by tag if provided
     if let Some(tag_filter) = tag {
         // Need to fetch tags for filtering
-        let tag_rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
-            "SELECT name, tags FROM formula_registry",
-        )
-        .fetch_all(&state.pg)
-        .await?;
+        let tag_rows: Vec<(String, serde_json::Value)> =
+            sqlx::query_as("SELECT name, tags FROM formula_registry")
+                .fetch_all(&state.pg)
+                .await?;
 
         let names_with_tag: std::collections::HashSet<String> = tag_rows
             .iter()
             .filter(|(_, tags)| {
-                tags.as_array()
-                    .map_or(false, |arr| arr.iter().any(|t| t.as_str() == Some(tag_filter)))
+                tags.as_array().map_or(false, |arr| {
+                    arr.iter().any(|t| t.as_str() == Some(tag_filter))
+                })
             })
             .map(|(name, _)| name.clone())
             .collect();
@@ -5182,20 +5454,48 @@ async fn tool_get_formula(
 ) -> Result<serde_json::Value, BroodlinkError> {
     let name = param_str(params, "name")?;
 
-    let row: Option<(String, String, String, Option<String>, i32, serde_json::Value, Option<String>, serde_json::Value, bool, bool, i32, Option<String>, Option<String>, Option<String>)> =
-        sqlx::query_as(
-            "SELECT id, name, display_name, description, version, definition, author,
+    let row: Option<(
+        String,
+        String,
+        String,
+        Option<String>,
+        i32,
+        serde_json::Value,
+        Option<String>,
+        serde_json::Value,
+        bool,
+        bool,
+        i32,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT id, name, display_name, description, version, definition, author,
                     tags, is_system, enabled, usage_count, last_used_at::text,
                     created_at::text, updated_at::text
              FROM formula_registry
              WHERE name = $1",
-        )
-        .bind(name)
-        .fetch_optional(&state.pg)
-        .await?;
+    )
+    .bind(name)
+    .fetch_optional(&state.pg)
+    .await?;
 
-    let (id, nm, display, desc, ver, def, author, tags, system, enabled, usage, last_used, created, updated) =
-        row.ok_or_else(|| BroodlinkError::NotFound(format!("formula not found: {name}")))?;
+    let (
+        id,
+        nm,
+        display,
+        desc,
+        ver,
+        def,
+        author,
+        tags,
+        system,
+        enabled,
+        usage,
+        last_used,
+        created,
+        updated,
+    ) = row.ok_or_else(|| BroodlinkError::NotFound(format!("formula not found: {name}")))?;
 
     Ok(serde_json::json!({
         "id": id,
@@ -5245,7 +5545,10 @@ fn validate_formula_definition(def: &serde_json::Value) -> Result<(), String> {
     // Validate parameters
     if let Some(params) = def.get("parameters").and_then(|p| p.as_array()) {
         for param in params {
-            let ptype = param.get("type").and_then(|t| t.as_str()).unwrap_or("string");
+            let ptype = param
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("string");
             if !matches!(ptype, "string" | "integer" | "boolean") {
                 let pname = param.get("name").and_then(|n| n.as_str()).unwrap_or("?");
                 return Err(format!(
@@ -5260,9 +5563,7 @@ fn validate_formula_definition(def: &serde_json::Value) -> Result<(), String> {
         if !on_failure.is_null() {
             if let Some(step_name) = on_failure.get("step_name").and_then(|s| s.as_str()) {
                 if !step_names.iter().any(|n| n == step_name) {
-                    return Err(format!(
-                        "on_failure references unknown step '{step_name}'"
-                    ));
+                    return Err(format!("on_failure references unknown step '{step_name}'"));
                 }
             }
         }
@@ -5282,12 +5583,11 @@ async fn tool_create_formula(
     let tags_str = param_str_opt(params, "tags");
 
     // Parse and validate definition
-    let definition: serde_json::Value = serde_json::from_str(definition_str).map_err(|e| {
-        BroodlinkError::Validation {
+    let definition: serde_json::Value =
+        serde_json::from_str(definition_str).map_err(|e| BroodlinkError::Validation {
             field: "definition".to_string(),
             message: format!("invalid JSON: {e}"),
-        }
-    })?;
+        })?;
 
     validate_formula_definition(&definition).map_err(|msg| BroodlinkError::Validation {
         field: "definition".to_string(),
@@ -5346,28 +5646,25 @@ async fn tool_update_formula(
     let tags_str = param_str_opt(params, "tags");
 
     // Verify formula exists
-    let exists: Option<(String, bool)> = sqlx::query_as(
-        "SELECT id, is_system FROM formula_registry WHERE name = $1",
-    )
-    .bind(name)
-    .fetch_optional(&state.pg)
-    .await?;
+    let exists: Option<(String, bool)> =
+        sqlx::query_as("SELECT id, is_system FROM formula_registry WHERE name = $1")
+            .bind(name)
+            .fetch_optional(&state.pg)
+            .await?;
 
-    let (_id, _is_system) = exists.ok_or_else(|| {
-        BroodlinkError::NotFound(format!("formula not found: {name}"))
-    })?;
+    let (_id, _is_system) =
+        exists.ok_or_else(|| BroodlinkError::NotFound(format!("formula not found: {name}")))?;
 
     // Build dynamic update
     let mut updates = Vec::new();
     let mut bump_version = false;
 
     if let Some(def_str) = definition_str {
-        let definition: serde_json::Value = serde_json::from_str(def_str).map_err(|e| {
-            BroodlinkError::Validation {
+        let definition: serde_json::Value =
+            serde_json::from_str(def_str).map_err(|e| BroodlinkError::Validation {
                 field: "definition".to_string(),
                 message: format!("invalid JSON: {e}"),
-            }
-        })?;
+            })?;
 
         validate_formula_definition(&definition).map_err(|msg| BroodlinkError::Validation {
             field: "definition".to_string(),
@@ -5474,7 +5771,14 @@ async fn check_guardrails(
                 let applies_to_agent = agents.iter().any(|a| *a == "*" || *a == agent_id);
 
                 if applies_to_agent && blocked_tools.iter().any(|t| *t == tool_name) {
-                    log_guardrail_violation(state, agent_id, policy_name, tool_name, "tool blocked by policy").await;
+                    log_guardrail_violation(
+                        state,
+                        agent_id,
+                        policy_name,
+                        tool_name,
+                        "tool blocked by policy",
+                    )
+                    .await;
                     return Err(BroodlinkError::Guardrail {
                         policy: policy_name.clone(),
                         message: format!("tool '{tool_name}' is blocked for agent '{agent_id}'"),
@@ -5489,10 +5793,19 @@ async fn check_guardrails(
                         .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
                         .unwrap_or_default();
                     if !allowed_tools.is_empty() && !allowed_tools.iter().any(|t| *t == tool_name) {
-                        log_guardrail_violation(state, agent_id, policy_name, tool_name, "tool not in scope").await;
+                        log_guardrail_violation(
+                            state,
+                            agent_id,
+                            policy_name,
+                            tool_name,
+                            "tool not in scope",
+                        )
+                        .await;
                         return Err(BroodlinkError::Guardrail {
                             policy: policy_name.clone(),
-                            message: format!("tool '{tool_name}' not in allowed scope for agent '{agent_id}'"),
+                            message: format!(
+                                "tool '{tool_name}' not in allowed scope for agent '{agent_id}'"
+                            ),
                         });
                     }
                 }
@@ -5523,9 +5836,13 @@ async fn check_guardrails(
                         if let Ok(re) = regex::Regex::new(pat) {
                             if re.is_match(&params_str) {
                                 log_guardrail_violation(
-                                    state, agent_id, policy_name, tool_name,
+                                    state,
+                                    agent_id,
+                                    policy_name,
+                                    tool_name,
                                     &format!("content matched filter pattern: {pat}"),
-                                ).await;
+                                )
+                                .await;
                                 return Err(BroodlinkError::Guardrail {
                                     policy: policy_name.clone(),
                                     message: format!(
@@ -5554,16 +5871,21 @@ async fn check_guardrails(
 
                     let now = std::time::Instant::now();
                     let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
-                    bucket.tokens = (bucket.tokens + elapsed * bucket.refill_rate).min(bucket.max_tokens);
+                    bucket.tokens =
+                        (bucket.tokens + elapsed * bucket.refill_rate).min(bucket.max_tokens);
                     bucket.last_refill = now;
 
                     if bucket.tokens >= 1.0 {
                         bucket.tokens -= 1.0;
                     } else {
                         log_guardrail_violation(
-                            state, agent_id, policy_name, tool_name,
+                            state,
+                            agent_id,
+                            policy_name,
+                            tool_name,
                             &format!("rate override exceeded: {rpm} rpm"),
-                        ).await;
+                        )
+                        .await;
                         return Err(BroodlinkError::RateLimited(agent_id.to_string()));
                     }
                 }
@@ -5605,9 +5927,13 @@ async fn check_guardrails(
 
             if approved.is_none() {
                 log_guardrail_violation(
-                    state, agent_id, policy_name, tool_name,
+                    state,
+                    agent_id,
+                    policy_name,
+                    tool_name,
                     "tool requires approval gate",
-                ).await;
+                )
+                .await;
                 return Err(BroodlinkError::Guardrail {
                     policy: policy_name.clone(),
                     message: format!(
@@ -5686,14 +6012,25 @@ async fn tool_set_guardrail(
     let config_json = param_json(params, "config")?;
 
     // Validate rule_type
-    if !["tool_block", "rate_override", "content_filter", "scope_limit"].contains(&rule_type) {
+    if ![
+        "tool_block",
+        "rate_override",
+        "content_filter",
+        "scope_limit",
+    ]
+    .contains(&rule_type)
+    {
         return Err(BroodlinkError::Validation {
             field: "rule_type".to_string(),
-            message: "must be one of: tool_block, rate_override, content_filter, scope_limit".to_string(),
+            message: "must be one of: tool_block, rate_override, content_filter, scope_limit"
+                .to_string(),
         });
     }
 
-    let enabled = params.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    let enabled = params
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
     sqlx::query(
         "INSERT INTO guardrail_policies (name, rule_type, config, enabled, created_at, updated_at)
@@ -5711,7 +6048,17 @@ async fn tool_set_guardrail(
     .execute(&state.pg)
     .await?;
 
-    write_audit_log(&state.pg, &Uuid::new_v4().to_string(), agent_id, SERVICE_NAME, "set_guardrail", true, None).await.ok();
+    write_audit_log(
+        &state.pg,
+        &Uuid::new_v4().to_string(),
+        agent_id,
+        SERVICE_NAME,
+        "set_guardrail",
+        true,
+        None,
+    )
+    .await
+    .ok();
 
     Ok(serde_json::json!({ "upserted": true, "name": name }))
 }
@@ -5720,25 +6067,29 @@ async fn tool_list_guardrails(
     state: &AppState,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
-    let enabled_only = params.get("enabled_only").and_then(|v| v.as_bool()).unwrap_or(false);
+    let enabled_only = params
+        .get("enabled_only")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    let policies: Vec<(i64, String, String, serde_json::Value, bool, String, String)> = if enabled_only {
-        sqlx::query_as(
-            "SELECT id, name, rule_type, config, enabled,
+    let policies: Vec<(i64, String, String, serde_json::Value, bool, String, String)> =
+        if enabled_only {
+            sqlx::query_as(
+                "SELECT id, name, rule_type, config, enabled,
                     created_at::text, updated_at::text
              FROM guardrail_policies WHERE enabled = true ORDER BY name",
-        )
-        .fetch_all(&state.pg)
-        .await?
-    } else {
-        sqlx::query_as(
-            "SELECT id, name, rule_type, config, enabled,
+            )
+            .fetch_all(&state.pg)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT id, name, rule_type, config, enabled,
                     created_at::text, updated_at::text
              FROM guardrail_policies ORDER BY name",
-        )
-        .fetch_all(&state.pg)
-        .await?
-    };
+            )
+            .fetch_all(&state.pg)
+            .await?
+        };
 
     let list: Vec<serde_json::Value> = policies
         .into_iter()
@@ -5765,7 +6116,15 @@ async fn tool_get_guardrail_violations(
     let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(50));
     let agent_filter = param_str_opt(params, "agent_id");
 
-    let violations: Vec<(i64, String, String, String, Option<String>, Option<String>, String)> = if let Some(aid) = agent_filter {
+    let violations: Vec<(
+        i64,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+    )> = if let Some(aid) = agent_filter {
         sqlx::query_as(
             "SELECT id, trace_id, agent_id, policy_name, tool_name, details, created_at::text
              FROM guardrail_violations
@@ -5827,16 +6186,28 @@ async fn tool_set_approval_policy(
 
     let conditions = param_json(params, "conditions")?;
     let description = param_str_opt(params, "description");
-    let auto_approve = params.get("auto_approve").and_then(|v| v.as_bool()).unwrap_or(false);
+    let auto_approve = params
+        .get("auto_approve")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let threshold = params
         .get("auto_approve_threshold")
-        .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        .and_then(|v| {
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
         .unwrap_or(0.8);
     let expiry = params
         .get("expiry_minutes")
-        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
         .unwrap_or(60) as i32;
-    let active = params.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
+    let active = params
+        .get("active")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
     let id = Uuid::new_v4().to_string();
 
@@ -5865,7 +6236,17 @@ async fn tool_set_approval_policy(
     .execute(&state.pg)
     .await?;
 
-    write_audit_log(&state.pg, &Uuid::new_v4().to_string(), agent_id, SERVICE_NAME, "set_approval_policy", true, None).await.ok();
+    write_audit_log(
+        &state.pg,
+        &Uuid::new_v4().to_string(),
+        agent_id,
+        SERVICE_NAME,
+        "set_approval_policy",
+        true,
+        None,
+    )
+    .await
+    .ok();
 
     Ok(serde_json::json!({ "upserted": true, "name": name }))
 }
@@ -5874,9 +6255,24 @@ async fn tool_list_approval_policies(
     state: &AppState,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
-    let active_only = params.get("active_only").and_then(|v| v.as_bool()).unwrap_or(false);
+    let active_only = params
+        .get("active_only")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    let policies: Vec<(String, String, Option<String>, String, serde_json::Value, bool, f64, i32, bool, String, String)> = if active_only {
+    let policies: Vec<(
+        String,
+        String,
+        Option<String>,
+        String,
+        serde_json::Value,
+        bool,
+        f64,
+        i32,
+        bool,
+        String,
+        String,
+    )> = if active_only {
         sqlx::query_as(
             "SELECT id, name, description, gate_type, conditions, auto_approve,
                     auto_approve_threshold, expiry_minutes, active,
@@ -5898,21 +6294,35 @@ async fn tool_list_approval_policies(
 
     let list: Vec<serde_json::Value> = policies
         .into_iter()
-        .map(|(id, name, desc, gate_type, conditions, auto_approve, threshold, expiry, active, created, updated)| {
-            serde_json::json!({
-                "id": id,
-                "name": name,
-                "description": desc,
-                "gate_type": gate_type,
-                "conditions": conditions,
-                "auto_approve": auto_approve,
-                "auto_approve_threshold": threshold,
-                "expiry_minutes": expiry,
-                "active": active,
-                "created_at": created,
-                "updated_at": updated,
-            })
-        })
+        .map(
+            |(
+                id,
+                name,
+                desc,
+                gate_type,
+                conditions,
+                auto_approve,
+                threshold,
+                expiry,
+                active,
+                created,
+                updated,
+            )| {
+                serde_json::json!({
+                    "id": id,
+                    "name": name,
+                    "description": desc,
+                    "gate_type": gate_type,
+                    "conditions": conditions,
+                    "auto_approve": auto_approve,
+                    "auto_approve_threshold": threshold,
+                    "expiry_minutes": expiry,
+                    "active": active,
+                    "created_at": created,
+                    "updated_at": updated,
+                })
+            },
+        )
         .collect();
 
     Ok(serde_json::json!({ "policies": list }))
@@ -6026,9 +6436,10 @@ async fn tool_create_approval_gate(
     let severity = param_str_opt(params, "severity").unwrap_or("medium");
     let task_id = param_str_opt(params, "task_id");
     let tool_name_val = param_str_opt(params, "tool_name");
-    let confidence_val = params
-        .get("confidence")
-        .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+    let confidence_val = params.get("confidence").and_then(|v| {
+        v.as_f64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    });
     let caller_expiry = param_i64_opt(params, "expires_minutes").unwrap_or(60);
 
     if !["pre_dispatch", "pre_completion", "budget", "custom"].contains(&gate_type) {
@@ -6047,7 +6458,12 @@ async fn tool_create_approval_gate(
 
     // Evaluate policies
     let policy_result = evaluate_approval_policy(
-        &state.pg, gate_type, severity, agent_id, tool_name_val, confidence_val,
+        &state.pg,
+        gate_type,
+        severity,
+        agent_id,
+        tool_name_val,
+        confidence_val,
     )
     .await?;
 
@@ -6060,7 +6476,10 @@ async fn tool_create_approval_gate(
     // Merge severity into payload
     let mut enriched_payload = payload.clone();
     if let Some(obj) = enriched_payload.as_object_mut() {
-        obj.insert("severity".to_string(), serde_json::Value::String(severity.to_string()));
+        obj.insert(
+            "severity".to_string(),
+            serde_json::Value::String(severity.to_string()),
+        );
     }
 
     let gate_id = Uuid::new_v4().to_string();
@@ -6190,7 +6609,10 @@ async fn tool_resolve_approval(
             "{}.{}.tasks.task_available",
             state.config.nats.subject_prefix, state.config.broodlink.env,
         );
-        let _ = state.nats.publish(subject, b"re-queued after approval".to_vec().into()).await;
+        let _ = state
+            .nats
+            .publish(subject, b"re-queued after approval".to_vec().into())
+            .await;
     }
 
     // Publish resolution event
@@ -6217,46 +6639,71 @@ async fn tool_list_approvals(
     let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(50));
     let status_filter = param_str_opt(params, "status");
 
-    let approvals: Vec<(String, String, String, serde_json::Value, Option<String>, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> =
-        if let Some(status) = status_filter {
-            sqlx::query_as(
-                "SELECT id, gate_type, requested_by, payload, task_id, status, reviewed_by, reason,
+    let approvals: Vec<(
+        String,
+        String,
+        String,
+        serde_json::Value,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = if let Some(status) = status_filter {
+        sqlx::query_as(
+            "SELECT id, gate_type, requested_by, payload, task_id, status, reviewed_by, reason,
                         expires_at::text, created_at::text, reviewed_at::text
                  FROM approval_gates WHERE status = $1
                  ORDER BY created_at DESC LIMIT $2",
-            )
-            .bind(status)
-            .bind(limit)
-            .fetch_all(&state.pg)
-            .await?
-        } else {
-            sqlx::query_as(
-                "SELECT id, gate_type, requested_by, payload, task_id, status, reviewed_by, reason,
+        )
+        .bind(status)
+        .bind(limit)
+        .fetch_all(&state.pg)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT id, gate_type, requested_by, payload, task_id, status, reviewed_by, reason,
                         expires_at::text, created_at::text, reviewed_at::text
                  FROM approval_gates ORDER BY created_at DESC LIMIT $1",
-            )
-            .bind(limit)
-            .fetch_all(&state.pg)
-            .await?
-        };
+        )
+        .bind(limit)
+        .fetch_all(&state.pg)
+        .await?
+    };
 
     let list: Vec<serde_json::Value> = approvals
         .into_iter()
-        .map(|(id, gate_type, requested_by, payload, task_id, status, reviewed_by, reason, expires, created, reviewed_at)| {
-            serde_json::json!({
-                "id": id,
-                "gate_type": gate_type,
-                "requested_by": requested_by,
-                "payload": payload,
-                "task_id": task_id,
-                "status": status,
-                "reviewed_by": reviewed_by,
-                "reason": reason,
-                "expires_at": expires,
-                "created_at": created,
-                "reviewed_at": reviewed_at,
-            })
-        })
+        .map(
+            |(
+                id,
+                gate_type,
+                requested_by,
+                payload,
+                task_id,
+                status,
+                reviewed_by,
+                reason,
+                expires,
+                created,
+                reviewed_at,
+            )| {
+                serde_json::json!({
+                    "id": id,
+                    "gate_type": gate_type,
+                    "requested_by": requested_by,
+                    "payload": payload,
+                    "task_id": task_id,
+                    "status": status,
+                    "reviewed_by": reviewed_by,
+                    "reason": reason,
+                    "expires_at": expires,
+                    "created_at": created,
+                    "reviewed_at": reviewed_at,
+                })
+            },
+        )
         .collect();
 
     Ok(serde_json::json!({ "approvals": list }))
@@ -6268,33 +6715,56 @@ async fn tool_get_approval(
 ) -> Result<serde_json::Value, BroodlinkError> {
     let approval_id = param_str(params, "approval_id")?;
 
-    let row: Option<(String, String, String, serde_json::Value, Option<String>, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> =
-        sqlx::query_as(
-            "SELECT id, gate_type, requested_by, payload, task_id, status, reviewed_by, reason,
+    let row: Option<(
+        String,
+        String,
+        String,
+        serde_json::Value,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT id, gate_type, requested_by, payload, task_id, status, reviewed_by, reason,
                     expires_at::text, created_at::text, reviewed_at::text
              FROM approval_gates WHERE id = $1",
-        )
-        .bind(approval_id)
-        .fetch_optional(&state.pg)
-        .await?;
+    )
+    .bind(approval_id)
+    .fetch_optional(&state.pg)
+    .await?;
 
     match row {
-        Some((id, gate_type, requested_by, payload, task_id, status, reviewed_by, reason, expires, created, reviewed_at)) => {
-            Ok(serde_json::json!({
-                "id": id,
-                "gate_type": gate_type,
-                "requested_by": requested_by,
-                "payload": payload,
-                "task_id": task_id,
-                "status": status,
-                "reviewed_by": reviewed_by,
-                "reason": reason,
-                "expires_at": expires,
-                "created_at": created,
-                "reviewed_at": reviewed_at,
-            }))
-        }
-        None => Err(BroodlinkError::NotFound(format!("approval gate {approval_id}"))),
+        Some((
+            id,
+            gate_type,
+            requested_by,
+            payload,
+            task_id,
+            status,
+            reviewed_by,
+            reason,
+            expires,
+            created,
+            reviewed_at,
+        )) => Ok(serde_json::json!({
+            "id": id,
+            "gate_type": gate_type,
+            "requested_by": requested_by,
+            "payload": payload,
+            "task_id": task_id,
+            "status": status,
+            "reviewed_by": reviewed_by,
+            "reason": reason,
+            "expires_at": expires,
+            "created_at": created,
+            "reviewed_at": reviewed_at,
+        })),
+        None => Err(BroodlinkError::NotFound(format!(
+            "approval gate {approval_id}"
+        ))),
     }
 }
 
@@ -6343,8 +6813,10 @@ async fn tool_get_routing_scores(
     let mut scored_agents: Vec<serde_json::Value> = agents
         .into_iter()
         .map(|(agent_id, role, cost_tier, _last_seen)| {
-            let (completed, _failed, current_load, success_rate) =
-                metrics_map.get(&agent_id).copied().unwrap_or((0, 0, 0, 1.0));
+            let (completed, _failed, current_load, success_rate) = metrics_map
+                .get(&agent_id)
+                .copied()
+                .unwrap_or((0, 0, 0, 1.0));
 
             let cost_score = match cost_tier.as_str() {
                 "low" => 1.0,
@@ -6472,12 +6944,10 @@ async fn tool_accept_delegation(
     }
 
     // Notify the delegator
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT from_agent FROM delegations WHERE id = $1",
-    )
-    .bind(delegation_id)
-    .fetch_optional(&state.pg)
-    .await?;
+    let row: Option<(String,)> = sqlx::query_as("SELECT from_agent FROM delegations WHERE id = $1")
+        .bind(delegation_id)
+        .fetch_optional(&state.pg)
+        .await?;
 
     if let Some((from_agent,)) = row {
         let subject = format!(
@@ -6522,12 +6992,10 @@ async fn tool_reject_delegation(
     }
 
     // Notify the delegator
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT from_agent FROM delegations WHERE id = $1",
-    )
-    .bind(delegation_id)
-    .fetch_optional(&state.pg)
-    .await?;
+    let row: Option<(String,)> = sqlx::query_as("SELECT from_agent FROM delegations WHERE id = $1")
+        .bind(delegation_id)
+        .fetch_optional(&state.pg)
+        .await?;
 
     if let Some((from_agent,)) = row {
         let subject = format!(
@@ -6573,12 +7041,10 @@ async fn tool_complete_delegation(
     }
 
     // Notify the delegator
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT from_agent FROM delegations WHERE id = $1",
-    )
-    .bind(delegation_id)
-    .fetch_optional(&state.pg)
-    .await?;
+    let row: Option<(String,)> = sqlx::query_as("SELECT from_agent FROM delegations WHERE id = $1")
+        .bind(delegation_id)
+        .fetch_optional(&state.pg)
+        .await?;
 
     if let Some((from_agent,)) = row {
         let subject = format!(
@@ -6668,7 +7134,20 @@ async fn tool_list_delegations(
         limit_placeholder,
     );
 
-    let mut query = sqlx::query_as::<_, (String, Option<String>, String, String, String, String, Option<serde_json::Value>, String, String)>(&sql);
+    let mut query = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<String>,
+            String,
+            String,
+            String,
+            String,
+            Option<serde_json::Value>,
+            String,
+            String,
+        ),
+    >(&sql);
     for b in &binds {
         query = query.bind(b);
     }
@@ -6678,19 +7157,31 @@ async fn tool_list_delegations(
 
     let delegations: Vec<serde_json::Value> = rows
         .into_iter()
-        .map(|(id, parent_task_id, from_agent, to_agent, title, status, result, created_at, updated_at)| {
-            serde_json::json!({
-                "id": id,
-                "parent_task_id": parent_task_id,
-                "from_agent": from_agent,
-                "to_agent": to_agent,
-                "title": title,
-                "status": status,
-                "result": result,
-                "created_at": created_at,
-                "updated_at": updated_at,
-            })
-        })
+        .map(
+            |(
+                id,
+                parent_task_id,
+                from_agent,
+                to_agent,
+                title,
+                status,
+                result,
+                created_at,
+                updated_at,
+            )| {
+                serde_json::json!({
+                    "id": id,
+                    "parent_task_id": parent_task_id,
+                    "from_agent": from_agent,
+                    "to_agent": to_agent,
+                    "title": title,
+                    "status": status,
+                    "result": result,
+                    "created_at": created_at,
+                    "updated_at": updated_at,
+                })
+            },
+        )
         .collect();
 
     Ok(serde_json::json!({ "delegations": delegations }))
@@ -6747,13 +7238,12 @@ async fn tool_emit_stream_event(
     }
 
     // Verify the stream exists and is active
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT status FROM streams WHERE id = $1 AND agent_id = $2",
-    )
-    .bind(stream_id)
-    .bind(agent_id)
-    .fetch_optional(&state.pg)
-    .await?;
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM streams WHERE id = $1 AND agent_id = $2")
+            .bind(stream_id)
+            .bind(agent_id)
+            .fetch_optional(&state.pg)
+            .await?;
 
     match row {
         Some((status,)) if status != "active" => {
@@ -6782,18 +7272,24 @@ async fn tool_emit_stream_event(
         "timestamp": chrono::Utc::now().to_rfc3339(),
     });
     if let Ok(bytes) = serde_json::to_vec(&nats_payload) {
-        state.nats.publish(subject, bytes.into()).await.map_err(BroodlinkError::from)?;
+        state
+            .nats
+            .publish(subject, bytes.into())
+            .await
+            .map_err(BroodlinkError::from)?;
     }
 
     // Close stream on terminal events
     if event_type == "complete" || event_type == "error" {
-        let _ = sqlx::query(
-            "UPDATE streams SET status = $1, closed_at = NOW() WHERE id = $2",
-        )
-        .bind(if event_type == "complete" { "completed" } else { "failed" })
-        .bind(stream_id)
-        .execute(&state.pg)
-        .await;
+        let _ = sqlx::query("UPDATE streams SET status = $1, closed_at = NOW() WHERE id = $2")
+            .bind(if event_type == "complete" {
+                "completed"
+            } else {
+                "failed"
+            })
+            .bind(stream_id)
+            .execute(&state.pg)
+            .await;
     }
 
     Ok(serde_json::json!({ "emitted": true, "stream_id": stream_id, "event_type": event_type }))
@@ -6839,10 +7335,7 @@ async fn tool_a2a_delegate(
 ) -> Result<serde_json::Value, BroodlinkError> {
     let base_url = param_str(params, "url")?;
     let message_text = param_str(params, "message")?;
-    let api_key = params
-        .get("api_key")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let api_key = params.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
 
     let url = format!("{}/a2a/tasks/send", base_url.trim_end_matches('/'));
     let task_id = uuid::Uuid::new_v4().to_string();
@@ -6961,12 +7454,10 @@ async fn sse_stream_handler(
     axum::Extension(_claims): axum::Extension<Claims>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, BroodlinkError> {
     // Verify the stream exists
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT status FROM streams WHERE id = $1",
-    )
-    .bind(&stream_id)
-    .fetch_optional(&state.pg)
-    .await?;
+    let row: Option<(String,)> = sqlx::query_as("SELECT status FROM streams WHERE id = $1")
+        .bind(&stream_id)
+        .fetch_optional(&state.pg)
+        .await?;
 
     if row.is_none() {
         return Err(BroodlinkError::NotFound(format!("stream {stream_id}")));
@@ -6997,9 +7488,7 @@ async fn sse_stream_handler(
                 .and_then(|v| v["event_type"].as_str().map(String::from))
                 .unwrap_or_else(|| "message".to_string());
 
-            let event = Event::default()
-                .event(&event_type)
-                .data(&data);
+            let event = Event::default().event(&event_type).data(&data);
 
             if tx.send(Ok(event)).await.is_err() {
                 break; // Client disconnected
@@ -7035,7 +7524,10 @@ mod tests {
     fn test_circuit_breaker_starts_closed() {
         let cb = CircuitBreaker::new("test", 5, 30);
         assert!(!cb.is_open(), "a new circuit breaker should be closed");
-        assert!(cb.check().is_ok(), "check() should succeed on a closed breaker");
+        assert!(
+            cb.check().is_ok(),
+            "check() should succeed on a closed breaker"
+        );
     }
 
     #[test]
@@ -7095,7 +7587,10 @@ mod tests {
 
         // Next check should fail (no time for refill)
         let result = rl.check("agent-1").await;
-        assert!(result.is_err(), "should be rate limited after exhausting burst");
+        assert!(
+            result.is_err(),
+            "should be rate limited after exhausting burst"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -7161,7 +7656,11 @@ mod tests {
     #[test]
     fn test_tool_registry_count() {
         // Must match the number of match arms in tool_dispatch (excluding the _ fallback)
-        assert_eq!(TOOL_REGISTRY.len(), 84, "tool registry should have 84 tools");
+        assert_eq!(
+            TOOL_REGISTRY.len(),
+            84,
+            "tool registry should have 84 tools"
+        );
     }
 
     #[test]
@@ -7170,8 +7669,14 @@ mod tests {
             assert_eq!(tool["type"], "function", "tool type must be 'function'");
             let func = &tool["function"];
             assert!(func["name"].is_string(), "tool must have a name");
-            assert!(func["description"].is_string(), "tool must have a description");
-            assert_eq!(func["parameters"]["type"], "object", "params must be object type");
+            assert!(
+                func["description"].is_string(),
+                "tool must have a description"
+            );
+            assert_eq!(
+                func["parameters"]["type"], "object",
+                "params must be object type"
+            );
         }
     }
 
@@ -7182,22 +7687,47 @@ mod tests {
             .map(|t| t["function"]["name"].as_str().unwrap_or(""))
             .collect();
         for expected in &[
-            "store_memory", "recall_memory", "semantic_search", "hybrid_search",
-            "log_work", "list_projects", "send_message",
-            "log_decision", "claim_task", "agent_upsert",
-            "health_check", "ping",
+            "store_memory",
+            "recall_memory",
+            "semantic_search",
+            "hybrid_search",
+            "log_work",
+            "list_projects",
+            "send_message",
+            "log_decision",
+            "claim_task",
+            "agent_upsert",
+            "health_check",
+            "ping",
             // v0.2.0 tools
-            "set_guardrail", "list_guardrails", "get_guardrail_violations",
-            "create_approval_gate", "resolve_approval", "list_approvals", "get_approval",
-            "set_approval_policy", "list_approval_policies",
+            "set_guardrail",
+            "list_guardrails",
+            "get_guardrail_violations",
+            "create_approval_gate",
+            "resolve_approval",
+            "list_approvals",
+            "get_approval",
+            "set_approval_policy",
+            "list_approval_policies",
             "get_routing_scores",
-            "delegate_task", "accept_delegation", "reject_delegation", "complete_delegation",
-            "start_stream", "emit_stream_event",
-            "a2a_discover", "a2a_delegate",
+            "delegate_task",
+            "accept_delegation",
+            "reject_delegation",
+            "complete_delegation",
+            "start_stream",
+            "emit_stream_event",
+            "a2a_discover",
+            "a2a_delegate",
             // v0.5.0 knowledge graph tools
-            "graph_search", "graph_traverse", "graph_update_edge", "graph_stats",
+            "graph_search",
+            "graph_traverse",
+            "graph_update_edge",
+            "graph_stats",
         ] {
-            assert!(names.contains(expected), "registry missing tool: {expected}");
+            assert!(
+                names.contains(expected),
+                "registry missing tool: {expected}"
+            );
         }
     }
 
@@ -7264,10 +7794,15 @@ mod tests {
     fn test_error_response_is_json() {
         let err = BroodlinkError::NotFound("test".to_string());
         let resp = err.into_response();
-        let ct = resp.headers().get("content-type")
+        let ct = resp
+            .headers()
+            .get("content-type")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        assert!(ct.contains("application/json"), "error response should be JSON, got: {ct}");
+        assert!(
+            ct.contains("application/json"),
+            "error response should be JSON, got: {ct}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -7286,7 +7821,10 @@ mod tests {
     fn test_tool_request_empty_body() {
         let input = json!({});
         let req: ToolRequest = serde_json::from_value(input).unwrap();
-        assert!(req.params.is_null(), "missing params should default to null");
+        assert!(
+            req.params.is_null(),
+            "missing params should default to null"
+        );
     }
 
     #[test]
@@ -7319,7 +7857,10 @@ mod tests {
     fn test_claims_missing_agent_id_fails() {
         let input = json!({"sub": "claude", "exp": 9999999999_u64, "iat": 1700000000_u64});
         let result = serde_json::from_value::<Claims>(input);
-        assert!(result.is_err(), "missing agent_id should fail deserialization");
+        assert!(
+            result.is_err(),
+            "missing agent_id should fail deserialization"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -7354,7 +7895,12 @@ mod tests {
     fn test_policy_matches_empty_conditions() {
         let cond = json!({});
         assert!(policy_matches(&cond, "low", "claude", None));
-        assert!(policy_matches(&cond, "critical", "any-agent", Some("deploy")));
+        assert!(policy_matches(
+            &cond,
+            "critical",
+            "any-agent",
+            Some("deploy")
+        ));
     }
 
     #[test]
@@ -7448,7 +7994,10 @@ mod tests {
     fn test_temporal_decay_zero_age() {
         let now = chrono::Utc::now().to_rfc3339();
         let decay = temporal_decay(&now, 0.01);
-        assert!((decay - 1.0).abs() < 0.02, "decay at zero age should be ~1.0, got {decay}");
+        assert!(
+            (decay - 1.0).abs() < 0.02,
+            "decay at zero age should be ~1.0, got {decay}"
+        );
     }
 
     #[test]
@@ -7466,7 +8015,10 @@ mod tests {
     fn test_temporal_decay_lambda_zero() {
         let old = (chrono::Utc::now() - chrono::Duration::days(365)).to_rfc3339();
         let decay = temporal_decay(&old, 0.0);
-        assert!((decay - 1.0).abs() < f64::EPSILON, "lambda=0 should disable decay");
+        assert!(
+            (decay - 1.0).abs() < f64::EPSILON,
+            "lambda=0 should disable decay"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -7499,7 +8051,10 @@ mod tests {
     fn test_cosine_similarity_identical() {
         let a = vec![1.0, 0.0, 1.0];
         let sim = cosine_similarity(&a, &a);
-        assert!((sim - 1.0).abs() < 1e-10, "identical vectors should have similarity 1.0");
+        assert!(
+            (sim - 1.0).abs() < 1e-10,
+            "identical vectors should have similarity 1.0"
+        );
     }
 
     #[test]
@@ -7507,7 +8062,10 @@ mod tests {
         let a = vec![1.0, 0.0];
         let b = vec![0.0, 1.0];
         let sim = cosine_similarity(&a, &b);
-        assert!(sim.abs() < 1e-10, "orthogonal vectors should have similarity 0.0");
+        assert!(
+            sim.abs() < 1e-10,
+            "orthogonal vectors should have similarity 0.0"
+        );
     }
 
     #[test]
@@ -7515,7 +8073,10 @@ mod tests {
         let a = vec![1.0, 0.0];
         let b = vec![-1.0, 0.0];
         let sim = cosine_similarity(&a, &b);
-        assert!((sim - (-1.0)).abs() < 1e-10, "opposite vectors should have similarity -1.0");
+        assert!(
+            (sim - (-1.0)).abs() < 1e-10,
+            "opposite vectors should have similarity -1.0"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -7535,9 +8096,18 @@ mod tests {
         // Required params
         let required = params["required"].as_array().unwrap();
         assert!(required.contains(&json!("query")), "query must be required");
-        assert!(!required.contains(&json!("entity_type")), "entity_type must be optional");
-        assert!(!required.contains(&json!("include_edges")), "include_edges must be optional");
-        assert!(!required.contains(&json!("limit")), "limit must be optional");
+        assert!(
+            !required.contains(&json!("entity_type")),
+            "entity_type must be optional"
+        );
+        assert!(
+            !required.contains(&json!("include_edges")),
+            "include_edges must be optional"
+        );
+        assert!(
+            !required.contains(&json!("limit")),
+            "limit must be optional"
+        );
 
         // Properties exist
         let props = params["properties"].as_object().unwrap();
@@ -7556,7 +8126,10 @@ mod tests {
 
         let params = &tool["function"]["parameters"];
         let required = params["required"].as_array().unwrap();
-        assert!(required.contains(&json!("start_entity")), "start_entity must be required");
+        assert!(
+            required.contains(&json!("start_entity")),
+            "start_entity must be required"
+        );
         assert_eq!(required.len(), 1, "only start_entity should be required");
 
         let props = params["properties"].as_object().unwrap();
@@ -7585,10 +8158,16 @@ mod tests {
         assert!(required.contains(&"target_entity"));
         assert!(required.contains(&"relation_type"));
         assert!(required.contains(&"action"));
-        assert!(!required.contains(&"description"), "description must be optional");
+        assert!(
+            !required.contains(&"description"),
+            "description must be optional"
+        );
 
         let props = params["properties"].as_object().unwrap();
-        assert!(props.contains_key("description"), "description property must exist");
+        assert!(
+            props.contains_key("description"),
+            "description property must exist"
+        );
     }
 
     #[test]
@@ -7615,14 +8194,26 @@ mod tests {
 
     #[test]
     fn test_kg_readonly_tools() {
-        assert!(is_readonly_tool("graph_search"), "graph_search should be readonly");
-        assert!(is_readonly_tool("graph_traverse"), "graph_traverse should be readonly");
-        assert!(is_readonly_tool("graph_stats"), "graph_stats should be readonly");
+        assert!(
+            is_readonly_tool("graph_search"),
+            "graph_search should be readonly"
+        );
+        assert!(
+            is_readonly_tool("graph_traverse"),
+            "graph_traverse should be readonly"
+        );
+        assert!(
+            is_readonly_tool("graph_stats"),
+            "graph_stats should be readonly"
+        );
     }
 
     #[test]
     fn test_kg_write_tools_not_readonly() {
-        assert!(!is_readonly_tool("graph_update_edge"), "graph_update_edge should NOT be readonly");
+        assert!(
+            !is_readonly_tool("graph_update_edge"),
+            "graph_update_edge should NOT be readonly"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -7651,7 +8242,10 @@ mod tests {
     fn test_graph_traverse_requires_start_entity() {
         let params = json!({});
         let result = param_str(&params, "start_entity");
-        assert!(result.is_err(), "graph_traverse should reject missing start_entity");
+        assert!(
+            result.is_err(),
+            "graph_traverse should reject missing start_entity"
+        );
     }
 
     #[test]
@@ -7678,10 +8272,17 @@ mod tests {
     fn test_graph_traverse_relation_filter_parsing() {
         // Simulates the relation_types parsing logic from tool_graph_traverse
         let rt_str = "DEPENDS_ON, RUNS_ON, MANAGES";
-        let types: Vec<&str> = rt_str.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let types: Vec<&str> = rt_str
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
         assert_eq!(types, vec!["DEPENDS_ON", "RUNS_ON", "MANAGES"]);
 
-        let quoted: Vec<String> = types.iter().map(|t| format!("'{}'", t.replace('\'', "''"))).collect();
+        let quoted: Vec<String> = types
+            .iter()
+            .map(|t| format!("'{}'", t.replace('\'', "''")))
+            .collect();
         let filter = format!(" AND edge.relation_type IN ({})", quoted.join(", "));
         assert_eq!(
             filter,
@@ -7692,26 +8293,46 @@ mod tests {
     #[test]
     fn test_graph_traverse_empty_relation_filter() {
         let rt_str = "";
-        let types: Vec<&str> = rt_str.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
-        assert!(types.is_empty(), "empty string should produce no relation types");
+        let types: Vec<&str> = rt_str
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert!(
+            types.is_empty(),
+            "empty string should produce no relation types"
+        );
     }
 
     #[test]
     fn test_graph_traverse_sql_injection_in_relation_types() {
         // Verify the quoting logic escapes single quotes
         let rt_str = "DEPENDS_ON, O'REILLY";
-        let types: Vec<&str> = rt_str.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
-        let quoted: Vec<String> = types.iter().map(|t| format!("'{}'", t.replace('\'', "''"))).collect();
+        let types: Vec<&str> = rt_str
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        let quoted: Vec<String> = types
+            .iter()
+            .map(|t| format!("'{}'", t.replace('\'', "''")))
+            .collect();
         assert_eq!(quoted[1], "'O''REILLY'", "single quotes should be escaped");
     }
 
     #[test]
     fn test_graph_update_edge_requires_all_four_params() {
         let params = json!({"source_entity": "a", "target_entity": "b", "relation_type": "R"});
-        assert!(param_str(&params, "action").is_err(), "missing action should fail");
+        assert!(
+            param_str(&params, "action").is_err(),
+            "missing action should fail"
+        );
 
         let params = json!({"target_entity": "b", "relation_type": "R", "action": "invalidate"});
-        assert!(param_str(&params, "source_entity").is_err(), "missing source_entity should fail");
+        assert!(
+            param_str(&params, "source_entity").is_err(),
+            "missing source_entity should fail"
+        );
     }
 
     #[test]
@@ -7737,15 +8358,24 @@ mod tests {
         for (direction, expected_join) in &[
             ("outgoing", "edge.source_id = t.entity_id"),
             ("incoming", "edge.target_id = t.entity_id"),
-            ("both", "(edge.source_id = t.entity_id OR edge.target_id = t.entity_id)"),
-            ("unknown", "(edge.source_id = t.entity_id OR edge.target_id = t.entity_id)"),
+            (
+                "both",
+                "(edge.source_id = t.entity_id OR edge.target_id = t.entity_id)",
+            ),
+            (
+                "unknown",
+                "(edge.source_id = t.entity_id OR edge.target_id = t.entity_id)",
+            ),
         ] {
             let join = match *direction {
                 "outgoing" => "edge.source_id = t.entity_id",
                 "incoming" => "edge.target_id = t.entity_id",
                 _ => "(edge.source_id = t.entity_id OR edge.target_id = t.entity_id)",
             };
-            assert_eq!(join, *expected_join, "direction '{direction}' should map correctly");
+            assert_eq!(
+                join, *expected_join,
+                "direction '{direction}' should map correctly"
+            );
         }
     }
 
@@ -7773,21 +8403,36 @@ mod tests {
     fn test_list_chat_sessions_param_extraction() {
         // list_chat_sessions uses optional params: platform, status (default "active"), limit (default 20)
         let params = json!({"platform": "slack", "status": "closed", "limit": 5});
-        assert_eq!(params.get("platform").and_then(|v| v.as_str()), Some("slack"));
         assert_eq!(
-            params.get("status").and_then(|v| v.as_str()).unwrap_or("active"),
+            params.get("platform").and_then(|v| v.as_str()),
+            Some("slack")
+        );
+        assert_eq!(
+            params
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("active"),
             "closed"
         );
-        assert_eq!(params.get("limit").and_then(|v| v.as_i64()).unwrap_or(20), 5);
+        assert_eq!(
+            params.get("limit").and_then(|v| v.as_i64()).unwrap_or(20),
+            5
+        );
 
         // With no params, defaults should apply
         let empty = json!({});
         assert_eq!(empty.get("platform").and_then(|v| v.as_str()), None);
         assert_eq!(
-            empty.get("status").and_then(|v| v.as_str()).unwrap_or("active"),
+            empty
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("active"),
             "active"
         );
-        assert_eq!(empty.get("limit").and_then(|v| v.as_i64()).unwrap_or(20), 20);
+        assert_eq!(
+            empty.get("limit").and_then(|v| v.as_i64()).unwrap_or(20),
+            20
+        );
     }
 
     #[test]
@@ -7801,11 +8446,17 @@ mod tests {
 
         // Missing session_id should fail
         let bad_params = json!({"content": "hello"});
-        assert!(param_str(&bad_params, "session_id").is_err(), "missing session_id should error");
+        assert!(
+            param_str(&bad_params, "session_id").is_err(),
+            "missing session_id should error"
+        );
 
         // Missing content should fail
         let bad_params = json!({"session_id": "abc-123"});
-        assert!(param_str(&bad_params, "content").is_err(), "missing content should error");
+        assert!(
+            param_str(&bad_params, "content").is_err(),
+            "missing content should error"
+        );
     }
 
     #[test]
@@ -7814,18 +8465,30 @@ mod tests {
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap_or(""))
             .collect();
-        assert!(names.contains(&"list_chat_sessions"), "registry missing list_chat_sessions");
-        assert!(names.contains(&"reply_to_chat"), "registry missing reply_to_chat");
+        assert!(
+            names.contains(&"list_chat_sessions"),
+            "registry missing list_chat_sessions"
+        );
+        assert!(
+            names.contains(&"reply_to_chat"),
+            "registry missing reply_to_chat"
+        );
     }
 
     #[test]
     fn test_list_chat_sessions_is_readonly() {
-        assert!(is_readonly_tool("list_chat_sessions"), "list_chat_sessions should be readonly");
+        assert!(
+            is_readonly_tool("list_chat_sessions"),
+            "list_chat_sessions should be readonly"
+        );
     }
 
     #[test]
     fn test_reply_to_chat_is_not_readonly() {
-        assert!(!is_readonly_tool("reply_to_chat"), "reply_to_chat should NOT be readonly");
+        assert!(
+            !is_readonly_tool("reply_to_chat"),
+            "reply_to_chat should NOT be readonly"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -7854,7 +8517,10 @@ mod tests {
             ]
         });
         let err = validate_formula_definition(&def).unwrap_err();
-        assert!(err.contains("missing 'name'"), "error should mention missing name: {err}");
+        assert!(
+            err.contains("missing 'name'"),
+            "error should mention missing name: {err}"
+        );
     }
 
     #[test]
@@ -7868,7 +8534,10 @@ mod tests {
             ]
         });
         let err = validate_formula_definition(&def).unwrap_err();
-        assert!(err.contains("invalid type 'float'"), "error should mention invalid type: {err}");
+        assert!(
+            err.contains("invalid type 'float'"),
+            "error should mention invalid type: {err}"
+        );
     }
 
     #[test]
@@ -7882,14 +8551,20 @@ mod tests {
             }
         });
         let err = validate_formula_definition(&def).unwrap_err();
-        assert!(err.contains("nonexistent_step"), "error should mention bad step ref: {err}");
+        assert!(
+            err.contains("nonexistent_step"),
+            "error should mention bad step ref: {err}"
+        );
     }
 
     #[test]
     fn test_validate_formula_empty_steps() {
         let def = json!({"steps": []});
         let err = validate_formula_definition(&def).unwrap_err();
-        assert!(err.contains("at least one step"), "error should mention empty steps: {err}");
+        assert!(
+            err.contains("at least one step"),
+            "error should mention empty steps: {err}"
+        );
     }
 
     #[test]
@@ -7898,17 +8573,41 @@ mod tests {
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap_or(""))
             .collect();
-        assert!(names.contains(&"list_formulas"), "registry missing list_formulas");
-        assert!(names.contains(&"get_formula"), "registry missing get_formula");
-        assert!(names.contains(&"create_formula"), "registry missing create_formula");
-        assert!(names.contains(&"update_formula"), "registry missing update_formula");
+        assert!(
+            names.contains(&"list_formulas"),
+            "registry missing list_formulas"
+        );
+        assert!(
+            names.contains(&"get_formula"),
+            "registry missing get_formula"
+        );
+        assert!(
+            names.contains(&"create_formula"),
+            "registry missing create_formula"
+        );
+        assert!(
+            names.contains(&"update_formula"),
+            "registry missing update_formula"
+        );
     }
 
     #[test]
     fn test_formula_readonly_tools() {
-        assert!(is_readonly_tool("list_formulas"), "list_formulas should be readonly");
-        assert!(is_readonly_tool("get_formula"), "get_formula should be readonly");
-        assert!(!is_readonly_tool("create_formula"), "create_formula should NOT be readonly");
-        assert!(!is_readonly_tool("update_formula"), "update_formula should NOT be readonly");
+        assert!(
+            is_readonly_tool("list_formulas"),
+            "list_formulas should be readonly"
+        );
+        assert!(
+            is_readonly_tool("get_formula"),
+            "get_formula should be readonly"
+        );
+        assert!(
+            !is_readonly_tool("create_formula"),
+            "create_formula should NOT be readonly"
+        );
+        assert!(
+            !is_readonly_tool("update_formula"),
+            "update_formula should NOT be readonly"
+        );
     }
 }

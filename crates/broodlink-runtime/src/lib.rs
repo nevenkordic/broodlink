@@ -11,10 +11,6 @@
 //! - [`shutdown_signal`]: graceful SIGINT/SIGTERM handler
 //! - [`connect_nats`]: cluster-aware NATS connection
 
-#![deny(clippy::unwrap_used)]
-#![deny(clippy::expect_used)]
-#![warn(clippy::pedantic)]
-
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{error, info};
@@ -86,7 +82,8 @@ impl CircuitBreaker {
     /// Record a successful operation — resets the failure counter and probe flag.
     pub fn record_success(&self) {
         self.failure_count.store(0, Ordering::Relaxed);
-        self.half_open_probe_in_flight.store(false, Ordering::Release);
+        self.half_open_probe_in_flight
+            .store(false, Ordering::Release);
     }
 
     /// Record a failed operation — increments counter, updates timestamp,
@@ -95,7 +92,8 @@ impl CircuitBreaker {
         self.failure_count.fetch_add(1, Ordering::Relaxed);
         self.last_failure_epoch_ms
             .store(now_epoch_ms(), Ordering::Relaxed);
-        self.half_open_probe_in_flight.store(false, Ordering::Release);
+        self.half_open_probe_in_flight
+            .store(false, Ordering::Release);
     }
 
     /// Returns `Ok(())` if the circuit is closed/half-open, or `Err(name)` if open.

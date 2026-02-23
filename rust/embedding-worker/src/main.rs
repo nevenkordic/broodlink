@@ -19,9 +19,6 @@
  * <https://www.gnu.org/licenses/>.
  */
 
-#![deny(clippy::unwrap_used)]
-#![deny(clippy::expect_used)]
-#![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
 use std::collections::HashMap;
@@ -206,13 +203,19 @@ async fn main() {
         process::exit(1);
     });
 
-    let _telemetry_guard = broodlink_telemetry::init_telemetry(SERVICE_NAME, &boot_config.telemetry)
-        .unwrap_or_else(|e| {
-            eprintln!("fatal: telemetry init failed: {e}");
-            process::exit(1);
-        });
+    let _telemetry_guard =
+        broodlink_telemetry::init_telemetry(SERVICE_NAME, &boot_config.telemetry).unwrap_or_else(
+            |e| {
+                eprintln!("fatal: telemetry init failed: {e}");
+                process::exit(1);
+            },
+        );
 
-    info!(service = SERVICE_NAME, version = SERVICE_VERSION, "starting");
+    info!(
+        service = SERVICE_NAME,
+        version = SERVICE_VERSION,
+        "starting"
+    );
 
     let state = match init_state().await {
         Ok(s) => s,
@@ -315,16 +318,10 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
         .map_err(|e| BroodlinkError::Internal(format!("failed to create HTTP client: {e}")))?;
 
     // Circuit breakers
-    let ollama_breaker = CircuitBreaker::new(
-        "ollama",
-        CIRCUIT_FAILURE_THRESHOLD,
-        CIRCUIT_HALF_OPEN_SECS,
-    );
-    let qdrant_breaker = CircuitBreaker::new(
-        "qdrant",
-        CIRCUIT_FAILURE_THRESHOLD,
-        CIRCUIT_HALF_OPEN_SECS,
-    );
+    let ollama_breaker =
+        CircuitBreaker::new("ollama", CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_HALF_OPEN_SECS);
+    let qdrant_breaker =
+        CircuitBreaker::new("qdrant", CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_HALF_OPEN_SECS);
     let kg_extraction_breaker = CircuitBreaker::new(
         "kg_extraction",
         CIRCUIT_FAILURE_THRESHOLD,
@@ -421,7 +418,9 @@ async fn fetch_pending_batch(state: &AppState) -> Result<Vec<OutboxRow>, Broodli
     for row in rows {
         let id: i64 = row.try_get("id")?;
         let trace_id: Option<String> = row.try_get("trace_id").ok();
-        let operation: String = row.try_get("operation").unwrap_or_else(|_| "embed".to_string());
+        let operation: String = row
+            .try_get("operation")
+            .unwrap_or_else(|_| "embed".to_string());
         let payload: serde_json::Value = row.try_get("payload")?;
         let attempts: i32 = row.try_get::<i32, _>("attempts").unwrap_or(0);
 
@@ -442,10 +441,7 @@ async fn fetch_pending_batch(state: &AppState) -> Result<Vec<OutboxRow>, Broodli
 // ---------------------------------------------------------------------------
 
 async fn process_outbox_row(state: &AppState, row: &OutboxRow) -> Result<(), BroodlinkError> {
-    let trace_id = row
-        .trace_id
-        .as_deref()
-        .unwrap_or("no-trace");
+    let trace_id = row.trace_id.as_deref().unwrap_or("no-trace");
 
     info!(
         outbox_id = %row.id,
@@ -509,13 +505,7 @@ async fn process_outbox_row(state: &AppState, row: &OutboxRow) -> Result<(), Bro
         let now_str = chrono::Utc::now().to_rfc3339();
 
         if let Err(e) = upsert_qdrant(
-            state,
-            &qdrant_id,
-            &embedding,
-            topic,
-            agent_name,
-            memory_id,
-            &now_str,
+            state, &qdrant_id, &embedding, topic, agent_name, memory_id, &now_str,
         )
         .await
         {
@@ -552,8 +542,14 @@ async fn process_outbox_row(state: &AppState, row: &OutboxRow) -> Result<(), Bro
                         }
                     }
                     if !extracted.relationships.is_empty() {
-                        if let Err(e) =
-                            resolve_edges(state, &extracted.relationships, &entity_map, memory_id, agent_name).await
+                        if let Err(e) = resolve_edges(
+                            state,
+                            &extracted.relationships,
+                            &entity_map,
+                            memory_id,
+                            agent_name,
+                        )
+                        .await
                         {
                             warn!(error = %e, "edge resolution failed (non-fatal)");
                         }
@@ -594,7 +590,10 @@ async fn process_outbox_row(state: &AppState, row: &OutboxRow) -> Result<(), Bro
 // ---------------------------------------------------------------------------
 
 async fn get_embedding(state: &AppState, content: &str) -> Result<Vec<f32>, BroodlinkError> {
-    state.ollama_breaker.check().map_err(BroodlinkError::CircuitOpen)?;
+    state
+        .ollama_breaker
+        .check()
+        .map_err(BroodlinkError::CircuitOpen)?;
 
     let url = format!("{}/api/embeddings", state.config.ollama.url);
     let body = OllamaEmbedRequest {
@@ -789,12 +788,10 @@ async fn resolve_entity(
                         Ok(json) => {
                             if let Some(results) = json.get("result").and_then(|r| r.as_array()) {
                                 if let Some(top) = results.first() {
-                                    let score = top.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
+                                    let score =
+                                        top.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
                                     if score
-                                        >= state
-                                            .config
-                                            .memory_search
-                                            .kg_entity_similarity_threshold
+                                        >= state.config.memory_search.kg_entity_similarity_threshold
                                     {
                                         if let Some(matched_id) = top
                                             .get("payload")
@@ -987,7 +984,10 @@ async fn upsert_qdrant(
     memory_id: &str,
     created_at: &str,
 ) -> Result<(), BroodlinkError> {
-    state.qdrant_breaker.check().map_err(BroodlinkError::CircuitOpen)?;
+    state
+        .qdrant_breaker
+        .check()
+        .map_err(BroodlinkError::CircuitOpen)?;
 
     let url = format!(
         "{}/collections/{}/points",
@@ -1068,32 +1068,26 @@ async fn mark_processing(pg: &PgPool, outbox_id: i64) -> Result<(), BroodlinkErr
 }
 
 async fn mark_done(pg: &PgPool, outbox_id: i64) -> Result<(), BroodlinkError> {
-    sqlx::query(
-        "UPDATE outbox SET status = 'done', processed_at = NOW() WHERE id = $1",
-    )
-    .bind(outbox_id)
-    .execute(pg)
-    .await?;
+    sqlx::query("UPDATE outbox SET status = 'done', processed_at = NOW() WHERE id = $1")
+        .bind(outbox_id)
+        .execute(pg)
+        .await?;
     Ok(())
 }
 
 async fn increment_attempts(pg: &PgPool, outbox_id: i64) -> Result<(), BroodlinkError> {
-    sqlx::query(
-        "UPDATE outbox SET status = 'pending', attempts = attempts + 1 WHERE id = $1",
-    )
-    .bind(outbox_id)
-    .execute(pg)
-    .await?;
+    sqlx::query("UPDATE outbox SET status = 'pending', attempts = attempts + 1 WHERE id = $1")
+        .bind(outbox_id)
+        .execute(pg)
+        .await?;
     Ok(())
 }
 
 async fn mark_failed(pg: &PgPool, outbox_id: i64) -> Result<(), BroodlinkError> {
-    sqlx::query(
-        "UPDATE outbox SET status = 'failed', processed_at = NOW() WHERE id = $1",
-    )
-    .bind(outbox_id)
-    .execute(pg)
-    .await?;
+    sqlx::query("UPDATE outbox SET status = 'failed', processed_at = NOW() WHERE id = $1")
+        .bind(outbox_id)
+        .execute(pg)
+        .await?;
     Ok(())
 }
 
@@ -1215,9 +1209,18 @@ mod tests {
 
         // Verify payload fields are present
         let payload_obj = json.get("payload").unwrap();
-        assert_eq!(payload_obj.get("topic").unwrap().as_str().unwrap(), "test-topic");
-        assert_eq!(payload_obj.get("agent_id").unwrap().as_str().unwrap(), "agent-1");
-        assert_eq!(payload_obj.get("memory_id").unwrap().as_str().unwrap(), "mem-1");
+        assert_eq!(
+            payload_obj.get("topic").unwrap().as_str().unwrap(),
+            "test-topic"
+        );
+        assert_eq!(
+            payload_obj.get("agent_id").unwrap().as_str().unwrap(),
+            "agent-1"
+        );
+        assert_eq!(
+            payload_obj.get("memory_id").unwrap().as_str().unwrap(),
+            "mem-1"
+        );
     }
 
     #[test]
@@ -1289,7 +1292,10 @@ mod tests {
             cb.record_failure();
         }
 
-        assert!(!cb.is_open(), "4 failures < threshold of 5, breaker should remain closed");
+        assert!(
+            !cb.is_open(),
+            "4 failures < threshold of 5, breaker should remain closed"
+        );
     }
 
     #[test]
@@ -1405,7 +1411,8 @@ mod tests {
 
     #[test]
     fn test_extraction_only_entities_no_relationships() {
-        let json_str = r#"{"entities": [{"name": "solo-node", "type": "service"}], "relationships": []}"#;
+        let json_str =
+            r#"{"entities": [{"name": "solo-node", "type": "service"}], "relationships": []}"#;
         let extracted: ExtractedEntities = serde_json::from_str(json_str).unwrap();
         assert_eq!(extracted.entities.len(), 1);
         assert!(extracted.relationships.is_empty());
@@ -1497,7 +1504,11 @@ mod tests {
             "relationships": []
         }"#;
         let extracted: ExtractedEntities = serde_json::from_str(json_str).unwrap();
-        assert_eq!(extracted.entities.len(), 2, "duplicate names should both parse");
+        assert_eq!(
+            extracted.entities.len(),
+            2,
+            "duplicate names should both parse"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1558,7 +1569,10 @@ mod tests {
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["model"], "qwen3:1.7b");
         assert_eq!(json["stream"], false);
-        assert!(json["prompt"].as_str().unwrap().contains("Extract entities"));
+        assert!(json["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("Extract entities"));
     }
 
     #[test]
@@ -1585,7 +1599,10 @@ mod tests {
         // "entity_type" in JSON should NOT parse (it expects "type")
         let json_str = r#"{"name": "test", "entity_type": "person"}"#;
         let result = serde_json::from_str::<ExtractedEntity>(json_str);
-        assert!(result.is_err(), "JSON field 'entity_type' should not match; expects 'type'");
+        assert!(
+            result.is_err(),
+            "JSON field 'entity_type' should not match; expects 'type'"
+        );
     }
 
     #[test]
@@ -1600,6 +1617,9 @@ mod tests {
         assert_eq!(rel.source, "Alice");
         assert_eq!(rel.target, "auth-service");
         assert_eq!(rel.relation, "MANAGES");
-        assert_eq!(rel.description.as_deref(), Some("Alice manages the auth service team"));
+        assert_eq!(
+            rel.description.as_deref(),
+            Some("Alice manages the auth service team")
+        );
     }
 }

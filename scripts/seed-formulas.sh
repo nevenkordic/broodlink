@@ -94,9 +94,9 @@ print(json.dumps(defn))
   id=$(python3 -c "import uuid; print(str(uuid.uuid4()))")
 
   # Escape single quotes in definition for SQL
-  escaped_def=$(echo "$definition" | sed "s/'/''/g")
-  escaped_desc=$(echo "$description" | sed "s/'/''/g")
-  escaped_display=$(echo "$display_name" | sed "s/'/''/g")
+  escaped_def="${definition//\'/\'\'}"
+  escaped_desc="${description//\'/\'\'}"
+  escaped_display="${display_name//\'/\'\'}"
 
   # Insert with ON CONFLICT DO NOTHING (idempotent)
   sql="INSERT INTO formula_registry (id, name, display_name, description, definition, is_system, author)

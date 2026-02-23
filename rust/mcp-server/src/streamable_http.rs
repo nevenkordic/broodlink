@@ -54,10 +54,7 @@ pub struct HttpState {
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub async fn run_http_transport(
-    config: Arc<broodlink_config::Config>,
-    client: BridgeClient,
-) {
+pub async fn run_http_transport(config: Arc<broodlink_config::Config>, client: BridgeClient) {
     let session_timeout_mins = config.mcp_server.session_timeout_minutes;
     let cors_origins = config.mcp_server.cors_origins.clone();
 
@@ -80,7 +77,11 @@ pub async fn run_http_transport(
             sessions.retain(|_, s| s.last_activity.elapsed() < timeout);
             let reaped = before - sessions.len();
             if reaped > 0 {
-                info!(reaped = reaped, remaining = sessions.len(), "reaped expired sessions");
+                info!(
+                    reaped = reaped,
+                    remaining = sessions.len(),
+                    "reaped expired sessions"
+                );
             }
         }
     });
@@ -125,10 +126,7 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
             .expose_headers([header::HeaderName::from_static("mcp-session-id")]);
     }
 
-    let parsed: Vec<header::HeaderValue> = origins
-        .iter()
-        .filter_map(|o| o.parse().ok())
-        .collect();
+    let parsed: Vec<header::HeaderValue> = origins.iter().filter_map(|o| o.parse().ok()).collect();
 
     CorsLayer::new()
         .allow_origin(AllowOrigin::list(parsed))
@@ -147,9 +145,7 @@ fn validate_origin(headers: &HeaderMap, allowed: &[String]) -> Result<(), Status
         return Ok(());
     }
 
-    let origin = headers
-        .get(header::ORIGIN)
-        .and_then(|v| v.to_str().ok());
+    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
 
     match origin {
         Some(o) if allowed.iter().any(|a| a == o) => Ok(()),
@@ -181,7 +177,12 @@ async fn mcp_post_handler(
                 None,
                 Err((protocol::PARSE_ERROR, format!("parse error: {e}"))),
             );
-            return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], resp).into_response();
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                resp,
+            )
+                .into_response();
         }
     };
 
@@ -212,7 +213,12 @@ async fn mcp_post_handler(
         let result = handler::dispatch(&state.client, &req.method, &req.params).await;
         let resp_str = protocol::serialize_response(id, result);
 
-        let mut resp = (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], resp_str).into_response();
+        let mut resp = (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            resp_str,
+        )
+            .into_response();
         resp.headers_mut().insert(
             header::HeaderName::from_static("mcp-session-id"),
             match header::HeaderValue::from_str(&new_session_id) {
@@ -234,18 +240,34 @@ async fn mcp_post_handler(
                 None => {
                     let resp = protocol::serialize_response(
                         id,
-                        Err((protocol::INVALID_REQUEST, "invalid or expired session".to_string())),
+                        Err((
+                            protocol::INVALID_REQUEST,
+                            "invalid or expired session".to_string(),
+                        )),
                     );
-                    return (StatusCode::BAD_REQUEST, [(header::CONTENT_TYPE, "application/json")], resp).into_response();
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        resp,
+                    )
+                        .into_response();
                 }
             }
         }
         None => {
             let resp = protocol::serialize_response(
                 id,
-                Err((protocol::INVALID_REQUEST, "missing Mcp-Session-Id header".to_string())),
+                Err((
+                    protocol::INVALID_REQUEST,
+                    "missing Mcp-Session-Id header".to_string(),
+                )),
             );
-            return (StatusCode::BAD_REQUEST, [(header::CONTENT_TYPE, "application/json")], resp).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, "application/json")],
+                resp,
+            )
+                .into_response();
         }
     }
 
@@ -265,17 +287,19 @@ async fn mcp_post_handler(
     let result = handler::dispatch(&state.client, &req.method, &req.params).await;
     let resp_str = protocol::serialize_response(id, result);
 
-    (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], resp_str).into_response()
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        resp_str,
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
 // GET /mcp — SSE channel for server-initiated messages
 // ---------------------------------------------------------------------------
 
-async fn mcp_get_handler(
-    State(state): State<Arc<HttpState>>,
-    headers: HeaderMap,
-) -> Response {
+async fn mcp_get_handler(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> Response {
     // Origin check
     if let Err(status) = validate_origin(&headers, &state.allowed_origins) {
         return (status, "forbidden: invalid origin").into_response();
@@ -284,9 +308,7 @@ async fn mcp_get_handler(
     // Check for legacy SSE client (looking for "endpoint" event)
     // The Accept header for legacy SSE is text/event-stream
     // For streamable HTTP, the client should have a session
-    let session_id = headers
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok());
+    let session_id = headers.get("mcp-session-id").and_then(|v| v.to_str().ok());
 
     if session_id.is_none() {
         // Could be a legacy client trying the old SSE protocol
@@ -318,7 +340,9 @@ async fn mcp_get_handler(
     });
 
     let stream = ReceiverStream::new(rx);
-    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +393,10 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(header::ORIGIN, "http://evil.com".parse().unwrap());
         let allowed = vec!["http://localhost:1313".to_string()];
-        assert_eq!(validate_origin(&headers, &allowed), Err(StatusCode::FORBIDDEN));
+        assert_eq!(
+            validate_origin(&headers, &allowed),
+            Err(StatusCode::FORBIDDEN)
+        );
     }
 
     #[tokio::test]
@@ -390,10 +417,13 @@ mod tests {
         let sid = "test-session-123".to_string();
         {
             let mut sessions = state.sessions.write().await;
-            sessions.insert(sid.clone(), Session {
-                created_at: Instant::now(),
-                last_activity: Instant::now(),
-            });
+            sessions.insert(
+                sid.clone(),
+                Session {
+                    created_at: Instant::now(),
+                    last_activity: Instant::now(),
+                },
+            );
         }
 
         // Verify it exists
@@ -419,10 +449,13 @@ mod tests {
         // Insert session
         {
             let mut sessions = state.sessions.write().await;
-            sessions.insert("expired".to_string(), Session {
-                created_at: Instant::now(),
-                last_activity: Instant::now(),
-            });
+            sessions.insert(
+                "expired".to_string(),
+                Session {
+                    created_at: Instant::now(),
+                    last_activity: Instant::now(),
+                },
+            );
         }
 
         // Wait for expiry

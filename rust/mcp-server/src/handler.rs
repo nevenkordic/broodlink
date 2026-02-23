@@ -38,17 +38,19 @@ impl BridgeClient {
     /// Fetch tool definitions from beads-bridge and convert to MCP format.
     pub async fn list_tools(&self) -> Result<serde_json::Value, (i32, String)> {
         let url = format!("{}/api/v1/tools", self.bridge_url);
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| (protocol::INTERNAL_ERROR, format!("bridge request failed: {e}")))?;
+        let resp = self.http.get(&url).send().await.map_err(|e| {
+            (
+                protocol::INTERNAL_ERROR,
+                format!("bridge request failed: {e}"),
+            )
+        })?;
 
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| (protocol::INTERNAL_ERROR, format!("bridge response parse error: {e}")))?;
+        let body: serde_json::Value = resp.json().await.map_err(|e| {
+            (
+                protocol::INTERNAL_ERROR,
+                format!("bridge response parse error: {e}"),
+            )
+        })?;
 
         // Convert from OpenAI function-calling format to MCP tool format
         let tools = body["tools"]
@@ -83,21 +85,26 @@ impl BridgeClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| (protocol::INTERNAL_ERROR, format!("bridge request failed: {e}")))?;
+            .map_err(|e| {
+                (
+                    protocol::INTERNAL_ERROR,
+                    format!("bridge request failed: {e}"),
+                )
+            })?;
 
         let status = resp.status();
         let status_code = status.as_u16();
-        let response_body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| {
-                let code = match status_code {
-                    401 | 403 => protocol::INVALID_REQUEST,
-                    404 => protocol::METHOD_NOT_FOUND,
-                    _ => protocol::INTERNAL_ERROR,
-                };
-                (code, format!("bridge response parse error (HTTP {status_code}): {e}"))
-            })?;
+        let response_body: serde_json::Value = resp.json().await.map_err(|e| {
+            let code = match status_code {
+                401 | 403 => protocol::INVALID_REQUEST,
+                404 => protocol::METHOD_NOT_FOUND,
+                _ => protocol::INTERNAL_ERROR,
+            };
+            (
+                code,
+                format!("bridge response parse error (HTTP {status_code}): {e}"),
+            )
+        })?;
 
         if !status.is_success() {
             let error_msg = response_body["error"]
@@ -115,8 +122,7 @@ impl BridgeClient {
 
         // MCP tool result format
         let data = &response_body["data"];
-        let text = serde_json::to_string_pretty(data)
-            .unwrap_or_else(|_| data.to_string());
+        let text = serde_json::to_string_pretty(data).unwrap_or_else(|_| data.to_string());
 
         Ok(json!({
             "content": [{
@@ -171,10 +177,7 @@ impl BridgeClient {
     }
 
     /// Read a resource from status-api.
-    pub async fn read_resource(
-        &self,
-        uri: &str,
-    ) -> Result<serde_json::Value, (i32, String)> {
+    pub async fn read_resource(&self, uri: &str) -> Result<serde_json::Value, (i32, String)> {
         let endpoint = match uri {
             "broodlink://agents" => "/api/v1/agents",
             "broodlink://tasks" => "/api/v1/tasks",
@@ -197,15 +200,21 @@ impl BridgeClient {
             .header("X-Broodlink-Api-Key", &self.status_api_key)
             .send()
             .await
-            .map_err(|e| (protocol::INTERNAL_ERROR, format!("status-api request failed: {e}")))?;
+            .map_err(|e| {
+                (
+                    protocol::INTERNAL_ERROR,
+                    format!("status-api request failed: {e}"),
+                )
+            })?;
 
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| (protocol::INTERNAL_ERROR, format!("status-api response parse error: {e}")))?;
+        let body: serde_json::Value = resp.json().await.map_err(|e| {
+            (
+                protocol::INTERNAL_ERROR,
+                format!("status-api response parse error: {e}"),
+            )
+        })?;
 
-        let text = serde_json::to_string_pretty(&body)
-            .unwrap_or_else(|_| body.to_string());
+        let text = serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string());
 
         Ok(json!({
             "contents": [{
@@ -267,9 +276,12 @@ pub async fn dispatch(
         "resources/list" => Ok(client.list_resources()),
 
         "resources/read" => {
-            let uri = params["uri"]
-                .as_str()
-                .ok_or_else(|| (protocol::INVALID_REQUEST, "missing resource URI".to_string()))?;
+            let uri = params["uri"].as_str().ok_or_else(|| {
+                (
+                    protocol::INVALID_REQUEST,
+                    "missing resource URI".to_string(),
+                )
+            })?;
             client.read_resource(uri).await
         }
 
@@ -320,7 +332,10 @@ pub async fn dispatch(
 
         _ => {
             warn!(method = %method, "unknown MCP method");
-            Err((protocol::METHOD_NOT_FOUND, format!("unknown method: {method}")))
+            Err((
+                protocol::METHOD_NOT_FOUND,
+                format!("unknown method: {method}"),
+            ))
         }
     }
 }

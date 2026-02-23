@@ -19,9 +19,6 @@
  * <https://www.gnu.org/licenses/>.
  */
 
-#![deny(clippy::unwrap_used)]
-#![deny(clippy::expect_used)]
-#![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
 use serde::Deserialize;
@@ -1009,8 +1006,8 @@ impl Config {
     /// Returns `config::ConfigError` if the config file is missing, malformed,
     /// or required fields are absent.
     pub fn load() -> Result<Self, config::ConfigError> {
-        let config_path = std::env::var("BROODLINK_CONFIG")
-            .unwrap_or_else(|_| "config.toml".to_string());
+        let config_path =
+            std::env::var("BROODLINK_CONFIG").unwrap_or_else(|_| "config.toml".to_string());
 
         let settings = config::Config::builder()
             .add_source(config::File::with_name(&config_path))
@@ -1138,10 +1135,16 @@ api_key_name = "STATUS_API_KEY"
 
     #[test]
     fn test_load_missing_file() {
-        std::env::set_var("BROODLINK_CONFIG", "/tmp/broodlink_nonexistent_config_12345.toml");
+        std::env::set_var(
+            "BROODLINK_CONFIG",
+            "/tmp/broodlink_nonexistent_config_12345.toml",
+        );
 
         let result = Config::load();
-        assert!(result.is_err(), "loading a nonexistent file should return an error");
+        assert!(
+            result.is_err(),
+            "loading a nonexistent file should return an error"
+        );
 
         std::env::remove_var("BROODLINK_CONFIG");
     }
@@ -1157,27 +1160,57 @@ api_key_name = "STATUS_API_KEY"
         let cfg = Config::load().unwrap();
 
         // Dolt defaults
-        assert_eq!(cfg.dolt.min_connections, 2, "dolt min_connections default should be 2");
-        assert_eq!(cfg.dolt.max_connections, 5, "dolt max_connections default should be 5");
+        assert_eq!(
+            cfg.dolt.min_connections, 2,
+            "dolt min_connections default should be 2"
+        );
+        assert_eq!(
+            cfg.dolt.max_connections, 5,
+            "dolt max_connections default should be 5"
+        );
 
         // Postgres defaults
-        assert_eq!(cfg.postgres.min_connections, 5, "pg min_connections default should be 5");
-        assert_eq!(cfg.postgres.max_connections, 20, "pg max_connections default should be 20");
+        assert_eq!(
+            cfg.postgres.min_connections, 5,
+            "pg min_connections default should be 5"
+        );
+        assert_eq!(
+            cfg.postgres.max_connections, 20,
+            "pg max_connections default should be 20"
+        );
 
         // Rate limits defaults
-        assert_eq!(cfg.rate_limits.requests_per_minute_per_agent, 60, "default rpm should be 60");
+        assert_eq!(
+            cfg.rate_limits.requests_per_minute_per_agent, 60,
+            "default rpm should be 60"
+        );
         assert_eq!(cfg.rate_limits.burst, 10, "default burst should be 10");
 
         // Ollama timeout default
-        assert_eq!(cfg.ollama.timeout_seconds, 30, "default ollama timeout should be 30");
+        assert_eq!(
+            cfg.ollama.timeout_seconds, 30,
+            "default ollama timeout should be 30"
+        );
 
         // Profile defaults
-        assert!(!cfg.profile.tls_interservice, "tls_interservice should default to false");
-        assert!(!cfg.profile.nats_cluster, "nats_cluster should default to false");
-        assert_eq!(cfg.profile.secrets_provider, "sops", "secrets_provider should default to sops");
+        assert!(
+            !cfg.profile.tls_interservice,
+            "tls_interservice should default to false"
+        );
+        assert!(
+            !cfg.profile.nats_cluster,
+            "nats_cluster should default to false"
+        );
+        assert_eq!(
+            cfg.profile.secrets_provider, "sops",
+            "secrets_provider should default to sops"
+        );
 
         // Agents defaults to empty
-        assert!(cfg.agents.is_empty(), "agents should default to empty HashMap");
+        assert!(
+            cfg.agents.is_empty(),
+            "agents should default to empty HashMap"
+        );
 
         std::env::remove_var("BROODLINK_CONFIG");
     }
@@ -1193,12 +1226,18 @@ api_key_name = "STATUS_API_KEY"
         let cfg = Config::load().unwrap();
 
         // Telemetry defaults
-        assert!(!cfg.telemetry.enabled, "telemetry should default to disabled");
+        assert!(
+            !cfg.telemetry.enabled,
+            "telemetry should default to disabled"
+        );
         assert_eq!(cfg.telemetry.otlp_endpoint, "http://localhost:4317");
         assert!((cfg.telemetry.sample_rate - 1.0).abs() < f64::EPSILON);
 
         // MCP server defaults
-        assert!(cfg.mcp_server.enabled, "mcp_server should default to enabled");
+        assert!(
+            cfg.mcp_server.enabled,
+            "mcp_server should default to enabled"
+        );
         assert_eq!(cfg.mcp_server.port, 3311);
         assert_eq!(cfg.mcp_server.bridge_url, "http://localhost:3310");
         assert_eq!(cfg.mcp_server.agent_id, "mcp-server");
@@ -1235,7 +1274,10 @@ api_key_name = "STATUS_API_KEY"
 
         // v0.4.0: MemorySearch defaults
         assert!((cfg.memory_search.decay_lambda - 0.01).abs() < f64::EPSILON);
-        assert_eq!(cfg.memory_search.reranker_model, "snowflake-arctic-embed2:137m");
+        assert_eq!(
+            cfg.memory_search.reranker_model,
+            "snowflake-arctic-embed2:137m"
+        );
         assert!(cfg.memory_search.reranker_enabled);
         assert_eq!(cfg.memory_search.max_content_length, 2000);
 

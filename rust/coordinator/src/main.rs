@@ -19,9 +19,6 @@
  * <https://www.gnu.org/licenses/>.
  */
 
-#![deny(clippy::unwrap_used)]
-#![deny(clippy::expect_used)]
-#![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
 use std::collections::HashMap;
@@ -419,7 +416,8 @@ fn rank_agents(
         .into_iter()
         .map(|agent| {
             let m = metrics.get(&agent.agent_id);
-            let (score, breakdown) = compute_score(&agent, m, formula_name, weights, new_agent_bonus);
+            let (score, breakdown) =
+                compute_score(&agent, m, formula_name, weights, new_agent_bonus);
             ScoredAgent {
                 agent,
                 score,
@@ -429,7 +427,11 @@ fn rank_agents(
         .collect();
 
     // Sort descending by score
-    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     scored
 }
 
@@ -678,7 +680,9 @@ async fn load_formula_from_registry(
 
         // Parse JSONB definition into FormulaFile
         let formula: FormulaFile = serde_json::from_value(definition).map_err(|e| {
-            BroodlinkError::Internal(format!("failed to parse registry formula {formula_name}: {e}"))
+            BroodlinkError::Internal(format!(
+                "failed to parse registry formula {formula_name}: {e}"
+            ))
         })?;
 
         if formula.steps.is_empty() {
@@ -687,12 +691,20 @@ async fn load_formula_from_registry(
             )));
         }
 
-        info!(formula = formula_name, source = "registry", "loaded formula from Postgres registry");
+        info!(
+            formula = formula_name,
+            source = "registry",
+            "loaded formula from Postgres registry"
+        );
         return Ok(formula);
     }
 
     // Fall back to TOML file
-    info!(formula = formula_name, source = "toml", "formula not in registry, falling back to TOML");
+    info!(
+        formula = formula_name,
+        source = "toml",
+        "formula not in registry, falling back to TOML"
+    );
     load_formula(config, formula_name)
 }
 
@@ -810,7 +822,8 @@ async fn handle_workflow_start(
         "starting workflow"
     );
 
-    let formula = load_formula_from_registry(&state.pg, &state.config, &payload.formula_name).await?;
+    let formula =
+        load_formula_from_registry(&state.pg, &state.config, &payload.formula_name).await?;
     let total_steps = formula.steps.len() as i32;
 
     // Update workflow_runs with total_steps and set status to running
@@ -1025,13 +1038,12 @@ async fn handle_task_completed(
         .await?;
 
         // Check if more parallel tasks pending
-        let pending: i32 = sqlx::query_as::<_, (i32,)>(
-            "SELECT parallel_pending FROM workflow_runs WHERE id = $1",
-        )
-        .bind(&workflow_run_id)
-        .fetch_one(&state.pg)
-        .await?
-        .0;
+        let pending: i32 =
+            sqlx::query_as::<_, (i32,)>("SELECT parallel_pending FROM workflow_runs WHERE id = $1")
+                .bind(&workflow_run_id)
+                .fetch_one(&state.pg)
+                .await?
+                .0;
 
         if pending > 0 {
             info!(
@@ -1115,9 +1127,16 @@ async fn handle_task_completed(
                     }
                 }
                 create_step_task(
-                    state, &workflow_run_id, &convoy_id, &formula_name,
-                    &formula, si, &params, &step_results,
-                ).await?;
+                    state,
+                    &workflow_run_id,
+                    &convoy_id,
+                    &formula_name,
+                    &formula,
+                    si,
+                    &params,
+                    &step_results,
+                )
+                .await?;
             }
         } else {
             // Sequential step — evaluate condition
@@ -1129,9 +1148,16 @@ async fn handle_task_completed(
                     let skip_step = advance_to + 1;
                     if skip_step < total_steps as usize {
                         create_step_task(
-                            state, &workflow_run_id, &convoy_id, &formula_name,
-                            &formula, skip_step, &params, &step_results,
-                        ).await?;
+                            state,
+                            &workflow_run_id,
+                            &convoy_id,
+                            &formula_name,
+                            &formula,
+                            skip_step,
+                            &params,
+                            &step_results,
+                        )
+                        .await?;
                     } else {
                         // All remaining steps skipped — complete workflow
                         sqlx::query(
@@ -1147,9 +1173,16 @@ async fn handle_task_completed(
                 }
             }
             create_step_task(
-                state, &workflow_run_id, &convoy_id, &formula_name,
-                &formula, advance_to, &params, &step_results,
-            ).await?;
+                state,
+                &workflow_run_id,
+                &convoy_id,
+                &formula_name,
+                &formula,
+                advance_to,
+                &params,
+                &step_results,
+            )
+            .await?;
         }
     } else {
         // All steps done — mark workflow as completed
@@ -1662,7 +1695,9 @@ async fn handle_task_available(
 
         // 3b. Fetch metrics from Postgres and score all candidates
         let agent_ids: Vec<String> = agents.iter().map(|a| a.agent_id.clone()).collect();
-        let metrics = fetch_agent_metrics(&state.pg, &agent_ids).await.unwrap_or_default();
+        let metrics = fetch_agent_metrics(&state.pg, &agent_ids)
+            .await
+            .unwrap_or_default();
 
         let scored = rank_agents(
             agents,
@@ -1784,7 +1819,11 @@ async fn handle_task_available(
         state.config.nats.subject_prefix, state.config.broodlink.env,
     );
     if let Ok(bytes) = serde_json::to_vec(&routing_decision) {
-        if let Err(e) = state.nats.publish(routing_subject.clone(), bytes.into()).await {
+        if let Err(e) = state
+            .nats
+            .publish(routing_subject.clone(), bytes.into())
+            .await
+        {
             warn!(error = %e, subject = %routing_subject, "failed to publish routing decision");
         }
     }
@@ -1803,9 +1842,7 @@ async fn handle_task_available(
 
     let dispatch_subject = format!(
         "{}.{}.agent.{}.task",
-        state.config.nats.subject_prefix,
-        state.config.broodlink.env,
-        claiming_agent,
+        state.config.nats.subject_prefix, state.config.broodlink.env, claiming_agent,
     );
 
     let dispatch_payload = TaskDispatchPayload {
@@ -1819,7 +1856,11 @@ async fn handle_task_available(
     };
 
     if let Ok(bytes) = serde_json::to_vec(&dispatch_payload) {
-        if let Err(e) = state.nats.publish(dispatch_subject.clone(), bytes.into()).await {
+        if let Err(e) = state
+            .nats
+            .publish(dispatch_subject.clone(), bytes.into())
+            .await
+        {
             warn!(
                 error = %e,
                 subject = %dispatch_subject,
@@ -2158,11 +2199,13 @@ async fn main() {
         process::exit(1);
     });
 
-    let _telemetry_guard = broodlink_telemetry::init_telemetry(SERVICE_NAME, &boot_config.telemetry)
-        .unwrap_or_else(|e| {
-            eprintln!("fatal: telemetry init failed: {e}");
-            process::exit(1);
-        });
+    let _telemetry_guard =
+        broodlink_telemetry::init_telemetry(SERVICE_NAME, &boot_config.telemetry).unwrap_or_else(
+            |e| {
+                eprintln!("fatal: telemetry init failed: {e}");
+                process::exit(1);
+            },
+        );
 
     info!(
         service = SERVICE_NAME,
@@ -2202,7 +2245,9 @@ async fn main() {
     let task_completed_state = Arc::clone(&state);
     let task_completed_shutdown = shutdown_rx.clone();
     let task_completed_handle = tokio::spawn(async move {
-        if let Err(e) = run_task_completed_subscription(task_completed_state, task_completed_shutdown).await {
+        if let Err(e) =
+            run_task_completed_subscription(task_completed_state, task_completed_shutdown).await
+        {
             error!(error = %e, "task_completed subscription failed");
         }
     });
@@ -2210,7 +2255,8 @@ async fn main() {
     let task_failed_state = Arc::clone(&state);
     let task_failed_shutdown = shutdown_rx.clone();
     let task_failed_handle = tokio::spawn(async move {
-        if let Err(e) = run_task_failed_subscription(task_failed_state, task_failed_shutdown).await {
+        if let Err(e) = run_task_failed_subscription(task_failed_state, task_failed_shutdown).await
+        {
             error!(error = %e, "task_failed subscription failed");
         }
     });
@@ -2240,12 +2286,24 @@ async fn main() {
     // Wait for tasks to complete with a timeout
     let shutdown_timeout = Duration::from_secs(10);
     match tokio::time::timeout(shutdown_timeout, async {
-        if let Err(e) = sub_handle.await { warn!(error = %e, "subscription task panicked"); }
-        if let Err(e) = wf_start_handle.await { warn!(error = %e, "workflow start task panicked"); }
-        if let Err(e) = task_completed_handle.await { warn!(error = %e, "task completed handler panicked"); }
-        if let Err(e) = task_failed_handle.await { warn!(error = %e, "task failed handler panicked"); }
-        if let Err(e) = metrics_handle.await { warn!(error = %e, "metrics task panicked"); }
-        if let Err(e) = dlq_handle.await { warn!(error = %e, "DLQ retry task panicked"); }
+        if let Err(e) = sub_handle.await {
+            warn!(error = %e, "subscription task panicked");
+        }
+        if let Err(e) = wf_start_handle.await {
+            warn!(error = %e, "workflow start task panicked");
+        }
+        if let Err(e) = task_completed_handle.await {
+            warn!(error = %e, "task completed handler panicked");
+        }
+        if let Err(e) = task_failed_handle.await {
+            warn!(error = %e, "task failed handler panicked");
+        }
+        if let Err(e) = metrics_handle.await {
+            warn!(error = %e, "metrics task panicked");
+        }
+        if let Err(e) = dlq_handle.await {
+            warn!(error = %e, "DLQ retry task panicked");
+        }
     })
     .await
     {
@@ -2397,7 +2455,10 @@ mod tests {
         assert_eq!(json["title"], "Test task");
         assert_eq!(json["priority"], 5);
         assert_eq!(json["assigned_by"], "coordinator");
-        assert!(json["description"].is_null(), "None fields should serialize as null");
+        assert!(
+            json["description"].is_null(),
+            "None fields should serialize as null"
+        );
     }
 
     // ----- Scoring algorithm tests -----
@@ -2420,7 +2481,10 @@ mod tests {
         let now = chrono::Utc::now().naive_utc();
         let ts = now.format("%Y-%m-%d %H:%M:%S").to_string();
         let score = recency_score(Some(&ts));
-        assert!(score > 0.95, "just-now timestamp should score ~1.0, got {score}");
+        assert!(
+            score > 0.95,
+            "just-now timestamp should score ~1.0, got {score}"
+        );
     }
 
     #[test]
@@ -2428,7 +2492,10 @@ mod tests {
         let old = chrono::Utc::now().naive_utc() - chrono::Duration::hours(1);
         let ts = old.format("%Y-%m-%d %H:%M:%S").to_string();
         let score = recency_score(Some(&ts));
-        assert!(score < f64::EPSILON, "1-hour-old timestamp should score 0.0, got {score}");
+        assert!(
+            score < f64::EPSILON,
+            "1-hour-old timestamp should score 0.0, got {score}"
+        );
     }
 
     #[test]
@@ -2437,7 +2504,10 @@ mod tests {
         let mid = chrono::Utc::now().naive_utc() - chrono::Duration::minutes(15);
         let ts = mid.format("%Y-%m-%d %H:%M:%S").to_string();
         let score = recency_score(Some(&ts));
-        assert!(score > 0.2 && score < 0.8, "15-min-old should be mid-range, got {score}");
+        assert!(
+            score > 0.2 && score < 0.8,
+            "15-min-old should be mid-range, got {score}"
+        );
     }
 
     #[test]
@@ -2489,7 +2559,10 @@ mod tests {
         let (_, breakdown) = compute_score(&agent, Some(&metrics), None, &weights, 1.0);
 
         // availability: 1.0 - (3/3) = 0.0
-        assert!(breakdown.availability < f64::EPSILON, "fully loaded agent should have 0 availability");
+        assert!(
+            breakdown.availability < f64::EPSILON,
+            "fully loaded agent should have 0 availability"
+        );
     }
 
     #[test]
@@ -2501,19 +2574,31 @@ mod tests {
         let mut metrics = HashMap::new();
         metrics.insert(
             "low-success".to_string(),
-            AgentMetrics { success_rate: 0.3, current_load: 0 },
+            AgentMetrics {
+                success_rate: 0.3,
+                current_load: 0,
+            },
         );
         metrics.insert(
             "high-success".to_string(),
-            AgentMetrics { success_rate: 0.95, current_load: 0 },
+            AgentMetrics {
+                success_rate: 0.95,
+                current_load: 0,
+            },
         );
 
         let weights = default_weights();
         let ranked = rank_agents(agents, &metrics, None, &weights, 1.0);
 
         assert_eq!(ranked.len(), 2);
-        assert_eq!(ranked[0].agent.agent_id, "high-success", "higher score first");
-        assert!(ranked[0].score >= ranked[1].score, "should be sorted descending");
+        assert_eq!(
+            ranked[0].agent.agent_id, "high-success",
+            "higher score first"
+        );
+        assert!(
+            ranked[0].score >= ranked[1].score,
+            "should be sorted descending"
+        );
     }
 
     #[test]
@@ -2604,7 +2689,8 @@ mod tests {
 
     #[test]
     fn test_task_completed_payload_deserialization() {
-        let json_str = r#"{"task_id":"t-1","agent_id":"claude","result_data":{"sources":["a","b"]}}"#;
+        let json_str =
+            r#"{"task_id":"t-1","agent_id":"claude","result_data":{"sources":["a","b"]}}"#;
         let payload: TaskCompletedPayload = serde_json::from_str(json_str).unwrap();
         assert_eq!(payload.task_id, "t-1");
         assert_eq!(payload.agent_id, "claude");
@@ -2630,7 +2716,8 @@ mod tests {
     #[test]
     fn test_load_formula_research() {
         // Parse the formula TOML directly from the workspace
-        let content = std::fs::read_to_string("../../.beads/formulas/research.formula.toml").unwrap();
+        let content =
+            std::fs::read_to_string("../../.beads/formulas/research.formula.toml").unwrap();
         let formula: FormulaFile = toml::from_str(&content).unwrap();
         assert_eq!(formula.formula.name, "research");
         assert_eq!(formula.steps.len(), 3);
@@ -2643,7 +2730,8 @@ mod tests {
 
     #[test]
     fn test_load_formula_build_feature() {
-        let content = std::fs::read_to_string("../../.beads/formulas/build-feature.formula.toml").unwrap();
+        let content =
+            std::fs::read_to_string("../../.beads/formulas/build-feature.formula.toml").unwrap();
         let formula: FormulaFile = toml::from_str(&content).unwrap();
         assert_eq!(formula.formula.name, "build-feature");
         assert_eq!(formula.steps.len(), 4);
@@ -2731,7 +2819,10 @@ output = "result"
 
         let formula: FormulaFile = serde_json::from_value(definition).unwrap();
         assert_eq!(formula.formula.name, "test-jsonb");
-        assert_eq!(formula.formula.description.as_deref(), Some("A test formula from JSONB"));
+        assert_eq!(
+            formula.formula.description.as_deref(),
+            Some("A test formula from JSONB")
+        );
         assert_eq!(formula.steps.len(), 1);
         assert_eq!(formula.steps[0].name, "step_1");
         assert_eq!(formula.steps[0].agent_role, "researcher");
