@@ -196,6 +196,7 @@ pub struct AppState {
     pub api_key: String,
     pub start_time: Instant,
     pub login_attempts: RwLock<HashMap<String, (u32, Instant)>>,
+    pub http_client: reqwest::Client,
 }
 
 // ---------------------------------------------------------------------------
@@ -400,6 +401,7 @@ async fn init_state() -> Result<AppState, StatusApiError> {
         api_key,
         start_time: Instant::now(),
         login_attempts: RwLock::new(HashMap::new()),
+        http_client: reqwest::Client::new(),
     })
 }
 
@@ -472,6 +474,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/users/:id/role", post(handler_change_role))
         .route("/users/:id/toggle", post(handler_toggle_user))
         .route("/users/:id/reset-password", post(handler_reset_password))
+        // Telegram bot registration
+        .route("/telegram/status", get(handler_telegram_status))
+        .route("/telegram/register", post(handler_telegram_register))
+        .route("/telegram/disconnect", post(handler_telegram_disconnect))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
@@ -3261,6 +3267,176 @@ async fn handler_reset_password(
     Ok(ok_response(serde_json::json!({
         "id": user_id,
         "password_reset": true,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Telegram bot registration
+// ---------------------------------------------------------------------------
+
+async fn handler_telegram_status(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let row = sqlx::query_as::<_, (String, Option<String>, Option<String>, bool, Option<String>)>(
+        "SELECT bot_token, bot_username, webhook_url, enabled, registered_at::text
+         FROM platform_credentials WHERE platform = 'telegram'",
+    )
+    .fetch_optional(&state.pg)
+    .await?;
+
+    match row {
+        Some((_token, username, webhook_url, enabled, registered_at)) => {
+            Ok(ok_response(serde_json::json!({
+                "configured": true,
+                "enabled": enabled,
+                "bot_username": username,
+                "webhook_url": webhook_url,
+                "registered_at": registered_at,
+            })))
+        }
+        None => Ok(ok_response(serde_json::json!({"configured": false}))),
+    }
+}
+
+async fn handler_telegram_register(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let bot_token = body
+        .get("bot_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if bot_token.is_empty() {
+        return Err(StatusApiError::BadRequest("bot_token is required".into()));
+    }
+    let webhook_url = body
+        .get("webhook_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if webhook_url.is_empty() {
+        return Err(StatusApiError::BadRequest("webhook_url is required".into()));
+    }
+    let secret_token = body
+        .get("secret_token")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    // Step 1: Verify token with getMe
+    let me_url = format!("https://api.telegram.org/bot{bot_token}/getMe");
+    let me_resp = state
+        .http_client
+        .get(&me_url)
+        .send()
+        .await
+        .map_err(|e| StatusApiError::Internal(format!("Telegram API call failed: {e}")))?;
+
+    if !me_resp.status().is_success() {
+        let status = me_resp.status();
+        let text = me_resp.text().await.unwrap_or_default();
+        return Err(StatusApiError::BadRequest(format!(
+            "Invalid bot token (Telegram returned {status}): {text}"
+        )));
+    }
+
+    let me_body: serde_json::Value = me_resp
+        .json()
+        .await
+        .map_err(|e| StatusApiError::Internal(format!("failed to parse getMe response: {e}")))?;
+
+    let bot_username = me_body
+        .get("result")
+        .and_then(|r| r.get("username"))
+        .and_then(|u| u.as_str())
+        .map(|u| format!("@{u}"));
+    let bot_id = me_body
+        .get("result")
+        .and_then(|r| r.get("id"))
+        .and_then(|id| id.as_i64())
+        .map(|id| id.to_string());
+
+    // Step 2: Register webhook with Telegram
+    let mut webhook_payload = serde_json::json!({
+        "url": webhook_url,
+    });
+    if let Some(ref secret) = secret_token {
+        webhook_payload["secret_token"] = serde_json::Value::String(secret.clone());
+    }
+
+    let hook_url = format!("https://api.telegram.org/bot{bot_token}/setWebhook");
+    let hook_resp = state
+        .http_client
+        .post(&hook_url)
+        .json(&webhook_payload)
+        .send()
+        .await
+        .map_err(|e| StatusApiError::Internal(format!("setWebhook call failed: {e}")))?;
+
+    if !hook_resp.status().is_success() {
+        let status = hook_resp.status();
+        let text = hook_resp.text().await.unwrap_or_default();
+        return Err(StatusApiError::Internal(format!(
+            "setWebhook failed ({status}): {text}"
+        )));
+    }
+
+    // Step 3: Upsert into platform_credentials
+    sqlx::query(
+        "INSERT INTO platform_credentials (platform, bot_token, secret_token, webhook_url, bot_username, bot_id, registered_at)
+         VALUES ('telegram', $1, $2, $3, $4, $5, NOW())
+         ON CONFLICT (platform) DO UPDATE SET
+           bot_token = EXCLUDED.bot_token,
+           secret_token = EXCLUDED.secret_token,
+           webhook_url = EXCLUDED.webhook_url,
+           bot_username = EXCLUDED.bot_username,
+           bot_id = EXCLUDED.bot_id,
+           enabled = true,
+           registered_at = NOW(),
+           updated_at = NOW()",
+    )
+    .bind(bot_token)
+    .bind(&secret_token)
+    .bind(webhook_url)
+    .bind(&bot_username)
+    .bind(&bot_id)
+    .execute(&state.pg)
+    .await?;
+
+    info!(bot_username = ?bot_username, "Telegram bot registered");
+
+    Ok(ok_response(serde_json::json!({
+        "ok": true,
+        "bot_username": bot_username,
+        "bot_id": bot_id,
+    })))
+}
+
+async fn handler_telegram_disconnect(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    // Read token to call deleteWebhook
+    let row = sqlx::query_as::<_, (String,)>(
+        "SELECT bot_token FROM platform_credentials WHERE platform = 'telegram'",
+    )
+    .fetch_optional(&state.pg)
+    .await?;
+
+    if let Some((token,)) = row {
+        let url = format!("https://api.telegram.org/bot{token}/deleteWebhook");
+        let resp = state.http_client.post(&url).send().await;
+        if let Err(e) = resp {
+            warn!(error = %e, "deleteWebhook call failed (continuing with removal)");
+        }
+    }
+
+    sqlx::query("DELETE FROM platform_credentials WHERE platform = 'telegram'")
+        .execute(&state.pg)
+        .await?;
+
+    info!("Telegram bot disconnected");
+
+    Ok(ok_response(serde_json::json!({
+        "ok": true,
+        "disconnected": true,
     })))
 }
 

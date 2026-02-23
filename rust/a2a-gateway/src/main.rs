@@ -128,6 +128,9 @@ struct AppState {
     bridge_jwt: String,
     http_client: reqwest::Client,
     api_key: Option<String>,
+    /// Cached Telegram credentials from platform_credentials table.
+    /// (bot_token, secret_token, fetched_at)
+    telegram_creds: tokio::sync::RwLock<Option<(String, Option<String>, std::time::Instant)>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +245,7 @@ async fn main() {
         http_client: reqwest::Client::new(),
         api_key,
         config: Arc::clone(&config),
+        telegram_creds: tokio::sync::RwLock::new(None),
     });
 
     // Spawn chat reply delivery loop
@@ -1653,6 +1657,51 @@ async fn webhook_teams_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Telegram credential lookup (DB with cache, config fallback)
+// ---------------------------------------------------------------------------
+
+/// Returns (bot_token, secret_token) from DB cache, falling back to config.
+async fn get_telegram_creds(state: &AppState) -> (Option<String>, Option<String>) {
+    // Check cache (60s TTL)
+    {
+        let guard = state.telegram_creds.read().await;
+        if let Some((token, secret, fetched)) = guard.as_ref() {
+            if fetched.elapsed() < std::time::Duration::from_secs(60) {
+                return (Some(token.clone()), secret.clone());
+            }
+        }
+    }
+
+    // Query DB
+    let row = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT bot_token, secret_token FROM platform_credentials WHERE platform = 'telegram' AND enabled = true",
+    )
+    .fetch_optional(&state.pg)
+    .await
+    .ok()
+    .flatten();
+
+    if let Some((token, secret)) = row {
+        let mut guard = state.telegram_creds.write().await;
+        *guard = Some((token.clone(), secret.clone(), std::time::Instant::now()));
+        return (Some(token), secret);
+    }
+
+    // Fallback to config
+    let token = state.config.webhooks.telegram_bot_token.clone();
+    let secret = state.config.webhooks.telegram_secret_token.clone();
+    if token.is_some() {
+        let mut guard = state.telegram_creds.write().await;
+        *guard = Some((
+            token.clone().unwrap_or_default(),
+            secret.clone(),
+            std::time::Instant::now(),
+        ));
+    }
+    (token, secret)
+}
+
+// ---------------------------------------------------------------------------
 // POST /webhook/telegram — receive Telegram bot updates
 // ---------------------------------------------------------------------------
 
@@ -1665,8 +1714,9 @@ async fn webhook_telegram_handler(
         return (StatusCode::NOT_FOUND, "webhooks disabled").into_response();
     }
 
-    // Verify Telegram secret token if configured
-    if let Some(ref secret) = state.config.webhooks.telegram_secret_token {
+    // Verify Telegram secret token if configured (DB-first, config fallback)
+    let (_tg_token, tg_secret) = get_telegram_creds(&state).await;
+    if let Some(ref secret) = tg_secret {
         let provided = headers
             .get("X-Telegram-Bot-Api-Secret-Token")
             .and_then(|v| v.to_str().ok())
@@ -2203,7 +2253,8 @@ async fn deliver_telegram(
     thread_id: Option<&str>,
     text: &str,
 ) -> Result<(), String> {
-    let token = state.config.webhooks.telegram_bot_token.as_deref().unwrap_or("");
+    let (tg_token, _) = get_telegram_creds(state).await;
+    let token = tg_token.unwrap_or_default();
     if token.is_empty() {
         return Err("no telegram_bot_token configured".to_string());
     }

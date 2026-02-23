@@ -36,6 +36,7 @@
   <button role="tab" aria-selected="false" aria-controls="panel-chat" id="tab-chat" class="tab" data-tab="chat">Chat</button>
   <button role="tab" aria-selected="false" aria-controls="panel-formulas" id="tab-formulas" class="tab" data-tab="formulas">Formulas</button>
   <button role="tab" aria-selected="false" aria-controls="panel-users" id="tab-users" class="tab" data-tab="users">Users</button>
+  <button role="tab" aria-selected="false" aria-controls="panel-telegram" id="tab-telegram" class="tab" data-tab="telegram">Telegram</button>
 </nav>
 
 <!-- Toast container -->
@@ -268,6 +269,16 @@
     </thead>
     <tbody id="ctrl-users-tbody" aria-live="polite"></tbody>
   </table>
+</section>
+
+<!-- Telegram Bot Tab -->
+<section role="tabpanel" id="panel-telegram" aria-labelledby="tab-telegram" hidden>
+  <div class="ctrl-section-header">
+    <h3>Telegram Bot</h3>
+  </div>
+  <div id="ctrl-telegram-content" aria-live="polite">
+    <p style="color:var(--muted)">Loading...</p>
+  </div>
 </section>
 
 {{ end }}
