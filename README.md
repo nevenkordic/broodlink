@@ -82,7 +82,7 @@ After startup, you'll have:
 5. **Multi-agent collaboration** -- `decompose_task` splits work into sub-tasks with merge strategies (concatenate, vote, best) -- `create_workspace` + `workspace_read`/`workspace_write` for shared context -- coordinator tracks child completions and auto-merges results
 6. **Budget enforcement** -- `check_budget` middleware deducts tokens per tool call -- `set_budget`/`get_budget` tools for management -- daily replenishment via heartbeat -- `BudgetExhausted` error (402) blocks calls when depleted
 7. **Webhook gateway** -- a2a-gateway receives Slack slash commands, Teams bot messages, Telegram updates -- parses `/broodlink <command>` into tool calls -- outbound notifications for agent.offline, task.failed, budget.low, workflow events, guardrail violations
-8. **Conversational gateway** (v0.7.0) -- a2a-gateway receives Slack/Teams/Telegram messages → creates chat sessions → routes to coordinator for task creation → delivers replies via platform-specific APIs -- `list_chat_sessions`/`reply_to_chat` tools for agent interaction
+8. **Conversational gateway** (v0.7.0) -- a2a-gateway receives Slack/Teams/Telegram messages → creates chat sessions → routes to coordinator for task creation → delivers replies via platform-specific APIs -- `list_chat_sessions`/`reply_to_chat` tools for agent interaction -- direct Ollama LLM chat with tool calling (Brave Search for real-time queries: weather, news, scores) -- efficiency safeguards: Ollama concurrency semaphore (configurable, default 1), Brave search result cache (5-min TTL), duplicate message suppression (30s dedup window checked before any DB/bridge work), periodic typing indicator refresh (every 4s via `tokio::select!`) -- busy/dedup replies excluded from conversation history to prevent context pollution
 9. **Formula registry** (v0.7.0) -- coordinator loads formula definitions from Postgres `formula_registry` table (TOML fallback) -- `list_formulas`/`get_formula`/`create_formula`/`update_formula` tools for CRUD -- seed script populates system formulas from `.beads/formulas/`
 10. **Dashboard auth** (v0.7.0) -- session-based RBAC (viewer/operator/admin) -- bcrypt passwords, session tokens in Postgres -- API key fallback when auth disabled -- role enforcement in JS control panel
 11. **Heartbeat cycle** (every 5 min) -- Dolt commit, Beads issue sync, agent metrics computation, daily summary generation, stale agent deactivation, memory search index sync (Dolt → Postgres), knowledge graph backfill, KG entity/edge expiry with weight decay, daily budget replenishment, chat session expiry, dashboard session cleanup
@@ -92,7 +92,7 @@ After startup, you'll have:
 | Database | Port | Purpose |
 |----------|------|---------|
 | **Dolt** (MySQL wire protocol) | 3307 | Versioned brain: agent_memory, decisions, agent_profiles, projects, skills, beads_issues, daily_summary |
-| **PostgreSQL** | 5432 | Hot paths: task_queue, messages, work_log, audit_log, outbox, residency_log, approval_policies, approval_gates, agent_metrics, delegations, streams, guardrail_policies, guardrail_violations, a2a_task_map, workflow_runs, memory_search_index (BM25 full-text), kg_entities, kg_edges, kg_entity_memories, budget_transactions, tool_cost_map, dead_letter_queue, task_decompositions, shared_workspaces, webhook_endpoints, webhook_log, chat_sessions, chat_messages, chat_reply_queue, formula_registry, dashboard_users, dashboard_sessions |
+| **PostgreSQL** | 5432 | Hot paths: task_queue, messages, work_log, audit_log, outbox, residency_log, approval_policies, approval_gates, agent_metrics, delegations, streams, guardrail_policies, guardrail_violations, a2a_task_map, workflow_runs, memory_search_index (BM25 full-text), kg_entities, kg_edges, kg_entity_memories, budget_transactions, tool_cost_map, dead_letter_queue, task_decompositions, shared_workspaces, webhook_endpoints, webhook_log, chat_sessions, chat_messages, chat_reply_queue, formula_registry, dashboard_users, dashboard_sessions, platform_credentials |
 | **Qdrant** | 6333 | Semantic vector search: `broodlink_memory` (768-dim nomic-embed-text) for hybrid_search, `broodlink_kg_entities` (768-dim) for knowledge graph entity similarity |
 
 ## Services
@@ -105,7 +105,7 @@ After startup, you'll have:
 | embedding-worker | -- | NATS + DB | Outbox poll -- Ollama `nomic-embed-text` embeddings -- Qdrant upsert -- LLM entity extraction for knowledge graph, circuit breakers |
 | status-api | 3312 | HTTP | Dashboard API with API key + session auth (RBAC), CORS, SSE stream proxy, control panel endpoints (agent toggle, budget set, task cancel, webhook CRUD, guardrails, DLQ), chat session management, formula registry CRUD, user management |
 | mcp-server | 3311 | HTTP + stdio | MCP protocol server (streamable HTTP + legacy stdio), proxies bridge tools |
-| a2a-gateway | 3313 | HTTP | Google A2A protocol gateway, AgentCard discovery, cross-system task delegation, webhook gateway for Slack/Teams/Telegram with inbound command parsing and outbound event notifications, conversational chat gateway with session management and greeting support |
+| a2a-gateway | 3313 | HTTP | Google A2A protocol gateway, AgentCard discovery, cross-system task delegation, webhook gateway for Slack/Teams/Telegram with inbound command parsing and outbound event notifications, conversational chat gateway with session management, greeting support, direct Ollama LLM chat with Brave Search tool calling, concurrency semaphore, search cache, dedup, and typing refresh |
 
 ### Shared Crates
 
@@ -165,12 +165,13 @@ The E2E suite covers: service health, JWT/API key auth, all tool categories, sta
 | `scripts/start-services.sh` | Start/stop all 7 Rust services + Hugo (`--stop` to stop) |
 | `scripts/build.sh` | cargo deny + tests + release build + Hugo |
 | `scripts/secrets-init.sh` | Generate JWT keypair, create `.secrets/env`, scaffold `secrets.skeleton.json` |
-| `scripts/db-setup.sh` | Create databases, run all 23 migrations, create Qdrant collections |
+| `scripts/db-setup.sh` | Create databases, run all 24 migrations, create Qdrant collections |
 | `scripts/rotate-jwt-keys.sh` | Generate new JWT keypair with kid fingerprint, retire old keys after grace period |
 | `scripts/backfill-search-index.sh` | One-time backfill of Postgres memory_search_index from Dolt agent_memory |
 | `scripts/backfill-knowledge-graph.sh` | One-time backfill of knowledge graph entities from existing memories |
 | `scripts/seed-formulas.sh` | Seed formula_registry from `.beads/formulas/*.formula.toml` (idempotent) |
 | `scripts/create-admin.sh` | Create dashboard admin user with bcrypt password |
+| `scripts/start-gateway.sh` | Start a2a-gateway with `.env` sourcing |
 | `scripts/onboard-agent.sh` | Register an agent: generate JWT, insert profile, create system prompt |
 | `scripts/dev.sh` | Start/stop dev stack (Podman containers + services) |
 | `scripts/launchagents.sh` | Install/manage macOS LaunchAgents for all services |
@@ -196,7 +197,7 @@ broodlink/
 ├── agents/                       # Python agent SDK (any OpenAI-compatible LLM)
 ├── status-site/                  # Hugo dashboard (WCAG 2.1 AA)
 │   └── themes/broodlink-status/
-├── migrations/                   # SQL migrations (23 files, additive only)
+├── migrations/                   # SQL migrations (24 files, additive only)
 │   ├── 001_dolt_brain.sql
 │   ├── 002_postgres_hotpaths.sql
 │   ├── 003_postgres_functions.sql
@@ -219,7 +220,8 @@ broodlink/
 │   ├── 018_webhooks.sql
 │   ├── 019_chat_sessions.sql
 │   ├── 020_formula_registry.sql
-│   └── 021_dashboard_auth.sql
+│   ├── 021_dashboard_auth.sql
+│   └── 024_platform_credentials_meta.sql
 ├── tests/                        # Integration + E2E test suites
 ├── templates/                    # System prompt template for agent onboarding
 ├── scripts/                      # Build, setup, onboarding, and dev scripts

@@ -13,6 +13,25 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
   in a2a-gateway with automatic chat session creation and platform-specific reply
   delivery. New Postgres tables: `chat_sessions`, `chat_messages`, `chat_reply_queue`
   (migration 019).
+- **Telegram Tool Calling with Brave Search**: Direct Ollama LLM chat loop with
+  `web_search` tool calling for real-time queries (weather, news, sports scores).
+  Tighter system prompt restricts tool use to real-time data only. Configurable
+  `num_ctx` (default 4096) and `tool_context_messages` (default 4) for CPU
+  inference efficiency. `.env` file loader with `unsafe set_var` for secrets.
+- **Chat Efficiency Safeguards**: Ollama concurrency semaphore (configurable,
+  default 1) returns busy message instantly instead of queuing. Brave search
+  result cache with TTL (default 5 min). Duplicate message suppression with
+  dedup window (default 30s) checked before any DB/bridge work. Periodic typing
+  indicator refresh every 4s via `tokio::select!`. Busy/dedup replies excluded
+  from `chat_messages` to prevent conversation history pollution. Dedup
+  check-and-insert uses single write lock (no TOCTOU race). Shared
+  `normalize_search_query` for cache and dedup key normalization.
+- **Platform Credentials**: `platform_credentials` table (migration 024) for
+  storing Telegram bot tokens and other platform secrets with JSONB metadata.
+  Telegram poll offset persisted across restarts via `meta->>'poll_offset'`.
+- **Telegram Long-Polling**: `getUpdates`-based polling loop with configurable
+  offset persistence, automatic token cache invalidation on errors, and typing
+  indicators.
 - **Formula Registry**: Persistent formula storage in Postgres `formula_registry`
   table (migration 020) with CRUD tools (`create_formula`, `get_formula`,
   `update_formula`, `delete_formula`, `list_formulas`). Seed script
@@ -32,6 +51,12 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 - `scripts/create-admin.sh` for bootstrapping dashboard admin users with
   pgcrypto fallback (no Python bcrypt dependency required).
 - Heartbeat: chat session expiry and dashboard session cleanup cycles.
+- New config fields: `[ollama].num_ctx`, `[a2a].ollama_concurrency`,
+  `[a2a].dedup_window_secs`, `[a2a].busy_message`, `[chat].chat_model`,
+  `[chat.tools].web_search_enabled`, `[chat.tools].max_tool_rounds`,
+  `[chat.tools].search_result_count`, `[chat.tools].tool_context_messages`,
+  `[chat.tools].search_cache_ttl_secs`.
+- `scripts/start-gateway.sh` wrapper for `.env` sourcing.
 - 6 new beads-bridge tools (78 -> 84): `list_chat_sessions`, `reply_to_chat`,
   `create_formula`, `get_formula`, `update_formula`, `list_formulas`.
 - 4 new status-api endpoint groups: `/api/v1/chat/*`, `/api/v1/formulas/*`,
