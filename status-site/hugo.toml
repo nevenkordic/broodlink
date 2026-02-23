@@ -5,7 +5,7 @@ theme            = "broodlink-status"
 
 [params]
   statusApiUrl    = "http://localhost:3312"
-  statusApiKey    = ""  # set via environment or override in production
+  statusApiKey    = "dev-api-key"  # set via BROODLINK_STATUS_API_KEY in production
   refreshInterval = 10000
   company         = "Broodlink"
   version         = "0.7.0"
