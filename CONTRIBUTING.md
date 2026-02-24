@@ -29,6 +29,18 @@ purpose of operating hosted Broodlink services.
 - `cargo deny check` must pass
 - WCAG 2.1 AA for all Hugo site changes
 
+## Security Rules
+
+- Every new POST endpoint in status-api must call `require_role()` with the
+  appropriate level (Admin for mutations, Operator for operational actions)
+- Regex patterns must be anchored (`^...$`) to prevent ReDoS
+- User-supplied URLs must pass `validate_webhook_url()` (SSRF protection)
+- Shell scripts must use parameterized SQL (psql `-v` or `\set`), never string
+  interpolation
+- Passwords must be bcrypt-hashed; minimum 12 characters enforced in scripts
+- Constant-time comparison for all secret/token validation
+- No logging of user-supplied secrets (passwords, auth codes, tokens)
+
 ## Commit Types
 
 - `feat`: new feature

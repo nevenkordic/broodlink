@@ -86,6 +86,45 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 - 45 new unit tests (204 -> 249) including UserRole ordering, bcrypt roundtrip,
   require_role, serde, and deserialization tests.
 
+### Security
+
+- **RBAC on all mutation endpoints**: Every POST handler in status-api now
+  enforces `require_role()` — Admin for agent toggle, budget set, webhook CRUD,
+  Telegram register/disconnect, formula create/update/toggle, approval policy
+  upsert; Operator for task cancel, chat assign/close, approval review.
+- **Security headers**: HSTS (`max-age=63072000; includeSubDomains`), CSP
+  (`default-src 'self'`), `X-Frame-Options: DENY`, `X-Content-Type-Options:
+  nosniff`, `Cache-Control: no-store`, `Permissions-Policy` on all 5 HTTP
+  services (beads-bridge, status-api, mcp-server, a2a-gateway streamable HTTP).
+- **SSRF protection**: `validate_webhook_url()` blocks private/internal
+  networks (localhost, link-local, RFC 1918, metadata endpoints) on webhook and
+  Telegram registration URLs.
+- **Request body limits**: 10 MiB cap on all HTTP request bodies via
+  `DefaultBodyLimit`.
+- **Query LIMIT clamping**: All paginated status-api queries clamped to 1–1000
+  via `clamp_limit()`.
+- **Fail-closed guardrails**: `check_guardrails()` rejects on DB errors instead
+  of silently allowing. `evaluate_condition()` defaults to `false` for unknown
+  expressions.
+- **Input validation**: Regex anchoring (`^...$`) on all patterns to prevent
+  ReDoS. Path traversal prevention in KG entity names. Whitespace/length limits
+  on user-supplied strings.
+- **SQL parameterization**: Shell scripts (`db-setup.sh`, `create-admin.sh`,
+  `backfill-*.sh`) now use psql `-v` variable binding or `\set` piped via stdin
+  instead of string interpolation. Dolt password args properly quoted.
+- **Password policy**: `create-admin.sh` enforces 12-character minimum with
+  interactive confirmation prompt. Bcrypt cost factor configurable (default 12).
+- **Session invalidation**: `POST /auth/logout-all` invalidates all sessions
+  for the current user.
+- **SSE stream caps**: Maximum 100 concurrent streams, 1-hour TTL with reaper.
+- **Brave search cache hard cap**: 200-entry maximum with LRU eviction.
+- **Container hardening**: `read_only: true`, `no-new-privileges`, dropped
+  capabilities in podman-compose.
+- **Constant-time comparison**: API key validation uses byte-level XOR
+  comparison to prevent timing side-channels.
+- **CI security scanning**: `cargo-deny` license and advisory audit in build
+  pipeline.
+
 ### Fixed
 
 - Dashboard Telegram registration form stuck on "Registering..." after
@@ -96,6 +135,10 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
   to every POST body, causing "trailing characters" JSON parse errors).
 - Stale chat session reuse in integration tests (unique timestamp-based channel
   IDs per run).
+- `create-admin.sh` podman fallback for psql `-v` variable binding (uses piped
+  `\set` statements instead).
+- Test webhook URL updated for SSRF validation compatibility.
+- Hugo minified HTML grep patterns in test assertions.
 
 ## [0.6.0] - 2026-02-22
 

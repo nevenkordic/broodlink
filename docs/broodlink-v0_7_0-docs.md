@@ -100,6 +100,7 @@ A2A Gateway → Google A2A protocol for cross-platform agent interop
 - 3 new status-api endpoint groups: `/api/v1/chat/*`, `/api/v1/formulas/*`, `/api/v1/users/*`, `/api/v1/auth/*`
 - 45 new unit tests (204 → 249)
 - 3 new integration test suites: chat-integration (9 tests), formula-registry (11 tests), dashboard-auth (19 tests)
+- **Security hardening** (8-pass audit): RBAC on all mutation endpoints, HSTS/CSP/X-Frame-Options on all HTTP services, SSRF protection on webhook URLs, 10 MiB body limits, query LIMIT clamping, fail-closed guardrails and conditions, anchored regex (ReDoS prevention), SQL parameterization in shell scripts, 12-char password policy, session invalidation endpoint, SSE stream caps, Brave cache hard cap, constant-time API key comparison, container hardening, CI security scanning
 - Working multi-agent example: `examples/research-report/` — two agents (researcher + writer) collaborate end-to-end using 10 bridge tools, Ollama LLM inference, inter-agent messaging, knowledge graph queries, and persistent memory
 
 **v0.6.0 highlights:**
@@ -2391,11 +2392,54 @@ BROODLINK_CONFIG=./config.toml nohup ./target/release/<service> > /tmp/broodlink
 
 ### Status-API Auth
 
-`X-Broodlink-Api-Key` header matched against `BROODLINK_STATUS_API_KEY` secret.
+Dual-mode authentication middleware:
+- **API key**: `X-Broodlink-Api-Key` header matched (constant-time comparison) against `BROODLINK_STATUS_API_KEY`. Grants `Admin` role.
+- **Session token**: `X-Broodlink-Session` header looked up in `dashboard_sessions` with expiry check. Grants the user's assigned role (viewer/operator/admin).
+
+**RBAC enforcement (v0.7.0 security hardening):** Every mutation endpoint calls `require_role()`:
+- **Admin**: agent toggle, budget set, webhook create/toggle/delete, Telegram register/disconnect, formula create/update/toggle, approval policy upsert, user management
+- **Operator**: task cancel, chat assign/close, approval review
+- **Viewer**: read-only access to all GET endpoints
+
+**Password policy:** `create-admin.sh` enforces 12-character minimum. Bcrypt hashing with configurable cost (default 12). Interactive confirmation prompt when run without `--password`.
+
+**Session management:** `POST /auth/logout-all` invalidates all sessions for the current user.
 
 ### A2A Gateway Auth
 
 Bearer token matched against env var named by `config.a2a.api_key_name`.
+
+### Security Headers (v0.7.0)
+
+All HTTP services (beads-bridge, status-api, mcp-server, a2a-gateway) apply security headers via middleware:
+
+| Header | Value |
+|--------|-------|
+| `Strict-Transport-Security` | `max-age=63072000; includeSubDomains` |
+| `Content-Security-Policy` | `default-src 'self'` |
+| `X-Frame-Options` | `DENY` |
+| `X-Content-Type-Options` | `nosniff` |
+| `Cache-Control` | `no-store` |
+| `Pragma` | `no-cache` |
+| `Permissions-Policy` | `camera=(), microphone=(), geolocation=()` |
+
+### Input Validation (v0.7.0)
+
+| Control | Scope |
+|---------|-------|
+| **Body size limit** | 10 MiB on all HTTP services via `DefaultBodyLimit` |
+| **Query LIMIT clamping** | All paginated queries clamped to 1–1000 via `clamp_limit()` |
+| **SSRF protection** | `validate_webhook_url()` blocks localhost, link-local, RFC 1918, metadata endpoints |
+| **Regex anchoring** | All patterns use `^...$` to prevent ReDoS |
+| **Path traversal** | KG entity names validated to prevent directory traversal |
+| **SQL parameterization** | Shell scripts use psql `-v` binding or piped `\set` instead of string interpolation |
+
+### Container Hardening (v0.7.0)
+
+Production compose (`podman-compose.prod.yaml`) applies:
+- `read_only: true` — immutable root filesystem
+- `security_opt: no-new-privileges` — prevents privilege escalation
+- Dropped capabilities — only essential caps retained
 
 ---
 
@@ -2428,9 +2472,15 @@ States: CLOSED → OPEN (reject all, HTTP 503) → HALF_OPEN (test one) → CLOS
 | Python bridge calls | 3 attempts with tenacity |
 | Infisical secrets | 3 attempts, exp backoff (100ms base) |
 
+### SSE Stream Limits (v0.7.0)
+
+- Maximum 100 concurrent streams per beads-bridge instance
+- 1-hour TTL with periodic reaper (60s interval)
+- Clients exceeding the stream cap receive a `stream_limit_reached` error
+
 ### Guardrails (beads-bridge)
 
-Checked before every tool execution via `check_guardrails()`. Rule types:
+Checked before every tool execution via `check_guardrails()`. **Fail-closed** (v0.7.0): DB errors during guardrail check reject the call instead of allowing it through. Rule types:
 - **tool_block:** Deny specific tools for specific agents
 - **rate_override:** Per-agent token bucket rate limits (config: `{"agents": {"claude": 30, "qwen3": 120}}` RPM). Secondary limiter alongside the global rate limiter.
 - **content_filter:** Regex matching against serialized tool params (config: `{"patterns": ["secret|password"], "tools": ["store_memory"], "agents": ["*"]}`). Blocks on match.
@@ -2661,6 +2711,7 @@ MODEL="qwen3:32b" bash run.sh
 | **Integration tests** | 3 new suites: `chat-integration.sh` (9 tests), `formula-registry.sh` (11 tests), `dashboard-auth.sh` (19 tests); 18 → 21 suites |
 | **E2E tests** | +2 assertions (~95 → ~97): section 16 (chat/auth/formula/user endpoints), dashboard page count 13→15 |
 | **Examples** | New: `examples/research-report/` (4 files, 736 lines) — two-agent demo using 10 bridge tools, Ollama LLM, inter-agent messaging, KG queries, persistent memory |
+| **Security** | 8-pass security audit: RBAC `require_role()` on all 20+ POST endpoints (Admin/Operator), HSTS+CSP+X-Frame-Options+nosniff on 5 middleware instances, `validate_webhook_url()` SSRF blocking, `DefaultBodyLimit` 10 MiB, `clamp_limit()` on all queries, fail-closed guardrails and conditions, anchored regex, SQL parameterization in 4 shell scripts, 12-char password minimum, `POST /auth/logout-all`, SSE caps (100 streams, 1h TTL), brave_cache 200-entry hard cap, constant-time API key comparison, `read_only`/`no-new-privileges` container hardening, `cargo-deny` CI scanning |
 
 ## Changelog: v0.4.0 → v0.5.0
 

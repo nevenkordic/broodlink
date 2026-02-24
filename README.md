@@ -103,7 +103,7 @@ After startup, you'll have:
 | coordinator | -- | NATS only | Smart task routing with weighted scoring, atomic claiming, exponential backoff, dead-letter queue with auto-retry, workflow orchestration with conditional steps, parallel groups, per-step retries, timeouts, and error handlers, multi-agent task decomposition |
 | heartbeat | -- | NATS + DB | 5-min sync cycle: Dolt commit, Beads sync, agent metrics, daily summary, stale agent deactivation, KG entity/edge expiry with weight decay, daily budget replenishment |
 | embedding-worker | -- | NATS + DB | Outbox poll -- Ollama `nomic-embed-text` embeddings -- Qdrant upsert -- LLM entity extraction for knowledge graph, circuit breakers |
-| status-api | 3312 | HTTP | Dashboard API with API key + session auth (RBAC), CORS, SSE stream proxy, control panel endpoints (agent toggle, budget set, task cancel, webhook CRUD, guardrails, DLQ), chat session management, formula registry CRUD, user management |
+| status-api | 3312 | HTTP | Dashboard API with API key + session auth (RBAC on all mutations), CORS, security headers (HSTS, CSP, X-Frame-Options), SSE stream proxy, control panel endpoints (agent toggle, budget set, task cancel, webhook CRUD, guardrails, DLQ), chat session management, formula registry CRUD, user management |
 | mcp-server | 3311 | HTTP + stdio | MCP protocol server (streamable HTTP + legacy stdio), proxies bridge tools |
 | a2a-gateway | 3313 | HTTP | Google A2A protocol gateway, AgentCard discovery, cross-system task delegation, webhook gateway for Slack/Teams/Telegram with inbound command parsing and outbound event notifications, conversational chat gateway with session management, greeting support, direct Ollama LLM chat with Brave Search tool calling, concurrency semaphore, search cache, dedup, and typing refresh |
 
@@ -244,6 +244,21 @@ Located in `.beads/formulas/`:
 | `build-feature.formula.toml` | End-to-end feature: plan, implement, test, document |
 | `daily-review.formula.toml` | Daily ops review: metrics, blockers, summary |
 | `knowledge-gap.formula.toml` | Audit memory, prioritize gaps, research and fill |
+
+## Security
+
+Broodlink applies defence-in-depth across all services:
+
+| Layer | Mechanism |
+|-------|-----------|
+| **Authentication** | JWT RS256 (beads-bridge, MCP), API key + session tokens (status-api), Bearer token (a2a-gateway) |
+| **Authorization** | RBAC (viewer/operator/admin) enforced on every status-api mutation endpoint via `require_role()` |
+| **Transport** | HSTS, CSP `default-src 'self'`, X-Frame-Options DENY, X-Content-Type-Options nosniff on all HTTP services |
+| **Input validation** | 10 MiB body limits, query LIMIT clamping (1–1000), anchored regex, path traversal prevention, webhook SSRF blocking |
+| **Secrets** | SOPS/age encryption, constant-time API key comparison, bcrypt passwords (cost 12), 12-char minimum policy |
+| **Resilience** | Fail-closed guardrails, fail-closed condition evaluation, circuit breakers, rate limiting, SSE stream caps (100 max, 1h TTL) |
+| **Container** | `read_only: true`, `no-new-privileges`, dropped capabilities in production compose |
+| **CI** | `cargo-deny` license and advisory audit |
 
 ## External Integrations
 
