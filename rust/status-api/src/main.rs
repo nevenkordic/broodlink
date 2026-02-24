@@ -1611,7 +1611,12 @@ async fn handler_budgets(
 async fn handler_agent_toggle(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(agent_id): axum::extract::Path<String>,
+    req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Admin)?;
+
     let result = sqlx::query("UPDATE agent_profiles SET active = NOT active WHERE agent_id = ?")
         .bind(&agent_id)
         .execute(&state.dolt)
@@ -1680,7 +1685,12 @@ async fn handler_budget_set(
 async fn handler_task_cancel(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(task_id): axum::extract::Path<String>,
+    req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Operator)?;
+
     let result = sqlx::query(
         "UPDATE task_queue SET status = 'failed', updated_at = NOW()
          WHERE id = $1 AND status IN ('pending', 'claimed')",
@@ -2316,8 +2326,19 @@ fn default_true() -> bool {
 
 async fn handler_upsert_approval_policy(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<UpsertPolicyBody>,
+    req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Admin)?;
+
+    let body: UpsertPolicyBody = {
+        let bytes = axum::body::to_bytes(req.into_body(), 10_485_760)
+            .await
+            .map_err(|e| StatusApiError::BadRequest(format!("invalid body: {e}")))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| StatusApiError::BadRequest(format!("invalid JSON: {e}")))?
+    };
     if !["pre_dispatch", "pre_completion", "budget", "custom"].contains(&body.gate_type.as_str()) {
         return Err(StatusApiError::Internal(
             "gate_type must be one of: pre_dispatch, pre_completion, budget, custom".to_string(),
@@ -2365,7 +2386,12 @@ async fn handler_upsert_approval_policy(
 async fn handler_toggle_approval_policy(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(policy_id): axum::extract::Path<String>,
+    req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Admin)?;
+
     let result = sqlx::query(
         "UPDATE approval_policies SET active = NOT active, updated_at = NOW() WHERE id = $1",
     )
@@ -2409,8 +2435,19 @@ struct ApprovalReviewBody {
 async fn handler_approval_review(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(gate_id): axum::extract::Path<String>,
-    Json(body): Json<ApprovalReviewBody>,
+    req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Operator)?;
+
+    let body: ApprovalReviewBody = {
+        let bytes = axum::body::to_bytes(req.into_body(), 10_485_760)
+            .await
+            .map_err(|e| StatusApiError::BadRequest(format!("invalid body: {e}")))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| StatusApiError::BadRequest(format!("invalid JSON: {e}")))?
+    };
     if body.decision != "approved" && body.decision != "rejected" {
         return Err(StatusApiError::Internal(
             "decision must be 'approved' or 'rejected'".to_string(),
