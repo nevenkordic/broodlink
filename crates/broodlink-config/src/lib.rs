@@ -789,6 +789,8 @@ pub struct ChatConfig {
     pub enabled: bool,
     #[serde(default = "default_chat_model")]
     pub chat_model: String,
+    #[serde(default)]
+    pub chat_fallback_model: String,
     #[serde(default = "default_chat_max_context_messages")]
     pub max_context_messages: u32,
     #[serde(default = "default_chat_session_timeout_hours")]
@@ -841,6 +843,7 @@ impl Default for ChatConfig {
         Self {
             enabled: default_chat_enabled(),
             chat_model: default_chat_model(),
+            chat_fallback_model: String::new(),
             max_context_messages: default_chat_max_context_messages(),
             session_timeout_hours: default_chat_session_timeout_hours(),
             reply_timeout_seconds: default_chat_reply_timeout_seconds(),

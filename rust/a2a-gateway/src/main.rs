@@ -2915,6 +2915,213 @@ async fn fetch_chat_history(state: &AppState, session_id: &str) -> Vec<(String, 
         .collect()
 }
 
+/// Ollama HTTP request errors, classified for retry/fallback decisions.
+enum OllamaRequestError {
+    Timeout,
+    Connection(String),
+    Parse(String),
+}
+
+/// Send an Ollama /api/chat request with one automatic retry on transient
+/// connection errors (connection refused, reset, DNS failure).
+async fn send_ollama_request(
+    client: &reqwest::Client,
+    url: &str,
+    payload: &serde_json::Value,
+    _timeout_secs: u64,
+) -> Result<serde_json::Value, OllamaRequestError> {
+    let mut last_err = String::new();
+    for attempt in 0..2u8 {
+        if attempt > 0 {
+            info!(attempt = attempt, "retrying Ollama request after connection error");
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        match client.post(url).json(payload).send().await {
+            Ok(resp) => match resp.json().await {
+                Ok(b) => return Ok(b),
+                Err(e) => return Err(OllamaRequestError::Parse(e.to_string())),
+            },
+            Err(e) if e.is_timeout() => return Err(OllamaRequestError::Timeout),
+            Err(e) if e.is_connect() => {
+                last_err = e.to_string();
+                continue;
+            }
+            Err(e) => {
+                // Other transient errors (reset, broken pipe) — retry once
+                let msg = e.to_string();
+                if attempt == 0 && (msg.contains("reset") || msg.contains("broken pipe")) {
+                    last_err = msg;
+                    continue;
+                }
+                return Err(OllamaRequestError::Connection(msg));
+            }
+        }
+    }
+    Err(OllamaRequestError::Connection(format!(
+        "connection failed after retry: {last_err}"
+    )))
+}
+
+/// Attempt to recover from an Ollama model error by unloading the failed model
+/// to free memory, then retrying it. Returns the primary model's response on
+/// success, or uses the fallback model to communicate the failure to the user.
+async fn handle_ollama_recovery(
+    state: &AppState,
+    chat_url: &str,
+    primary_model: &str,
+    fallback_model: &str,
+    error_msg: &str,
+    messages: &[serde_json::Value],
+    timeout_secs: u64,
+) -> String {
+    let ollama_url = &state.config.ollama.url;
+    let num_ctx = state.config.ollama.num_ctx;
+
+    // Step 1: Unload the failed model to free memory
+    info!(model = %primary_model, "unloading model to free memory");
+    let unload_payload = serde_json::json!({
+        "model": primary_model,
+        "keep_alive": 0,
+    });
+    let unload_url = format!("{ollama_url}/api/generate");
+    match state
+        .ollama_client
+        .post(&unload_url)
+        .json(&unload_payload)
+        .send()
+        .await
+    {
+        Ok(_) => info!(model = %primary_model, "model unload requested"),
+        Err(e) => warn!(model = %primary_model, error = %e, "failed to request model unload"),
+    }
+
+    // Step 2: Wait for memory to settle
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    // Step 3: Retry the primary model (single attempt, no tools — keep it simple)
+    info!(model = %primary_model, "retrying primary model after recovery");
+    let retry_payload = serde_json::json!({
+        "model": primary_model,
+        "messages": messages,
+        "stream": false,
+        "think": false,
+        "options": {
+            "temperature": 0.7,
+            "num_predict": 512,
+            "num_ctx": num_ctx,
+        }
+    });
+
+    match send_ollama_request(&state.ollama_client, chat_url, &retry_payload, timeout_secs).await {
+        Ok(body) if body.get("error").is_none() => {
+            if let Some(content) = body
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+            {
+                let cleaned = strip_think_tags(content.trim());
+                if !cleaned.is_empty() {
+                    info!(model = %primary_model, "primary model recovered successfully");
+                    return cleaned;
+                }
+            }
+        }
+        Ok(body) => {
+            let retry_err = body
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            warn!(model = %primary_model, error = %retry_err, "primary model still failing after recovery");
+        }
+        Err(e) => {
+            let desc = match &e {
+                OllamaRequestError::Timeout => "timeout".to_string(),
+                OllamaRequestError::Connection(s) => s.clone(),
+                OllamaRequestError::Parse(s) => s.clone(),
+            };
+            warn!(model = %primary_model, error = %desc, "primary model retry failed");
+        }
+    }
+
+    // Step 4: Recovery failed — use the fallback model to communicate with the user
+    generate_status_message(
+        &state.ollama_client,
+        chat_url,
+        fallback_model,
+        error_msg,
+        num_ctx,
+    )
+    .await
+}
+
+/// Use the fallback model to generate a brief status message explaining the
+/// service disruption. The fallback model does NOT answer the user's question —
+/// its only job is clear communication about what happened.
+async fn generate_status_message(
+    client: &reqwest::Client,
+    chat_url: &str,
+    fallback_model: &str,
+    error_msg: &str,
+    num_ctx: u32,
+) -> String {
+    let payload = serde_json::json!({
+        "model": fallback_model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are Broodlink's system recovery agent. The primary AI model \
+                    hit an error and recovery failed. Your ONLY job is to briefly tell the user \
+                    what happened. Do NOT try to answer their question — just explain the \
+                    situation in 1-2 friendly sentences. Mention that they should try again \
+                    shortly."
+            },
+            {
+                "role": "user",
+                "content": format!(
+                    "The primary model encountered this error: \"{error_msg}\". \
+                     Recovery was attempted but the model is still unavailable. \
+                     Generate a brief, friendly status message for the end user."
+                )
+            }
+        ],
+        "stream": false,
+        "think": false,
+        "options": {
+            "temperature": 0.3,
+            "num_predict": 128,
+            "num_ctx": num_ctx,
+        }
+    });
+
+    match client.post(chat_url).json(&payload).send().await {
+        Ok(resp) => {
+            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                // Check for Ollama error first
+                if body.get("error").is_some() {
+                    warn!("fallback model also returned error");
+                } else if let Some(content) = body
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_str())
+                {
+                    let cleaned = strip_think_tags(content.trim());
+                    if !cleaned.is_empty() {
+                        return cleaned;
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "fallback model request failed");
+        }
+    }
+
+    // Canned fallback if even the small model fails
+    "I'm experiencing a temporary resource issue and couldn't process your message. \
+     Please try again in a moment."
+        .to_string()
+}
+
 async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> String {
     let ollama_url = &state.config.ollama.url;
     let timeout_secs = state.config.ollama.timeout_seconds;
@@ -3022,32 +3229,48 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
             payload["tools"] = tools_def.clone().unwrap();
         }
 
-        let body: serde_json::Value =
-            match state.ollama_client.post(&url).json(&payload).send().await {
-                Ok(resp) => match resp.json().await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        warn!(error = %e, round = round, "failed to parse Ollama response");
-                        return "Something went wrong. Please try again.".to_string();
-                    }
-                },
-                Err(e) if e.is_timeout() => {
-                    warn!(
-                        round = round,
-                        "Ollama request timed out ({}s)", timeout_secs
-                    );
-                    return "Response timed out. Please try a shorter question.".to_string();
-                }
-                Err(e) => {
-                    warn!(error = %e, round = round, "Ollama request failed");
-                    return "I'm temporarily unavailable. Please try again in a moment."
-                        .to_string();
-                }
-            };
+        // Send request with one retry on transient connection errors
+        let body: serde_json::Value = match send_ollama_request(
+            &state.ollama_client,
+            &url,
+            &payload,
+            timeout_secs,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(OllamaRequestError::Timeout) => {
+                warn!(model = %model, round = round, "Ollama request timed out ({}s)", timeout_secs);
+                return "Response timed out. Please try a shorter question.".to_string();
+            }
+            Err(OllamaRequestError::Connection(e)) => {
+                warn!(model = %model, error = %e, round = round, "Ollama connection failed after retry");
+                return "I'm temporarily unavailable. Please try again in a moment.".to_string();
+            }
+            Err(OllamaRequestError::Parse(e)) => {
+                warn!(model = %model, error = %e, round = round, "failed to parse Ollama response");
+                return "Something went wrong. Please try again.".to_string();
+            }
+        };
 
         // Check for Ollama-level errors (OOM, model not found, etc.)
+        // → hand off to recovery agent: unload model, retry, communicate via fallback
         if let Some(err) = body.get("error").and_then(|e| e.as_str()) {
-            warn!(error = %err, round = round, "Ollama returned error");
+            warn!(model = %model, error = %err, round = round, "Ollama returned error");
+
+            if !chat_cfg.chat_fallback_model.is_empty() {
+                return handle_ollama_recovery(
+                    state,
+                    &url,
+                    model,
+                    &chat_cfg.chat_fallback_model,
+                    err,
+                    &messages,
+                    timeout_secs,
+                )
+                .await;
+            }
+
             return "I'm temporarily unable to process your message. Please try again in a moment."
                 .to_string();
         }

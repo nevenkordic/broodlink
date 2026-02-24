@@ -148,6 +148,7 @@ max_retries           = 3
 [chat]
 enabled = true
 chat_model = "qwen3:32b"
+chat_fallback_model = "qwen3:1.7b"
 max_context_messages = 10
 session_timeout_hours = 24
 reply_timeout_seconds = 300
