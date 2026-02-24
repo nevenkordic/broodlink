@@ -1,0 +1,47 @@
+name: Formula Submission
+description: Submit a new workflow formula for inclusion
+labels: ["formula"]
+body:
+  - type: input
+    id: name
+    attributes:
+      label: Formula Name
+      description: Slug form (e.g., "code-review", "security-audit")
+      placeholder: my-formula
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What does this formula do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps Overview
+      description: Brief description of each step in the workflow.
+      placeholder: |
+        1. Gather context — role: researcher
+        2. Analyze findings — role: analyst
+        3. Generate report — role: writer
+    validations:
+      required: true
+
+  - type: textarea
+    id: toml
+    attributes:
+      label: Formula TOML
+      description: Paste the full .formula.toml content.
+      render: toml
+    validations:
+      required: true
+
+  - type: textarea
+    id: testing
+    attributes:
+      label: How to Test
+      description: How can reviewers verify this formula works?

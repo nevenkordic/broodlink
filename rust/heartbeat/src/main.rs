@@ -541,6 +541,30 @@ async fn run_cycle(state: &AppState) -> Result<(), BroodlinkError> {
     }
 
     // -----------------------------------------------------------------------
+    // 5l. Formula registry sync (bidirectional TOML ↔ Postgres)
+    // -----------------------------------------------------------------------
+    match sync_formula_registry(&state.pg, &state.config).await {
+        Ok(stats) => {
+            if stats.system_synced > 0
+                || stats.custom_backfilled > 0
+                || stats.hashes_filled > 0
+                || stats.disk_written > 0
+            {
+                info!(
+                    system_synced = stats.system_synced,
+                    custom_backfilled = stats.custom_backfilled,
+                    hashes_filled = stats.hashes_filled,
+                    disk_written = stats.disk_written,
+                    "formula registry synced"
+                );
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "formula registry sync failed");
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // 6. Publish broodlink.<env>.health (NATS)
     // -----------------------------------------------------------------------
     let dolt_ok = sqlx::query("SELECT 1").execute(&state.dolt).await.is_ok();
@@ -1653,6 +1677,189 @@ async fn dashboard_session_cleanup(pg: &PgPool, config: &Config) -> Result<u64, 
     }
 
     Ok(total_deleted)
+}
+
+// ---------------------------------------------------------------------------
+// Formula registry sync (bidirectional TOML ↔ Postgres)
+// ---------------------------------------------------------------------------
+
+struct FormulaSyncStats {
+    system_synced: u32,
+    custom_backfilled: u32,
+    hashes_filled: u32,
+    disk_written: u32,
+}
+
+async fn sync_formula_registry(
+    pg: &PgPool,
+    config: &Arc<Config>,
+) -> Result<FormulaSyncStats, BroodlinkError> {
+    let mut stats = FormulaSyncStats {
+        system_synced: 0,
+        custom_backfilled: 0,
+        hashes_filled: 0,
+        disk_written: 0,
+    };
+
+    // A. System sync: TOML → Postgres (system formulas only)
+    let system_formulas = broodlink_formulas::load_toml_formulas(&config.beads.formulas_dir);
+    for lf in &system_formulas {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT id, definition_hash FROM formula_registry WHERE name = $1 AND is_system = true",
+        )
+        .bind(&lf.name)
+        .fetch_optional(pg)
+        .await?;
+
+        match row {
+            Some((id, existing_hash)) => {
+                if existing_hash.as_deref() == Some(&lf.hash) {
+                    continue; // no change
+                }
+                let display_name = broodlink_formulas::title_case(&lf.name);
+                let description = lf
+                    .formula
+                    .formula
+                    .description
+                    .as_deref()
+                    .unwrap_or("");
+                sqlx::query(
+                    "UPDATE formula_registry
+                     SET definition = $1, definition_hash = $2,
+                         display_name = $3, description = $4,
+                         version = version + 1, updated_at = NOW()
+                     WHERE id = $5 AND is_system = true",
+                )
+                .bind(&lf.definition)
+                .bind(&lf.hash)
+                .bind(&display_name)
+                .bind(description)
+                .bind(&id)
+                .execute(pg)
+                .await?;
+                info!(formula = %lf.name, "system formula updated from TOML");
+                stats.system_synced += 1;
+            }
+            None => {
+                // Insert only if no row with this name exists (don't overwrite user formulas)
+                let id = Uuid::new_v4().to_string();
+                let display_name = broodlink_formulas::title_case(&lf.name);
+                let description = lf
+                    .formula
+                    .formula
+                    .description
+                    .as_deref()
+                    .unwrap_or("");
+                let result = sqlx::query(
+                    "INSERT INTO formula_registry (id, name, display_name, description, definition, definition_hash, author, is_system, enabled)
+                     VALUES ($1, $2, $3, $4, $5, $6, 'system', true, true)
+                     ON CONFLICT (name) DO UPDATE SET
+                         definition = EXCLUDED.definition,
+                         definition_hash = EXCLUDED.definition_hash,
+                         display_name = EXCLUDED.display_name,
+                         description = EXCLUDED.description,
+                         version = formula_registry.version + 1,
+                         updated_at = NOW()
+                     WHERE formula_registry.is_system = true",
+                )
+                .bind(&id)
+                .bind(&lf.name)
+                .bind(&display_name)
+                .bind(description)
+                .bind(&lf.definition)
+                .bind(&lf.hash)
+                .execute(pg)
+                .await?;
+                if result.rows_affected() > 0 {
+                    info!(formula = %lf.name, "system formula synced to registry");
+                    stats.system_synced += 1;
+                }
+            }
+        }
+    }
+
+    // B. Custom backfill: custom TOML → Postgres (insert only, never overwrite)
+    let custom_formulas =
+        broodlink_formulas::load_custom_formulas(&config.beads.formulas_custom_dir);
+    for lf in &custom_formulas {
+        let exists: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM formula_registry WHERE name = $1")
+                .bind(&lf.name)
+                .fetch_optional(pg)
+                .await?;
+        if exists.is_some() {
+            continue; // never overwrite existing
+        }
+        let id = Uuid::new_v4().to_string();
+        let display_name = broodlink_formulas::title_case(&lf.name);
+        let description = lf
+            .formula
+            .formula
+            .description
+            .as_deref()
+            .unwrap_or("");
+        sqlx::query(
+            "INSERT INTO formula_registry (id, name, display_name, description, definition, definition_hash, author, is_system, enabled)
+             VALUES ($1, $2, $3, $4, $5, $6, 'disk-import', false, true)
+             ON CONFLICT (name) DO NOTHING",
+        )
+        .bind(&id)
+        .bind(&lf.name)
+        .bind(&display_name)
+        .bind(description)
+        .bind(&lf.definition)
+        .bind(&lf.hash)
+        .execute(pg)
+        .await?;
+        info!(formula = %lf.name, "custom formula backfilled from disk");
+        stats.custom_backfilled += 1;
+    }
+
+    // C. Hash backfill: compute hashes for rows missing definition_hash
+    let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+        "SELECT id, definition FROM formula_registry WHERE definition_hash IS NULL",
+    )
+    .fetch_all(pg)
+    .await?;
+    for (id, def) in &rows {
+        let hash = broodlink_formulas::definition_hash(def);
+        sqlx::query("UPDATE formula_registry SET definition_hash = $1 WHERE id = $2")
+            .bind(&hash)
+            .bind(id)
+            .execute(pg)
+            .await?;
+        stats.hashes_filled += 1;
+    }
+
+    // D. Disk safety net: write user formulas to disk that are missing on disk
+    let custom_dir = &config.beads.formulas_custom_dir;
+    let user_rows: Vec<(String, String, serde_json::Value, Option<String>)> = sqlx::query_as(
+        "SELECT name, display_name, definition, description
+         FROM formula_registry WHERE is_system = false",
+    )
+    .fetch_all(pg)
+    .await?;
+
+    for (name, display_name, definition, description) in &user_rows {
+        let toml_path =
+            std::path::Path::new(custom_dir).join(format!("{name}.formula.toml"));
+        if toml_path.exists() {
+            continue; // already on disk
+        }
+        let meta = broodlink_formulas::FormulaTomlMeta {
+            display_name,
+            description: description.as_deref().unwrap_or(""),
+        };
+        if let Err(e) = broodlink_formulas::persist_formula_toml(custom_dir, name, definition, &meta)
+        {
+            warn!(formula = %name, error = %e, "failed to write user formula to disk (safety net)");
+        } else {
+            info!(formula = %name, "user formula written to disk (safety net)");
+            stats.disk_written += 1;
+        }
+    }
+
+    Ok(stats)
 }
 
 /// Publish a JSON payload to NATS (best-effort, logs warning on failure).

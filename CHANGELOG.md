@@ -5,6 +5,44 @@ All notable changes to Broodlink are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Bidirectional Formula Sync**: System TOML formulas (`.beads/formulas/`) sync
+  to Postgres via heartbeat (TOML wins for `is_system=true` rows, skips when
+  `definition_hash` matches). User formulas write through to
+  `.beads/formulas/custom/` on every create/update. Custom TOMLs backfill to
+  Postgres on startup (insert only, never overwrite). Heartbeat safety net
+  rewrites missing user formula TOMLs within one cycle. Migration 026 adds
+  `definition_hash` column.
+- **System Formula Protection**: API and bridge reject edits to `is_system=true`
+  formulas with a clear error ("cannot modify system formula — create a copy
+  with a new name"). Name collision guard prevents user formulas from shadowing
+  system formula names.
+- **Shared `broodlink-formulas` crate**: Formula TOML parsing, JSONB conversion,
+  `definition_hash` (SHA-256), `persist_formula_toml` (atomic write), parameter
+  format conversion (TOML dict ↔ JSONB array), `validate_formula_name`. 12 unit
+  tests. Used by coordinator, heartbeat, beads-bridge, and status-api.
+- **Ollama Self-Healing**: When the primary chat model (`chat_model`) hits an OOM
+  or other error, a2a-gateway attempts recovery (unload model, wait, retry). If
+  recovery fails, enters **degraded mode** — routes all subsequent messages to
+  `chat_fallback_model` (e.g. `qwen3:1.7b`) which answers the user's actual
+  question instead of returning an error. Degraded mode skips the primary model
+  entirely (no 3s recovery penalty per message). After a 5-minute cooldown, the
+  next message probes the primary model again to detect recovery. Fully automatic
+  — no operator intervention needed.
+- **GitHub Repository Setup**: Branch protection on `main` (require PR reviews,
+  CI status checks, no force push). Issue templates for bug reports, feature
+  requests, and formula submissions. PR template with checklist. `SECURITY.md`
+  responsible disclosure policy. `CODE_OF_CONDUCT.md` (Contributor Covenant v2.1).
+- `scripts/seed-formulas.sh` updated with deprecation notice (heartbeat handles
+  sync automatically) and `ON CONFLICT DO UPDATE WHERE is_system = true` for
+  idempotent re-seeding with `definition_hash`.
+- `formulas_custom_dir` config field in `[beads]` section (default:
+  `.beads/formulas/custom`) with tilde expansion.
+- 12 new unit tests in broodlink-formulas crate (249 → 261 workspace total).
+
 ## [0.7.0] - 2026-02-23
 
 ### Added

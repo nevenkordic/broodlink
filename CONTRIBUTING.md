@@ -41,6 +41,21 @@ purpose of operating hosted Broodlink services.
 - Constant-time comparison for all secret/token validation
 - No logging of user-supplied secrets (passwords, auth codes, tokens)
 
+## Contributing Formulas
+
+Workflow formulas define multi-step agent tasks. To contribute a formula:
+
+1. Use the **Formula Submission** issue template on GitHub
+2. Place your TOML file in `.beads/formulas/custom/` (user formulas) or propose
+   additions to `.beads/formulas/` (system formulas) via PR
+3. Follow the existing formula structure (see `research.formula.toml` for reference):
+   - `[formula]` section with name, description, version
+   - `[formula.metadata]` with author, category, tags
+   - `[[formula.steps]]` with sequential or parallel step definitions
+   - `[formula.parameters]` with typed parameter declarations
+4. System formula names are reserved — user formulas cannot shadow them
+5. Include test instructions showing the formula works end-to-end
+
 ## Commit Types
 
 - `feat`: new feature

@@ -5788,6 +5788,20 @@ async fn tool_create_formula(
     let definition_str = param_str(params, "definition")?;
     let tags_str = param_str_opt(params, "tags");
 
+    // Guard: reject names that collide with system formulas
+    let system_exists: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM formula_registry WHERE name = $1 AND is_system = true",
+    )
+    .bind(name)
+    .fetch_optional(&state.pg)
+    .await?;
+    if system_exists.is_some() {
+        return Err(BroodlinkError::Validation {
+            field: "name".to_string(),
+            message: format!("name '{name}' is reserved for a system formula"),
+        });
+    }
+
     // Parse and validate definition
     let definition: serde_json::Value =
         serde_json::from_str(definition_str).map_err(|e| BroodlinkError::Validation {
@@ -5808,16 +5822,18 @@ async fn tool_create_formula(
     };
 
     let id = uuid::Uuid::new_v4().to_string();
+    let def_hash = broodlink_formulas::definition_hash(&definition);
 
     sqlx::query(
-        "INSERT INTO formula_registry (id, name, display_name, description, definition, tags, author)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        "INSERT INTO formula_registry (id, name, display_name, description, definition, definition_hash, tags, author)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(&id)
     .bind(name)
     .bind(display_name)
     .bind(description)
     .bind(&definition)
+    .bind(&def_hash)
     .bind(&tags)
     .bind("agent")
     .execute(&state.pg)
@@ -5832,6 +5848,20 @@ async fn tool_create_formula(
             BroodlinkError::Database(e)
         }
     })?;
+
+    // Write-through: persist to custom TOML (best-effort)
+    let meta = broodlink_formulas::FormulaTomlMeta {
+        display_name,
+        description: description.unwrap_or(""),
+    };
+    if let Err(e) = broodlink_formulas::persist_formula_toml(
+        &state.config.beads.formulas_custom_dir,
+        name,
+        &definition,
+        &meta,
+    ) {
+        warn!(formula = %name, error = %e, "write-through to disk failed (create)");
+    }
 
     Ok(serde_json::json!({
         "id": id,
@@ -5851,15 +5881,28 @@ async fn tool_update_formula(
     let enabled = params.get("enabled").and_then(|v| v.as_bool());
     let tags_str = param_str_opt(params, "tags");
 
-    // Verify formula exists
+    // Verify formula exists and check system flag
     let exists: Option<(String, bool)> =
         sqlx::query_as("SELECT id, is_system FROM formula_registry WHERE name = $1")
             .bind(name)
             .fetch_optional(&state.pg)
             .await?;
 
-    let (_id, _is_system) =
+    let (_id, is_system) =
         exists.ok_or_else(|| BroodlinkError::NotFound(format!("formula not found: {name}")))?;
+
+    // Guard: block modifications to system formulas (except toggling enabled)
+    if is_system
+        && (definition_str.is_some()
+            || display_name.is_some()
+            || description.is_some()
+            || tags_str.is_some())
+    {
+        return Err(BroodlinkError::Validation {
+            field: "name".to_string(),
+            message: "cannot modify system formula — create a copy with a new name".to_string(),
+        });
+    }
 
     // Build dynamic update
     let mut updates = Vec::new();
@@ -5877,11 +5920,15 @@ async fn tool_update_formula(
             message: msg,
         })?;
 
-        sqlx::query("UPDATE formula_registry SET definition = $1 WHERE name = $2")
-            .bind(&definition)
-            .bind(name)
-            .execute(&state.pg)
-            .await?;
+        let def_hash = broodlink_formulas::definition_hash(&definition);
+        sqlx::query(
+            "UPDATE formula_registry SET definition = $1, definition_hash = $2 WHERE name = $3",
+        )
+        .bind(&definition)
+        .bind(&def_hash)
+        .bind(name)
+        .execute(&state.pg)
+        .await?;
         updates.push("definition");
         bump_version = true;
     }
@@ -5936,6 +5983,30 @@ async fn tool_update_formula(
         .bind(name)
         .execute(&state.pg)
         .await?;
+
+    // Write-through: persist user formula to disk (best-effort, skip system formulas)
+    if !is_system {
+        let row: Option<(serde_json::Value, String, Option<String>)> = sqlx::query_as(
+            "SELECT definition, display_name, description FROM formula_registry WHERE name = $1",
+        )
+        .bind(name)
+        .fetch_optional(&state.pg)
+        .await?;
+        if let Some((def, dn, desc)) = row {
+            let meta = broodlink_formulas::FormulaTomlMeta {
+                display_name: &dn,
+                description: desc.as_deref().unwrap_or(""),
+            };
+            if let Err(e) = broodlink_formulas::persist_formula_toml(
+                &state.config.beads.formulas_custom_dir,
+                name,
+                &def,
+                &meta,
+            ) {
+                warn!(formula = %name, error = %e, "write-through to disk failed (update)");
+            }
+        }
+    }
 
     Ok(serde_json::json!({
         "name": name,

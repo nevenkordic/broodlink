@@ -313,6 +313,7 @@ dependencies = [
  "axum",
  "axum-server",
  "broodlink-config",
+ "broodlink-formulas",
  "broodlink-runtime",
  "broodlink-secrets",
  "broodlink-telemetry",
@@ -379,6 +380,18 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
+name = "broodlink-formulas"
+version = "0.7.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "toml",
  "tracing",
 ]
 
@@ -563,6 +576,7 @@ dependencies = [
  "async-nats",
  "async-trait",
  "broodlink-config",
+ "broodlink-formulas",
  "broodlink-runtime",
  "broodlink-secrets",
  "broodlink-telemetry",
@@ -1162,6 +1176,7 @@ dependencies = [
  "async-nats",
  "async-trait",
  "broodlink-config",
+ "broodlink-formulas",
  "broodlink-runtime",
  "broodlink-secrets",
  "broodlink-telemetry",
@@ -3004,6 +3019,7 @@ dependencies = [
  "axum-server",
  "bcrypt",
  "broodlink-config",
+ "broodlink-formulas",
  "broodlink-runtime",
  "broodlink-secrets",
  "broodlink-telemetry",

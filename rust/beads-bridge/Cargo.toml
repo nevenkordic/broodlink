@@ -10,6 +10,7 @@ broodlink-secrets = { path = "../../crates/broodlink-secrets" }
 broodlink-config = { path = "../../crates/broodlink-config" }
 broodlink-telemetry = { path = "../../crates/broodlink-telemetry" }
 broodlink-runtime = { path = "../../crates/broodlink-runtime" }
+broodlink-formulas = { path = "../../crates/broodlink-formulas" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

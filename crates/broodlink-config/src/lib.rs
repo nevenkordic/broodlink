@@ -175,6 +175,12 @@ pub struct BeadsConfig {
     pub workspace: String,
     pub bd_binary: String,
     pub formulas_dir: String,
+    #[serde(default = "default_formulas_custom_dir")]
+    pub formulas_custom_dir: String,
+}
+
+fn default_formulas_custom_dir() -> String {
+    ".beads/formulas/custom".to_string()
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -1032,6 +1038,7 @@ impl Config {
             cfg.secrets.sops_file = Some(expand_tilde(p));
         }
         cfg.beads.formulas_dir = expand_tilde(&cfg.beads.formulas_dir);
+        cfg.beads.formulas_custom_dir = expand_tilde(&cfg.beads.formulas_custom_dir);
         if let Some(ref p) = cfg.tls.cert_path {
             cfg.tls.cert_path = Some(expand_tilde(p));
         }

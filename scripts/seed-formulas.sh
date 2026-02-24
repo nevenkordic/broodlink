@@ -3,8 +3,11 @@
 # Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
+# DEPRECATED: The heartbeat service now syncs formulas automatically every
+# 5-minute cycle. This script is retained for manual bootstrapping only.
+#
 # Seed the formula_registry table from .beads/formulas/*.formula.toml files.
-# Idempotent: ON CONFLICT (name) DO NOTHING.
+# ON CONFLICT: updates system formulas, skips user formulas.
 # Run: bash scripts/seed-formulas.sh
 
 set -euo pipefail
@@ -93,12 +96,22 @@ print(json.dumps(defn))
   display_name=$(echo "$name" | sed 's/-/ /g' | python3 -c "import sys; print(sys.stdin.read().strip().title())")
   id=$(python3 -c "import uuid; print(str(uuid.uuid4()))")
 
-  # Use parameterized queries to prevent SQL injection
-  sql="INSERT INTO formula_registry (id, name, display_name, description, definition, is_system, author)
-VALUES (:'fid', :'fname', :'fdisplay', :'fdesc', :'fdef'::jsonb, true, 'system')
-ON CONFLICT (name) DO NOTHING;"
+  # Compute definition hash for change detection
+  def_hash=$(echo -n "$definition" | shasum -a 256 | cut -d' ' -f1)
 
-  psql_vars=(-v "fid=$id" -v "fname=$name" -v "fdisplay=$display_name" -v "fdesc=$description" -v "fdef=$definition")
+  # Use parameterized queries to prevent SQL injection
+  sql="INSERT INTO formula_registry (id, name, display_name, description, definition, definition_hash, is_system, author)
+VALUES (:'fid', :'fname', :'fdisplay', :'fdesc', :'fdef'::jsonb, :'fhash', true, 'system')
+ON CONFLICT (name) DO UPDATE SET
+  definition = EXCLUDED.definition,
+  definition_hash = EXCLUDED.definition_hash,
+  display_name = EXCLUDED.display_name,
+  description = EXCLUDED.description,
+  version = formula_registry.version + 1,
+  updated_at = NOW()
+WHERE formula_registry.is_system = true;"
+
+  psql_vars=(-v "fid=$id" -v "fname=$name" -v "fdisplay=$display_name" -v "fdesc=$description" -v "fdef=$definition" -v "fhash=$def_hash")
 
   if podman exec -i broodlink-postgres psql -U "$PG_USER" -d "$PG_DB" -c "$sql" -q "${psql_vars[@]}" 2>/dev/null; then
     echo "    Seeded: $name"

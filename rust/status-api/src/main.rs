@@ -3272,21 +3272,50 @@ async fn handler_create_formula(
         ));
     }
 
+    // Guard: reject names that collide with system formulas
+    let system_exists: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM formula_registry WHERE name = $1 AND is_system = true",
+    )
+    .bind(name)
+    .fetch_optional(&state.pg)
+    .await?;
+    if system_exists.is_some() {
+        return Err(StatusApiError::BadRequest(format!(
+            "name '{name}' is reserved for a system formula"
+        )));
+    }
+
     let id = uuid::Uuid::new_v4().to_string();
     let tags = body.get("tags").cloned().unwrap_or(serde_json::json!([]));
+    let def_hash = broodlink_formulas::definition_hash(definition);
 
     sqlx::query(
-        "INSERT INTO formula_registry (id, name, display_name, description, definition, tags, author)
-         VALUES ($1, $2, $3, $4, $5, $6, 'dashboard')",
+        "INSERT INTO formula_registry (id, name, display_name, description, definition, definition_hash, tags, author)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'dashboard')",
     )
     .bind(&id)
     .bind(name)
     .bind(display_name)
     .bind(description)
     .bind(definition)
+    .bind(&def_hash)
     .bind(&tags)
     .execute(&state.pg)
     .await?;
+
+    // Write-through: persist to custom TOML (best-effort)
+    let meta = broodlink_formulas::FormulaTomlMeta {
+        display_name,
+        description: description.unwrap_or(""),
+    };
+    if let Err(e) = broodlink_formulas::persist_formula_toml(
+        &state.config.beads.formulas_custom_dir,
+        name,
+        definition,
+        &meta,
+    ) {
+        tracing::warn!(formula = %name, error = %e, "write-through to disk failed (create)");
+    }
 
     Ok(ok_response(serde_json::json!({
         "id": id,
@@ -3304,6 +3333,15 @@ async fn handler_update_formula(
         .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Admin)?;
 
+    // Check system flag
+    let row: Option<(bool,)> =
+        sqlx::query_as("SELECT is_system FROM formula_registry WHERE name = $1")
+            .bind(&name)
+            .fetch_optional(&state.pg)
+            .await?;
+    let (is_system,) =
+        row.ok_or_else(|| StatusApiError::NotFound(format!("formula not found: {name}")))?;
+
     let body: serde_json::Value = {
         let bytes = axum::body::to_bytes(req.into_body(), 10_485_760)
             .await
@@ -3311,13 +3349,27 @@ async fn handler_update_formula(
         serde_json::from_slice(&bytes)
             .map_err(|e| StatusApiError::BadRequest(format!("invalid JSON: {e}")))?
     };
+
+    // Guard: block content modifications to system formulas (toggling enabled is OK)
+    if is_system
+        && (body.get("definition").is_some()
+            || body.get("display_name").is_some()
+            || body.get("description").is_some())
+    {
+        return Err(StatusApiError::BadRequest(
+            "cannot modify system formula — create a copy with a new name".to_string(),
+        ));
+    }
+
     let mut updates = Vec::new();
 
     if let Some(def) = body.get("definition") {
+        let def_hash = broodlink_formulas::definition_hash(def);
         sqlx::query(
-            "UPDATE formula_registry SET definition = $1, version = version + 1 WHERE name = $2",
+            "UPDATE formula_registry SET definition = $1, definition_hash = $2, version = version + 1 WHERE name = $3",
         )
         .bind(def)
+        .bind(&def_hash)
         .bind(&name)
         .execute(&state.pg)
         .await?;
@@ -3355,6 +3407,30 @@ async fn handler_update_formula(
         .bind(&name)
         .execute(&state.pg)
         .await?;
+
+    // Write-through: persist user formula to disk (best-effort, skip system formulas)
+    if !is_system {
+        let final_row: Option<(serde_json::Value, String, Option<String>)> = sqlx::query_as(
+            "SELECT definition, display_name, description FROM formula_registry WHERE name = $1",
+        )
+        .bind(&name)
+        .fetch_optional(&state.pg)
+        .await?;
+        if let Some((def, dn, desc)) = final_row {
+            let meta = broodlink_formulas::FormulaTomlMeta {
+                display_name: &dn,
+                description: desc.as_deref().unwrap_or(""),
+            };
+            if let Err(e) = broodlink_formulas::persist_formula_toml(
+                &state.config.beads.formulas_custom_dir,
+                &name,
+                &def,
+                &meta,
+            ) {
+                tracing::warn!(formula = %name, error = %e, "write-through to disk failed (update)");
+            }
+        }
+    }
 
     Ok(ok_response(serde_json::json!({
         "name": name,

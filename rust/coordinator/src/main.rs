@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use broodlink_config::Config;
+use broodlink_formulas::{FormulaFile, FormulaInput};
 use broodlink_secrets::SecretsProvider;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -590,66 +591,8 @@ async fn publish_dead_letter(
 }
 
 // ---------------------------------------------------------------------------
-// Formula parsing
+// Formula loading (types imported from broodlink_formulas)
 // ---------------------------------------------------------------------------
-
-#[derive(Deserialize, Debug, Clone)]
-struct FormulaFile {
-    #[allow(dead_code)]
-    formula: FormulaMetadata,
-    #[serde(default)]
-    steps: Vec<FormulaStep>,
-    #[serde(default)]
-    on_failure: Option<FormulaStep>,
-    /// Top-level parameters (from JSONB registry format).
-    #[allow(dead_code)]
-    #[serde(default)]
-    parameters: Option<serde_json::Value>,
-}
-
-#[derive(Deserialize, Debug, Clone)]
-struct FormulaMetadata {
-    #[allow(dead_code)]
-    name: String,
-    #[allow(dead_code)]
-    version: Option<String>,
-    #[allow(dead_code)]
-    description: Option<String>,
-    #[allow(dead_code)]
-    #[serde(default)]
-    parameters: Option<serde_json::Value>,
-}
-
-#[derive(Deserialize, Debug, Clone)]
-struct FormulaStep {
-    name: String,
-    agent_role: String,
-    #[allow(dead_code)]
-    tools: Option<Vec<String>>,
-    prompt: String,
-    #[serde(default)]
-    input: Option<FormulaInput>,
-    output: String,
-    // v0.6.0: Workflow branching
-    #[serde(default)]
-    when: Option<String>,
-    #[serde(default)]
-    retries: Option<u32>,
-    #[serde(default)]
-    backoff: Option<String>,
-    #[serde(default)]
-    timeout_seconds: Option<u64>,
-    #[serde(default)]
-    group: Option<u32>,
-}
-
-/// A step's input can be a single key or multiple keys.
-#[derive(Deserialize, Debug, Clone)]
-#[serde(untagged)]
-enum FormulaInput {
-    Single(String),
-    Multiple(Vec<String>),
-}
 
 /// Load a formula from Postgres registry first, falling back to TOML files.
 async fn load_formula_from_registry(
@@ -709,11 +652,7 @@ async fn load_formula_from_registry(
 }
 
 fn load_formula(config: &Config, formula_name: &str) -> Result<FormulaFile, BroodlinkError> {
-    // Validate formula name to prevent path traversal
-    if !formula_name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
+    if !broodlink_formulas::validate_formula_name(formula_name) {
         return Err(BroodlinkError::Internal(format!(
             "invalid formula name: {formula_name}"
         )));

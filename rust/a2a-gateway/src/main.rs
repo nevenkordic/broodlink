@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, State};
@@ -151,6 +152,11 @@ struct AppState {
     brave_cache: tokio::sync::RwLock<HashMap<String, (String, std::time::Instant)>>,
     /// In-flight chat dedup: "platform:chat_id:text_hash" → started_at.
     inflight_chats: tokio::sync::RwLock<HashMap<String, std::time::Instant>>,
+    /// True when the primary chat model is known to be too large for available memory.
+    /// Avoids wasting 3+ seconds retrying a model that will never fit.
+    primary_model_degraded: AtomicBool,
+    /// When the primary model entered degraded mode. Used to periodically retry.
+    degraded_since: tokio::sync::RwLock<Option<std::time::Instant>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +330,8 @@ async fn async_main() {
         ollama_semaphore: tokio::sync::Semaphore::new(config.a2a.ollama_concurrency as usize),
         brave_cache: tokio::sync::RwLock::new(HashMap::new()),
         inflight_chats: tokio::sync::RwLock::new(HashMap::new()),
+        primary_model_degraded: AtomicBool::new(false),
+        degraded_since: tokio::sync::RwLock::new(None),
     });
 
     // Spawn chat reply delivery loop
@@ -2962,15 +2970,18 @@ async fn send_ollama_request(
     )))
 }
 
+/// How long to stay in degraded mode before retrying the primary model.
+const DEGRADED_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Attempt to recover from an Ollama model error by unloading the failed model
-/// to free memory, then retrying it. Returns the primary model's response on
-/// success, or uses the fallback model to communicate the failure to the user.
+/// to free memory, then retrying it. If recovery fails, enters degraded mode
+/// and answers the user's question using the fallback model directly.
 async fn handle_ollama_recovery(
     state: &AppState,
     chat_url: &str,
     primary_model: &str,
     fallback_model: &str,
-    error_msg: &str,
+    _error_msg: &str,
     messages: &[serde_json::Value],
     timeout_secs: u64,
 ) -> String {
@@ -3021,7 +3032,11 @@ async fn handle_ollama_recovery(
             {
                 let cleaned = strip_think_tags(content.trim());
                 if !cleaned.is_empty() {
-                    info!(model = %primary_model, "primary model recovered successfully");
+                    // Primary recovered — clear degraded flag if it was set
+                    if state.primary_model_degraded.swap(false, Ordering::Relaxed) {
+                        *state.degraded_since.write().await = None;
+                        info!(model = %primary_model, "primary model recovered — leaving degraded mode");
+                    }
                     return cleaned;
                 }
             }
@@ -3043,52 +3058,60 @@ async fn handle_ollama_recovery(
         }
     }
 
-    // Step 4: Recovery failed — use the fallback model to communicate with the user
-    generate_status_message(
+    // Step 4: Enter degraded mode — skip primary on subsequent requests
+    if !state.primary_model_degraded.swap(true, Ordering::Relaxed) {
+        *state.degraded_since.write().await = Some(std::time::Instant::now());
+        warn!(
+            model = %primary_model,
+            fallback = %fallback_model,
+            "entering degraded mode — routing chat to fallback model for {}s",
+            DEGRADED_RETRY_INTERVAL.as_secs()
+        );
+    }
+
+    // Step 5: Answer using the fallback model (not just a status message)
+    fallback_chat(
         &state.ollama_client,
         chat_url,
         fallback_model,
-        error_msg,
+        messages,
         num_ctx,
     )
     .await
 }
 
-/// Use the fallback model to generate a brief status message explaining the
-/// service disruption. The fallback model does NOT answer the user's question —
-/// its only job is clear communication about what happened.
-async fn generate_status_message(
+/// Use the fallback model to answer the user's actual question.
+/// Prepends a system note so the model knows it's operating as a lightweight
+/// stand-in, but otherwise gives a real answer.
+async fn fallback_chat(
     client: &reqwest::Client,
     chat_url: &str,
     fallback_model: &str,
-    error_msg: &str,
+    messages: &[serde_json::Value],
     num_ctx: u32,
 ) -> String {
+    // Replace the system prompt with one suited for the fallback model
+    let mut fallback_messages = Vec::with_capacity(messages.len());
+    fallback_messages.push(serde_json::json!({
+        "role": "system",
+        "content": "You are Broodlink, an AI assistant running in lightweight mode. \
+            Answer the user's question as best you can. Keep responses concise."
+    }));
+    // Copy user/assistant messages (skip original system prompt)
+    for msg in messages {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("system") {
+            fallback_messages.push(msg.clone());
+        }
+    }
+
     let payload = serde_json::json!({
         "model": fallback_model,
-        "messages": [
-            {
-                "role": "system",
-                "content": "You are Broodlink's system recovery agent. The primary AI model \
-                    hit an error and recovery failed. Your ONLY job is to briefly tell the user \
-                    what happened. Do NOT try to answer their question — just explain the \
-                    situation in 1-2 friendly sentences. Mention that they should try again \
-                    shortly."
-            },
-            {
-                "role": "user",
-                "content": format!(
-                    "The primary model encountered this error: \"{error_msg}\". \
-                     Recovery was attempted but the model is still unavailable. \
-                     Generate a brief, friendly status message for the end user."
-                )
-            }
-        ],
+        "messages": fallback_messages,
         "stream": false,
         "think": false,
         "options": {
-            "temperature": 0.3,
-            "num_predict": 128,
+            "temperature": 0.7,
+            "num_predict": 512,
             "num_ctx": num_ctx,
         }
     });
@@ -3096,9 +3119,8 @@ async fn generate_status_message(
     match client.post(chat_url).json(&payload).send().await {
         Ok(resp) => {
             if let Ok(body) = resp.json::<serde_json::Value>().await {
-                // Check for Ollama error first
                 if body.get("error").is_some() {
-                    warn!("fallback model also returned error");
+                    warn!(model = %fallback_model, "fallback model also returned error");
                 } else if let Some(content) = body
                     .get("message")
                     .and_then(|m| m.get("content"))
@@ -3209,6 +3231,32 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
 
     let max_rounds = tool_cfg.max_tool_rounds;
     let model = &chat_cfg.chat_model;
+    let fallback = &chat_cfg.chat_fallback_model;
+
+    // Degraded mode: skip primary model if it recently failed with OOM.
+    // Periodically retry (every DEGRADED_RETRY_INTERVAL) to detect recovery.
+    if state.primary_model_degraded.load(Ordering::Relaxed) && !fallback.is_empty() {
+        let should_retry = {
+            let ds = state.degraded_since.read().await;
+            ds.is_some_and(|t| t.elapsed() >= DEGRADED_RETRY_INTERVAL)
+        };
+        if should_retry {
+            info!(model = %model, "degraded cooldown expired — probing primary model");
+            // Clear flag optimistically; handle_ollama_recovery re-sets it on failure
+            state.primary_model_degraded.store(false, Ordering::Relaxed);
+            *state.degraded_since.write().await = None;
+        } else {
+            info!(model = %fallback, "degraded mode — routing to fallback model");
+            return fallback_chat(
+                &state.ollama_client,
+                &url,
+                fallback,
+                &messages,
+                state.config.ollama.num_ctx,
+            )
+            .await;
+        }
+    }
 
     for round in 0..=max_rounds {
         // Include tools only on rounds where the model can still call them

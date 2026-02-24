@@ -1,0 +1,61 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: service
+    attributes:
+      label: Affected Service
+      options:
+        - beads-bridge
+        - status-api
+        - coordinator
+        - heartbeat
+        - embedding-worker
+        - mcp-server
+        - a2a-gateway
+        - dashboard
+        - other
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: How can we reproduce this?
+      placeholder: |
+        1. Start service X
+        2. Send request Y
+        3. Observe error Z
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What should have happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs
+      description: Paste any relevant log output (redact secrets).
+      render: shell
+
+  - type: input
+    id: version
+    attributes:
+      label: Broodlink Version
+      placeholder: "0.7.0"

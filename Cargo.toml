@@ -5,6 +5,7 @@ members = [
   "crates/broodlink-config",
   "crates/broodlink-telemetry",
   "crates/broodlink-runtime",
+  "crates/broodlink-formulas",
   "rust/beads-bridge",
   "rust/coordinator",
   "rust/heartbeat",
