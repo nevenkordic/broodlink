@@ -133,7 +133,10 @@ pub fn jsonb_params_to_toml(params: &serde_json::Value) -> BTreeMap<String, Form
                     .get("required")
                     .and_then(|r| r.as_bool())
                     .unwrap_or(false),
-                description: item.get("description").and_then(|d| d.as_str()).map(String::from),
+                description: item
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .map(String::from),
                 default: item.get("default").cloned(),
             };
             map.insert(name.to_string(), param);
@@ -176,11 +179,7 @@ pub fn formula_to_jsonb(f: &FormulaFile) -> serde_json::Value {
     let mut def = serde_json::to_value(f).unwrap_or(serde_json::json!({}));
 
     // Transform parameters from TOML dict to JSONB array
-    if let Some(params_dict) = f
-        .formula
-        .parameters
-        .as_ref()
-    {
+    if let Some(params_dict) = f.formula.parameters.as_ref() {
         let params_array = toml_params_to_jsonb(params_dict);
         def["parameters"] = params_array;
     }
@@ -406,15 +405,13 @@ fn jsonb_to_formula_file(
         .unwrap_or_default();
 
     // Parse on_failure
-    let on_failure: Option<FormulaStep> = definition
-        .get("on_failure")
-        .and_then(|f| {
-            if f.is_null() {
-                None
-            } else {
-                serde_json::from_value(f.clone()).ok()
-            }
-        });
+    let on_failure: Option<FormulaStep> = definition.get("on_failure").and_then(|f| {
+        if f.is_null() {
+            None
+        } else {
+            serde_json::from_value(f.clone()).ok()
+        }
+    });
 
     Ok(FormulaFile {
         formula: FormulaMetadata {
@@ -539,8 +536,7 @@ mod tests {
             display_name: "Research",
             description: "Deep research workflow",
         };
-        let roundtripped =
-            jsonb_to_formula_file("research", &jsonb, &meta).expect("roundtrip");
+        let roundtripped = jsonb_to_formula_file("research", &jsonb, &meta).expect("roundtrip");
         assert_eq!(roundtripped.formula.name, "research");
         assert_eq!(roundtripped.steps.len(), 3);
         let rt_params = roundtripped.formula.parameters.as_ref().unwrap();
@@ -617,8 +613,8 @@ mod tests {
         persist_formula_toml(dir, "research", &jsonb, &meta).expect("persist");
 
         // Read back
-        let written = std::fs::read_to_string(tmp.path().join("research.formula.toml"))
-            .expect("read back");
+        let written =
+            std::fs::read_to_string(tmp.path().join("research.formula.toml")).expect("read back");
         assert!(written.contains("[formula]"));
         assert!(written.contains("name = \"research\""));
         assert!(written.contains("[formula.parameters.topic]"));

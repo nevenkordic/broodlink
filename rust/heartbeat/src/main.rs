@@ -1717,12 +1717,7 @@ async fn sync_formula_registry(
                     continue; // no change
                 }
                 let display_name = broodlink_formulas::title_case(&lf.name);
-                let description = lf
-                    .formula
-                    .formula
-                    .description
-                    .as_deref()
-                    .unwrap_or("");
+                let description = lf.formula.formula.description.as_deref().unwrap_or("");
                 sqlx::query(
                     "UPDATE formula_registry
                      SET definition = $1, definition_hash = $2,
@@ -1744,12 +1739,7 @@ async fn sync_formula_registry(
                 // Insert only if no row with this name exists (don't overwrite user formulas)
                 let id = Uuid::new_v4().to_string();
                 let display_name = broodlink_formulas::title_case(&lf.name);
-                let description = lf
-                    .formula
-                    .formula
-                    .description
-                    .as_deref()
-                    .unwrap_or("");
+                let description = lf.formula.formula.description.as_deref().unwrap_or("");
                 let result = sqlx::query(
                     "INSERT INTO formula_registry (id, name, display_name, description, definition, definition_hash, author, is_system, enabled)
                      VALUES ($1, $2, $3, $4, $5, $6, 'system', true, true)
@@ -1792,12 +1782,7 @@ async fn sync_formula_registry(
         }
         let id = Uuid::new_v4().to_string();
         let display_name = broodlink_formulas::title_case(&lf.name);
-        let description = lf
-            .formula
-            .formula
-            .description
-            .as_deref()
-            .unwrap_or("");
+        let description = lf.formula.formula.description.as_deref().unwrap_or("");
         sqlx::query(
             "INSERT INTO formula_registry (id, name, display_name, description, definition, definition_hash, author, is_system, enabled)
              VALUES ($1, $2, $3, $4, $5, $6, 'disk-import', false, true)
@@ -1816,11 +1801,10 @@ async fn sync_formula_registry(
     }
 
     // C. Hash backfill: compute hashes for rows missing definition_hash
-    let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
-        "SELECT id, definition FROM formula_registry WHERE definition_hash IS NULL",
-    )
-    .fetch_all(pg)
-    .await?;
+    let rows: Vec<(String, serde_json::Value)> =
+        sqlx::query_as("SELECT id, definition FROM formula_registry WHERE definition_hash IS NULL")
+            .fetch_all(pg)
+            .await?;
     for (id, def) in &rows {
         let hash = broodlink_formulas::definition_hash(def);
         sqlx::query("UPDATE formula_registry SET definition_hash = $1 WHERE id = $2")
@@ -1841,8 +1825,7 @@ async fn sync_formula_registry(
     .await?;
 
     for (name, display_name, definition, description) in &user_rows {
-        let toml_path =
-            std::path::Path::new(custom_dir).join(format!("{name}.formula.toml"));
+        let toml_path = std::path::Path::new(custom_dir).join(format!("{name}.formula.toml"));
         if toml_path.exists() {
             continue; // already on disk
         }
@@ -1850,7 +1833,8 @@ async fn sync_formula_registry(
             display_name,
             description: description.as_deref().unwrap_or(""),
         };
-        if let Err(e) = broodlink_formulas::persist_formula_toml(custom_dir, name, definition, &meta)
+        if let Err(e) =
+            broodlink_formulas::persist_formula_toml(custom_dir, name, definition, &meta)
         {
             warn!(formula = %name, error = %e, "failed to write user formula to disk (safety net)");
         } else {

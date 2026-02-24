@@ -118,7 +118,10 @@ pub async fn run_http_transport(config: Arc<broodlink_config::Config>, client: B
 async fn security_headers_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
     let mut resp = next.run(req).await;
     let headers = resp.headers_mut();
-    headers.insert("X-Content-Type-Options", header::HeaderValue::from_static("nosniff"));
+    headers.insert(
+        "X-Content-Type-Options",
+        header::HeaderValue::from_static("nosniff"),
+    );
     headers.insert(
         "Cache-Control",
         header::HeaderValue::from_static("no-store, no-cache, must-revalidate"),

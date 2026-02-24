@@ -68,11 +68,17 @@ impl IntoResponse for GatewayError {
             GatewayError::BadRequest(m) => (StatusCode::BAD_REQUEST, format!("bad request: {m}")),
             GatewayError::Bridge(e) => {
                 error!(error = %e, "bridge call failed");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
             GatewayError::Db(e) => {
                 error!(error = %e, "database error");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
         };
         (status, axum::Json(serde_json::json!({ "error": msg }))).into_response()
@@ -204,7 +210,6 @@ fn main() {
 }
 
 async fn async_main() {
-
     let config = match Config::load() {
         Ok(c) => Arc::new(c),
         Err(e) => {
@@ -608,7 +613,10 @@ async fn bridge_call(
 async fn security_headers_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
     let mut resp = next.run(req).await;
     let headers = resp.headers_mut();
-    headers.insert("X-Content-Type-Options", header::HeaderValue::from_static("nosniff"));
+    headers.insert(
+        "X-Content-Type-Options",
+        header::HeaderValue::from_static("nosniff"),
+    );
     headers.insert(
         "Cache-Control",
         header::HeaderValue::from_static("no-store, no-cache, must-revalidate"),
@@ -1177,10 +1185,7 @@ async fn tasks_send_subscribe_handler(
 // ---------------------------------------------------------------------------
 
 async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let pg_ok = sqlx::query("SELECT 1")
-        .execute(&state.pg)
-        .await
-        .is_ok();
+    let pg_ok = sqlx::query("SELECT 1").execute(&state.pg).await.is_ok();
 
     let bridge_ok = state
         .http_client
@@ -1541,9 +1546,7 @@ fn verify_teams_signature(shared_secret: &str, body: &str, auth_header: &str) ->
 
 fn base64_decode(input: &str) -> Option<Vec<u8>> {
     use base64::Engine;
-    base64::engine::general_purpose::STANDARD
-        .decode(input)
-        .ok()
+    base64::engine::general_purpose::STANDARD.decode(input).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -2941,7 +2944,10 @@ async fn send_ollama_request(
     let mut last_err = String::new();
     for attempt in 0..2u8 {
         if attempt > 0 {
-            info!(attempt = attempt, "retrying Ollama request after connection error");
+            info!(
+                attempt = attempt,
+                "retrying Ollama request after connection error"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
         match client.post(url).json(payload).send().await {

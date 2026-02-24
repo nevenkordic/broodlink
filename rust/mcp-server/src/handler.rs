@@ -69,11 +69,7 @@ impl BridgeClient {
         // Convert from OpenAI function-calling format to MCP tool format
         let tools = body["tools"]
             .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .map(convert_tool_to_mcp)
-                    .collect::<Vec<_>>()
-            })
+            .map(|arr| arr.iter().map(convert_tool_to_mcp).collect::<Vec<_>>())
             .unwrap_or_else(|| {
                 tracing::warn!("bridge response missing 'tools' array, returning empty tool list");
                 Vec::new()

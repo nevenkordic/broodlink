@@ -186,7 +186,10 @@ async fn process_jsonrpc_line(client: &BridgeClient, line: &str) -> Option<Strin
 async fn security_headers_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
     let mut resp = next.run(req).await;
     let headers = resp.headers_mut();
-    headers.insert("X-Content-Type-Options", header::HeaderValue::from_static("nosniff"));
+    headers.insert(
+        "X-Content-Type-Options",
+        header::HeaderValue::from_static("nosniff"),
+    );
     headers.insert(
         "Cache-Control",
         header::HeaderValue::from_static("no-store, no-cache, must-revalidate"),
@@ -282,10 +285,7 @@ async fn message_handler(
 }
 
 async fn health_handler(State(state): State<Arc<McpState>>) -> impl IntoResponse {
-    let bridge_ok = state
-        .client
-        .check_health()
-        .await;
+    let bridge_ok = state.client.check_health().await;
 
     let status = if bridge_ok { "ok" } else { "degraded" };
 

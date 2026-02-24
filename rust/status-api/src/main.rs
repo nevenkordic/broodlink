@@ -25,8 +25,8 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::process;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, Method, Request, StatusCode};
@@ -82,9 +82,9 @@ fn validate_webhook_url(url: &str) -> Result<(), StatusApiError> {
         }
     }
 
-    let host = parsed.host_str().ok_or_else(|| {
-        StatusApiError::BadRequest("webhook URL must contain a host".into())
-    })?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| StatusApiError::BadRequest("webhook URL must contain a host".into()))?;
 
     let lower = host.to_ascii_lowercase();
     if lower == "localhost"
@@ -504,7 +504,10 @@ async fn shutdown_signal() {
 
 fn build_router(state: Arc<AppState>) -> Router {
     // Build CORS layer from config origins
-    let cors = build_cors_layer(&state.config.status_api.cors_origins, &state.config.broodlink.env);
+    let cors = build_cors_layer(
+        &state.config.status_api.cors_origins,
+        &state.config.broodlink.env,
+    );
 
     let api_routes = Router::new()
         .route("/agents", get(handler_agents))
@@ -1578,7 +1581,10 @@ async fn handler_budgets(
     State(state): State<Arc<AppState>>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned()
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
         .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Operator)?;
 
@@ -1613,7 +1619,10 @@ async fn handler_agent_toggle(
     axum::extract::Path(agent_id): axum::extract::Path<String>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned()
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
         .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Admin)?;
 
@@ -1654,7 +1663,10 @@ async fn handler_budget_set(
     axum::extract::Path(agent_id): axum::extract::Path<String>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned()
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
         .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Admin)?;
 
@@ -1687,7 +1699,10 @@ async fn handler_task_cancel(
     axum::extract::Path(task_id): axum::extract::Path<String>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned()
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
         .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Operator)?;
 
@@ -1807,7 +1822,10 @@ async fn handler_webhook_create(
     State(state): State<Arc<AppState>>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned()
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
         .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Admin)?;
 
@@ -1862,7 +1880,10 @@ async fn handler_webhook_toggle(
     Path(endpoint_id): Path<String>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned()
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
         .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Admin)?;
 
@@ -1899,7 +1920,10 @@ async fn handler_webhook_delete(
     Path(endpoint_id): Path<String>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned()
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
         .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Admin)?;
 
@@ -2328,7 +2352,10 @@ async fn handler_upsert_approval_policy(
     State(state): State<Arc<AppState>>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned()
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
         .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Admin)?;
 
@@ -2388,7 +2415,10 @@ async fn handler_toggle_approval_policy(
     axum::extract::Path(policy_id): axum::extract::Path<String>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned()
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
         .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Admin)?;
 
@@ -2437,7 +2467,10 @@ async fn handler_approval_review(
     axum::extract::Path(gate_id): axum::extract::Path<String>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned()
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
         .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Operator)?;
 
@@ -2729,7 +2762,9 @@ async fn handler_stream_sse(
     Path(stream_id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, StatusApiError> {
     // Enforce global SSE connection limit
-    let current = state.sse_connections.load(std::sync::atomic::Ordering::Relaxed);
+    let current = state
+        .sse_connections
+        .load(std::sync::atomic::Ordering::Relaxed);
     if current >= MAX_SSE_CONNECTIONS {
         return Err(StatusApiError::BadRequest(
             "too many active SSE connections".into(),
@@ -2886,7 +2921,10 @@ async fn handler_chat_sessions(
     Query(params): Query<HashMap<String, String>>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned()
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
         .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Operator)?;
 
@@ -3029,7 +3067,10 @@ async fn handler_chat_stats(
     State(state): State<Arc<AppState>>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned()
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
         .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Operator)?;
 
@@ -3076,7 +3117,10 @@ async fn handler_chat_close(
     Path(session_id): Path<String>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned()
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
         .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Operator)?;
 
@@ -3096,7 +3140,10 @@ async fn handler_chat_assign(
     Path(session_id): Path<String>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned()
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
         .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Operator)?;
 
@@ -3245,7 +3292,10 @@ async fn handler_create_formula(
     State(state): State<Arc<AppState>>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned()
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
         .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Admin)?;
 
@@ -3273,12 +3323,11 @@ async fn handler_create_formula(
     }
 
     // Guard: reject names that collide with system formulas
-    let system_exists: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM formula_registry WHERE name = $1 AND is_system = true",
-    )
-    .bind(name)
-    .fetch_optional(&state.pg)
-    .await?;
+    let system_exists: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM formula_registry WHERE name = $1 AND is_system = true")
+            .bind(name)
+            .fetch_optional(&state.pg)
+            .await?;
     if system_exists.is_some() {
         return Err(StatusApiError::BadRequest(format!(
             "name '{name}' is reserved for a system formula"
@@ -3329,7 +3378,10 @@ async fn handler_update_formula(
     Path(name): Path<String>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned()
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
         .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Admin)?;
 
@@ -3444,7 +3496,10 @@ async fn handler_toggle_formula(
     Path(name): Path<String>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned()
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
         .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Admin)?;
 
@@ -3649,11 +3704,12 @@ async fn handler_auth_logout_all(
         .ok_or_else(|| StatusApiError::Auth("missing X-Broodlink-Session header".to_string()))?;
 
     // Look up the user_id for the current session
-    let user_id: Option<(String,)> =
-        sqlx::query_as("SELECT user_id FROM dashboard_sessions WHERE id = $1 AND expires_at > NOW()")
-            .bind(session_token)
-            .fetch_optional(&state.pg)
-            .await?;
+    let user_id: Option<(String,)> = sqlx::query_as(
+        "SELECT user_id FROM dashboard_sessions WHERE id = $1 AND expires_at > NOW()",
+    )
+    .bind(session_token)
+    .fetch_optional(&state.pg)
+    .await?;
 
     let (user_id,) = user_id.ok_or_else(|| StatusApiError::Auth("invalid session".to_string()))?;
 
@@ -4003,7 +4059,10 @@ async fn handler_telegram_status(
     State(state): State<Arc<AppState>>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned()
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
         .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Operator)?;
 
@@ -4060,7 +4119,10 @@ async fn handler_telegram_register(
     State(state): State<Arc<AppState>>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned()
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
         .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Admin)?;
 
@@ -4213,7 +4275,10 @@ async fn handler_telegram_disconnect(
     State(state): State<Arc<AppState>>,
     req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let ctx = req.extensions().get::<AuthContext>().cloned()
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
         .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Admin)?;
 

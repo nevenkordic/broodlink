@@ -1096,10 +1096,16 @@ async fn tools_metadata_handler() -> axum::Json<serde_json::Value> {
 // Security headers middleware (OWASP A05)
 // ---------------------------------------------------------------------------
 
-async fn security_headers_middleware(req: Request<axum::body::Body>, next: Next) -> axum::response::Response {
+async fn security_headers_middleware(
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> axum::response::Response {
     let mut resp = next.run(req).await;
     let headers = resp.headers_mut();
-    headers.insert("X-Content-Type-Options", header::HeaderValue::from_static("nosniff"));
+    headers.insert(
+        "X-Content-Type-Options",
+        header::HeaderValue::from_static("nosniff"),
+    );
     headers.insert(
         "Cache-Control",
         header::HeaderValue::from_static("no-store, no-cache, must-revalidate"),
@@ -1620,10 +1626,12 @@ fn validate_outbound_url(url: &str) -> Result<(), BroodlinkError> {
         }
     }
 
-    let host = parsed.host_str().ok_or_else(|| BroodlinkError::Validation {
-        field: "url".to_string(),
-        message: "URL must contain a host".to_string(),
-    })?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| BroodlinkError::Validation {
+            field: "url".to_string(),
+            message: "URL must contain a host".to_string(),
+        })?;
 
     // Block known internal hostnames
     let lower = host.to_ascii_lowercase();
@@ -2937,9 +2945,7 @@ async fn tool_graph_traverse(
             .map(String::from)
             .collect()
     });
-    let has_relation_filter = relation_types
-        .as_ref()
-        .is_some_and(|v| !v.is_empty());
+    let has_relation_filter = relation_types.as_ref().is_some_and(|v| !v.is_empty());
     let relation_filter = if has_relation_filter {
         " AND edge.relation_type = ANY($3)"
     } else {
@@ -2992,9 +2998,7 @@ async fn tool_graph_traverse(
         Option<String>,
         i32,
     )> = {
-        let q = sqlx::query_as(&sql)
-            .bind(start_entity)
-            .bind(max_hops);
+        let q = sqlx::query_as(&sql).bind(start_entity).bind(max_hops);
         // Bind relation_types as $3 only when filter is active
         if has_relation_filter {
             q.bind(relation_types.unwrap_or_default())
@@ -5634,9 +5638,8 @@ async fn tool_list_formulas(
         let names_with_tag: std::collections::HashSet<String> = tag_rows
             .iter()
             .filter(|(_, tags)| {
-                tags.as_array().is_some_and(|arr| {
-                    arr.iter().any(|t| t.as_str() == Some(tag_filter))
-                })
+                tags.as_array()
+                    .is_some_and(|arr| arr.iter().any(|t| t.as_str() == Some(tag_filter)))
             })
             .map(|(name, _)| name.clone())
             .collect();
@@ -5789,12 +5792,11 @@ async fn tool_create_formula(
     let tags_str = param_str_opt(params, "tags");
 
     // Guard: reject names that collide with system formulas
-    let system_exists: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM formula_registry WHERE name = $1 AND is_system = true",
-    )
-    .bind(name)
-    .fetch_optional(&state.pg)
-    .await?;
+    let system_exists: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM formula_registry WHERE name = $1 AND is_system = true")
+            .bind(name)
+            .fetch_optional(&state.pg)
+            .await?;
     if system_exists.is_some() {
         return Err(BroodlinkError::Validation {
             field: "name".to_string(),
@@ -6112,7 +6114,7 @@ async fn check_guardrails(
                     for pat in &patterns {
                         // Size-limit regex to prevent ReDoS from malicious patterns
                         let re = regex::RegexBuilder::new(pat)
-                            .size_limit(1 << 20)  // 1 MiB compiled size limit
+                            .size_limit(1 << 20) // 1 MiB compiled size limit
                             .dfa_size_limit(1 << 20)
                             .build();
                         if let Ok(re) = re {
@@ -7092,7 +7094,9 @@ async fn tool_get_routing_scores(
 
     let metrics_map: HashMap<String, (i32, i32, i32, f64)> = metrics
         .into_iter()
-        .map(|(aid, completed, failed, load, rate)| (aid, (completed, failed, load, f64::from(rate))))
+        .map(|(aid, completed, failed, load, rate)| {
+            (aid, (completed, failed, load, f64::from(rate)))
+        })
         .collect();
 
     let weights = &state.config.routing.weights;
