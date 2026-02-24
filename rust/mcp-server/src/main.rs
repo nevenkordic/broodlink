@@ -13,8 +13,10 @@ use std::process;
 use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{header, Request};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use broodlink_config::Config;
@@ -178,6 +180,26 @@ async fn process_jsonrpc_line(client: &BridgeClient, line: &str) -> Option<Strin
 }
 
 // ---------------------------------------------------------------------------
+// Security headers middleware (OWASP A05)
+// ---------------------------------------------------------------------------
+
+async fn security_headers_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    headers.insert("X-Content-Type-Options", header::HeaderValue::from_static("nosniff"));
+    headers.insert(
+        "Cache-Control",
+        header::HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+    );
+    headers.insert("Pragma", header::HeaderValue::from_static("no-cache"));
+    headers.insert(
+        "Permissions-Policy",
+        header::HeaderValue::from_static("geolocation=(), microphone=(), camera=()"),
+    );
+    resp
+}
+
+// ---------------------------------------------------------------------------
 // SSE transport — axum HTTP server on configured port
 // ---------------------------------------------------------------------------
 
@@ -192,6 +214,7 @@ async fn run_sse_transport(config: Arc<Config>, client: BridgeClient) {
         .route("/message", post(message_handler))
         .route("/health", get(health_handler))
         .layer(DefaultBodyLimit::max(1_048_576)) // 1 MiB
+        .layer(middleware::from_fn(security_headers_middleware))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.mcp_server.port));
@@ -219,7 +242,7 @@ async fn sse_handler(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
 
     // Send the endpoint event so the client knows where to POST
-    let endpoint_msg = format!("/message");
+    let endpoint_msg = "/message".to_string();
     tokio::spawn(async move {
         let event = Event::default().event("endpoint").data(endpoint_msg);
         let _ = tx.send(Ok(event)).await;

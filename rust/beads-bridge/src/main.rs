@@ -1093,6 +1093,26 @@ async fn tools_metadata_handler() -> axum::Json<serde_json::Value> {
 }
 
 // ---------------------------------------------------------------------------
+// Security headers middleware (OWASP A05)
+// ---------------------------------------------------------------------------
+
+async fn security_headers_middleware(req: Request<axum::body::Body>, next: Next) -> axum::response::Response {
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    headers.insert("X-Content-Type-Options", header::HeaderValue::from_static("nosniff"));
+    headers.insert(
+        "Cache-Control",
+        header::HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+    );
+    headers.insert("Pragma", header::HeaderValue::from_static("no-cache"));
+    headers.insert(
+        "Permissions-Policy",
+        header::HeaderValue::from_static("geolocation=(), microphone=(), camera=()"),
+    );
+    resp
+}
+
+// ---------------------------------------------------------------------------
 // Router construction
 // ---------------------------------------------------------------------------
 
@@ -1116,6 +1136,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             )),
         )
         .layer(axum::extract::DefaultBodyLimit::max(10_485_760)) // 10 MiB
+        .layer(middleware::from_fn(security_headers_middleware))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -1275,8 +1296,8 @@ async fn tool_dispatch(
     Json(body): Json<ToolRequest>,
 ) -> Result<Json<ToolResponse>, BroodlinkError> {
     let agent_id = &claims.agent_id;
-    tracing::Span::current().record("tool", &tracing::field::display(&tool_name));
-    tracing::Span::current().record("agent", &tracing::field::display(agent_id));
+    tracing::Span::current().record("tool", tracing::field::display(&tool_name));
+    tracing::Span::current().record("agent", tracing::field::display(agent_id));
     // Prefer OTLP trace ID for cross-service correlation; fall back to UUID
     let request_id =
         broodlink_telemetry::current_trace_id().unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -1755,7 +1776,7 @@ fn param_i64_opt(params: &serde_json::Value, field: &str) -> Option<i64> {
 
 /// Clamp a user-supplied limit to a safe range [1, 1000].
 fn clamp_limit(limit: i64) -> i64 {
-    limit.max(1).min(1000)
+    limit.clamp(1, 1000)
 }
 
 fn param_f64_opt(params: &serde_json::Value, field: &str) -> Option<f64> {
@@ -5603,7 +5624,7 @@ async fn tool_list_formulas(
         let names_with_tag: std::collections::HashSet<String> = tag_rows
             .iter()
             .filter(|(_, tags)| {
-                tags.as_array().map_or(false, |arr| {
+                tags.as_array().is_some_and(|arr| {
                     arr.iter().any(|t| t.as_str() == Some(tag_filter))
                 })
             })
@@ -5613,7 +5634,7 @@ async fn tool_list_formulas(
         formulas.retain(|f| {
             f.get("name")
                 .and_then(|n| n.as_str())
-                .map_or(false, |n| names_with_tag.contains(n))
+                .is_some_and(|n| names_with_tag.contains(n))
         });
     }
 
@@ -5945,7 +5966,7 @@ async fn check_guardrails(
                     .unwrap_or_default();
                 let applies_to_agent = agents.iter().any(|a| *a == "*" || *a == agent_id);
 
-                if applies_to_agent && blocked_tools.iter().any(|t| *t == tool_name) {
+                if applies_to_agent && blocked_tools.contains(&tool_name) {
                     log_guardrail_violation(
                         state,
                         agent_id,
@@ -5967,7 +5988,7 @@ async fn check_guardrails(
                         .as_array()
                         .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
                         .unwrap_or_default();
-                    if !allowed_tools.is_empty() && !allowed_tools.iter().any(|t| *t == tool_name) {
+                    if !allowed_tools.is_empty() && !allowed_tools.contains(&tool_name) {
                         log_guardrail_violation(
                             state,
                             agent_id,
@@ -8399,7 +8420,7 @@ mod tests {
         // No required params
         let required = params.get("required").and_then(|v| v.as_array());
         assert!(
-            required.map_or(true, |r| r.is_empty()),
+            required.is_none_or(|r| r.is_empty()),
             "graph_stats should have no required params"
         );
     }

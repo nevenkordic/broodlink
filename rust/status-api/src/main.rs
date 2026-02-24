@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::process;
 use std::sync::Arc;
-use std::sync::RwLock;
+use tokio::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
@@ -480,7 +480,10 @@ async fn init_state() -> Result<AppState, StatusApiError> {
         api_key,
         start_time: Instant::now(),
         login_attempts: RwLock::new(HashMap::new()),
-        http_client: reqwest::Client::new(),
+        http_client: reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("failed to build HTTP client"),
         sse_connections: std::sync::atomic::AtomicUsize::new(0),
     })
 }
@@ -617,6 +620,19 @@ async fn security_headers_middleware(req: Request<axum::body::Body>, next: Next)
     headers.insert(
         "Referrer-Policy",
         header::HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+    headers.insert(
+        "Cache-Control",
+        header::HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+    );
+    headers.insert("Pragma", header::HeaderValue::from_static("no-cache"));
+    headers.insert(
+        "Content-Security-Policy",
+        header::HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'"),
+    );
+    headers.insert(
+        "Permissions-Policy",
+        header::HeaderValue::from_static("geolocation=(), microphone=(), camera=()"),
     );
     resp
 }
@@ -1164,14 +1180,7 @@ async fn handler_health(
 
     // Determine overall status
     let all_ok = dependencies.values().all(|d| d.status == "ok");
-    let any_offline = dependencies.values().any(|d| d.status == "offline");
-    let overall = if all_ok {
-        "ok"
-    } else if any_offline {
-        "degraded"
-    } else {
-        "degraded"
-    };
+    let overall = if all_ok { "ok" } else { "degraded" };
 
     let uptime = state.start_time.elapsed().as_secs();
 
@@ -1482,7 +1491,7 @@ async fn handler_dlq(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let include_resolved = params.get("resolved").map_or(false, |v| v == "true");
+    let include_resolved = params.get("resolved").is_some_and(|v| v == "true");
     let limit: i64 = params
         .get("limit")
         .and_then(|l| l.parse().ok())
@@ -3257,10 +3266,7 @@ async fn handler_auth_login(
 
     // Rate limit: max 5 failed attempts per username per 5 minutes
     {
-        let attempts = state
-            .login_attempts
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
+        let attempts = state.login_attempts.read().await;
         if let Some((count, since)) = attempts.get(&body.username) {
             if since.elapsed() < Duration::from_secs(300) && *count >= 5 {
                 return Err(StatusApiError::BadRequest(
@@ -3281,7 +3287,8 @@ async fn handler_auth_login(
         Some(u) => u,
         None => {
             // Track failed attempt
-            if let Ok(mut attempts) = state.login_attempts.write() {
+            {
+                let mut attempts = state.login_attempts.write().await;
                 let entry = attempts
                     .entry(body.username.clone())
                     .or_insert((0, Instant::now()));
@@ -3308,7 +3315,8 @@ async fn handler_auth_login(
 
     if !valid {
         // Track failed attempt
-        if let Ok(mut attempts) = state.login_attempts.write() {
+        {
+            let mut attempts = state.login_attempts.write().await;
             let entry = attempts
                 .entry(body.username.clone())
                 .or_insert((0, Instant::now()));
@@ -3324,7 +3332,8 @@ async fn handler_auth_login(
     }
 
     // Reset failed attempts on successful login
-    if let Ok(mut attempts) = state.login_attempts.write() {
+    {
+        let mut attempts = state.login_attempts.write().await;
         attempts.remove(&body.username);
     }
 
@@ -3869,17 +3878,14 @@ async fn handler_telegram_register(
         "polling"
     };
 
-    // Step 3: Generate access code (8-char alphanumeric from CSPRNG)
+    // Step 3: Generate access code (12-char alphanumeric from CSPRNG, ~71-bit entropy)
     let auth_code: String = {
+        const CHARSET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
         let mut rng = rand::thread_rng();
-        (0..8)
+        (0..12)
             .map(|_| {
-                let idx = rng.gen_range(0..36);
-                if idx < 10 {
-                    (b'0' + idx) as char
-                } else {
-                    (b'a' + idx - 10) as char
-                }
+                let idx = rng.gen_range(0..CHARSET.len());
+                CHARSET[idx] as char
             })
             .collect()
     };

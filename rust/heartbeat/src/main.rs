@@ -1497,7 +1497,10 @@ async fn deliver_outbound_notifications(
             config.webhooks.delivery_timeout_secs,
         ))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .unwrap_or_else(|e| {
+            error!(error = %e, "failed to build webhook HTTP client");
+            std::process::exit(1);
+        });
 
     let mut delivered = 0u64;
     for (event_type, payload) in &notifications {

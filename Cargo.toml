@@ -55,6 +55,11 @@ toml                = "0.8"
 hmac                = "0.12"
 sha2                = "0.10"
 
+[profile.release]
+strip = true
+lto = true
+overflow-checks = true
+
 [workspace.lints.clippy]
 # Correctness — always deny
 correctness = { level = "deny", priority = -1 }

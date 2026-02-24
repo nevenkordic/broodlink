@@ -19,7 +19,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{header, HeaderMap, Method, StatusCode};
+use axum::http::{header, HeaderMap, Method, Request, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -93,6 +94,7 @@ pub async fn run_http_transport(config: Arc<broodlink_config::Config>, client: B
         .route("/mcp", post(mcp_post_handler).get(mcp_get_handler))
         .route("/health", get(health_handler))
         .layer(DefaultBodyLimit::max(1_048_576)) // 1 MiB
+        .layer(middleware::from_fn(security_headers_middleware))
         .layer(cors)
         .with_state(state);
 
@@ -111,6 +113,22 @@ pub async fn run_http_transport(config: Arc<broodlink_config::Config>, client: B
     if let Err(e) = axum::serve(listener, app).await {
         error!(error = %e, "server error");
     }
+}
+
+async fn security_headers_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    headers.insert("X-Content-Type-Options", header::HeaderValue::from_static("nosniff"));
+    headers.insert(
+        "Cache-Control",
+        header::HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+    );
+    headers.insert("Pragma", header::HeaderValue::from_static("no-cache"));
+    headers.insert(
+        "Permissions-Policy",
+        header::HeaderValue::from_static("geolocation=(), microphone=(), camera=()"),
+    );
+    resp
 }
 
 fn build_cors_layer(origins: &[String]) -> CorsLayer {

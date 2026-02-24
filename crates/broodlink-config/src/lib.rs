@@ -1039,7 +1039,58 @@ impl Config {
             cfg.tls.ca_path = Some(expand_tilde(p));
         }
 
+        cfg.validate()?;
+
         Ok(cfg)
+    }
+
+    /// Validate config bounds to catch misconfiguration early.
+    fn validate(&self) -> Result<(), config::ConfigError> {
+        let err = |msg: &str| config::ConfigError::Message(msg.to_string());
+
+        // Port 0 is ephemeral — almost certainly a misconfiguration
+        if self.status_api.port == 0 {
+            return Err(err("status_api.port must be > 0"));
+        }
+
+        // Pool sizing: min must not exceed max
+        if self.dolt.min_connections > self.dolt.max_connections {
+            return Err(err("dolt.min_connections must be <= max_connections"));
+        }
+        if self.postgres.min_connections > self.postgres.max_connections {
+            return Err(err("postgres.min_connections must be <= max_connections"));
+        }
+
+        // Bcrypt cost must be in [4, 31] per spec
+        if self.dashboard_auth.bcrypt_cost < 4 || self.dashboard_auth.bcrypt_cost > 31 {
+            return Err(err("dashboard_auth.bcrypt_cost must be in range [4, 31]"));
+        }
+
+        // Budget replenish hour must be a valid UTC hour
+        if self.budget.replenish_hour_utc >= 24 {
+            return Err(err("budget.replenish_hour_utc must be < 24"));
+        }
+
+        // Routing weights must be non-negative
+        let w = &self.routing.weights;
+        if w.capability < 0.0
+            || w.success_rate < 0.0
+            || w.availability < 0.0
+            || w.cost < 0.0
+            || w.recency < 0.0
+        {
+            return Err(err("routing weights must be non-negative"));
+        }
+
+        // KG similarity threshold must be in [0, 1]
+        let thresh = self.memory_search.kg_entity_similarity_threshold;
+        if !(0.0..=1.0).contains(&thresh) {
+            return Err(err(
+                "memory_search.kg_entity_similarity_threshold must be in [0.0, 1.0]",
+            ));
+        }
+
+        Ok(())
     }
 }
 

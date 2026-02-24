@@ -775,7 +775,7 @@ fn evaluate_condition(expr: &str, step_results: &serde_json::Value) -> bool {
                 return step_results
                     .get(key)
                     .and_then(|v| v.as_array())
-                    .map_or(false, |arr| arr.len() > n);
+                    .is_some_and(|arr| arr.len() > n);
             }
         }
     }
@@ -788,7 +788,7 @@ fn evaluate_condition(expr: &str, step_results: &serde_json::Value) -> bool {
                 return step_results
                     .get(key)
                     .and_then(|v| v.as_array())
-                    .map_or(false, |arr| arr.len() < n);
+                    .is_some_and(|arr| arr.len() < n);
             }
         }
     }
@@ -800,7 +800,7 @@ fn evaluate_condition(expr: &str, step_results: &serde_json::Value) -> bool {
         return step_results
             .get(key)
             .and_then(|v| v.as_str())
-            .map_or(false, |s| s == val);
+            .is_some_and(|s| s == val);
     }
 
     // Default: true (unknown conditions don't block)
@@ -852,6 +852,7 @@ async fn handle_workflow_start(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_step_task(
     state: &Arc<AppState>,
     workflow_id: &str,
@@ -2371,7 +2372,7 @@ mod tests {
 
     #[test]
     fn test_cost_tier_ordering() {
-        let mut agents = vec![
+        let mut agents = [
             make_agent("agent-high", "high"),
             make_agent("agent-low", "low"),
             make_agent("agent-medium", "medium"),

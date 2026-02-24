@@ -23,7 +23,8 @@ use std::process;
 use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{header, HeaderMap, Method, StatusCode};
+use axum::http::{header, HeaderMap, Method, Request, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -62,9 +63,16 @@ enum GatewayError {
 impl IntoResponse for GatewayError {
     fn into_response(self) -> Response {
         let (status, msg) = match &self {
-            GatewayError::NotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
-            GatewayError::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-            _ => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+            GatewayError::NotFound(m) => (StatusCode::NOT_FOUND, format!("not found: {m}")),
+            GatewayError::BadRequest(m) => (StatusCode::BAD_REQUEST, format!("bad request: {m}")),
+            GatewayError::Bridge(e) => {
+                error!(error = %e, "bridge call failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+            }
+            GatewayError::Db(e) => {
+                error!(error = %e, "database error");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+            }
         };
         (status, axum::Json(serde_json::json!({ "error": msg }))).into_response()
     }
@@ -465,6 +473,7 @@ async fn async_main() {
         .route("/webhook/telegram", post(webhook_telegram_handler))
         .route("/health", get(health_handler))
         .layer(DefaultBodyLimit::max(10_485_760)) // 10 MiB
+        .layer(middleware::from_fn(security_headers_middleware))
         .layer(cors)
         .with_state(state);
 
@@ -574,6 +583,26 @@ async fn bridge_call(
 }
 
 // ---------------------------------------------------------------------------
+// Security headers middleware (OWASP A05)
+// ---------------------------------------------------------------------------
+
+async fn security_headers_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    headers.insert("X-Content-Type-Options", header::HeaderValue::from_static("nosniff"));
+    headers.insert(
+        "Cache-Control",
+        header::HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+    );
+    headers.insert("Pragma", header::HeaderValue::from_static("no-cache"));
+    headers.insert(
+        "Permissions-Policy",
+        header::HeaderValue::from_static("geolocation=(), microphone=(), camera=()"),
+    );
+    resp
+}
+
+// ---------------------------------------------------------------------------
 // Map internal task status → A2A status
 // ---------------------------------------------------------------------------
 
@@ -629,7 +658,7 @@ fn jsonrpc_err(id: Option<serde_json::Value>, code: i32, message: &str) -> Respo
 
 async fn agent_card_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Build capabilities from Beads formulas (best-effort via bridge)
-    let skills = match bridge_call(&*state, "list_formulas", serde_json::json!({})).await {
+    let skills = match bridge_call(&state, "list_formulas", serde_json::json!({})).await {
         Ok(data) => {
             let formulas = data
                 .as_array()
@@ -729,7 +758,7 @@ async fn tasks_send_handler(
 
     // Create internal task via bridge
     let create_result = bridge_call(
-        &*state,
+        &state,
         "create_task",
         serde_json::json!({
             "title": title,
@@ -818,7 +847,7 @@ async fn tasks_get_handler(
 
     // Get task status from bridge
     let status_result = bridge_call(
-        &*state,
+        &state,
         "get_task",
         serde_json::json!({ "task_id": internal_id }),
     )
@@ -903,7 +932,7 @@ async fn tasks_cancel_handler(
 
     // Cancel via bridge
     match bridge_call(
-        &*state,
+        &state,
         "fail_task",
         serde_json::json!({ "task_id": internal_id }),
     )
@@ -973,7 +1002,7 @@ async fn tasks_send_subscribe_handler(
 
     // Create internal task
     let create_result = bridge_call(
-        &*state,
+        &state,
         "create_task",
         serde_json::json!({
             "title": title,
@@ -2459,6 +2488,7 @@ fn urlencoding_decode(s: &str) -> String {
 
 /// Handle an inbound chat message (free-form, not a /broodlink command).
 /// Creates or updates a session, stores the message, and creates a task.
+#[allow(clippy::too_many_arguments)]
 async fn handle_chat_message(
     state: &AppState,
     platform: &str,

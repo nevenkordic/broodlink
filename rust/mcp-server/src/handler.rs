@@ -27,7 +27,10 @@ impl BridgeClient {
         status_api_key: String,
     ) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("failed to build HTTP client"),
             bridge_url,
             jwt_token,
             status_api_url,
@@ -68,7 +71,7 @@ impl BridgeClient {
             .as_array()
             .map(|arr| {
                 arr.iter()
-                    .map(|t| convert_tool_to_mcp(t))
+                    .map(convert_tool_to_mcp)
                     .collect::<Vec<_>>()
             })
             .unwrap_or_else(|| {
