@@ -14,9 +14,13 @@ RUN cargo build --release -p status-api && \
     cp target/release/status-api /build/service
 
 FROM docker.io/library/debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r broodlink && useradd -r -g broodlink broodlink
 COPY --from=builder /build/service /usr/local/bin/service
 COPY --from=builder /build/config.toml /etc/broodlink/config.toml
 ENV BROODLINK_CONFIG=/etc/broodlink/config.toml
+USER broodlink
 EXPOSE 3312
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:3312/health || exit 1
 CMD ["/usr/local/bin/service"]

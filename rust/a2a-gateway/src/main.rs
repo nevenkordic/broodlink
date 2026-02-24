@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use std::process;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -295,13 +295,19 @@ async fn async_main() {
         http_client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new()),
+            .unwrap_or_else(|e| {
+                error!(error = %e, "failed to build http_client");
+                process::exit(1);
+            }),
         ollama_client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(
                 config.ollama.timeout_seconds,
             ))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new()),
+            .unwrap_or_else(|e| {
+                error!(error = %e, "failed to build ollama_client");
+                process::exit(1);
+            }),
         api_key,
         config: Arc::clone(&config),
         telegram_creds: tokio::sync::RwLock::new(None),
@@ -423,6 +429,11 @@ async fn async_main() {
     }
 
     let cors = if config.a2a.cors_origins.is_empty() {
+        if config.broodlink.env != "dev" && config.broodlink.env != "local" {
+            error!("a2a.cors_origins is empty in non-dev environment — refusing to start");
+            process::exit(1);
+        }
+        warn!("a2a.cors_origins is empty — allowing all origins (dev/local mode)");
         CorsLayer::new()
             .allow_methods([Method::GET, Method::POST])
             .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
@@ -453,6 +464,7 @@ async fn async_main() {
         .route("/webhook/teams", post(webhook_teams_handler))
         .route("/webhook/telegram", post(webhook_telegram_handler))
         .route("/health", get(health_handler))
+        .layer(DefaultBodyLimit::max(10_485_760)) // 10 MiB
         .layer(cors)
         .with_state(state);
 
@@ -480,6 +492,9 @@ async fn async_main() {
             error!(error = %e, "TLS server error");
         }
     } else {
+        if config.broodlink.env != "dev" && config.broodlink.env != "local" {
+            warn!("TLS is disabled in non-dev environment — traffic is unencrypted");
+        }
         info!(addr = %addr, "A2A Gateway listening (plaintext)");
 
         let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -511,7 +526,7 @@ fn check_auth(headers: &HeaderMap, api_key: &Option<String>) -> Result<(), Statu
         .and_then(|v| v.strip_prefix("Bearer "));
 
     match token {
-        Some(t) if t == expected => Ok(()),
+        Some(t) if constant_time_eq(t.as_bytes(), expected.as_bytes()) => Ok(()),
         _ => Err(StatusCode::UNAUTHORIZED),
     }
 }
@@ -1109,11 +1124,31 @@ async fn tasks_send_subscribe_handler(
 // GET /health
 // ---------------------------------------------------------------------------
 
-async fn health_handler() -> impl IntoResponse {
+async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let pg_ok = sqlx::query("SELECT 1")
+        .execute(&state.pg)
+        .await
+        .is_ok();
+
+    let bridge_ok = state
+        .http_client
+        .get(format!("{}/health", state.bridge_url))
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+
+    let status = if pg_ok && bridge_ok { "ok" } else { "degraded" };
+
     axum::Json(serde_json::json!({
-        "status": "ok",
+        "status": status,
         "service": SERVICE_NAME,
         "version": env!("CARGO_PKG_VERSION"),
+        "checks": {
+            "postgres": pg_ok,
+            "bridge": bridge_ok,
+        },
     }))
 }
 

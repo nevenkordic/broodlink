@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::process;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -191,6 +191,7 @@ async fn run_sse_transport(config: Arc<Config>, client: BridgeClient) {
         .route("/sse", get(sse_handler))
         .route("/message", post(message_handler))
         .route("/health", get(health_handler))
+        .layer(DefaultBodyLimit::max(1_048_576)) // 1 MiB
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.mcp_server.port));
@@ -253,11 +254,21 @@ async fn message_handler(
         })
 }
 
-async fn health_handler() -> impl IntoResponse {
+async fn health_handler(State(state): State<Arc<McpState>>) -> impl IntoResponse {
+    let bridge_ok = state
+        .client
+        .check_health()
+        .await;
+
+    let status = if bridge_ok { "ok" } else { "degraded" };
+
     axum::Json(serde_json::json!({
-        "status": "ok",
+        "status": status,
         "service": SERVICE_NAME,
         "version": env!("CARGO_PKG_VERSION"),
+        "checks": {
+            "bridge": bridge_ok,
+        },
     }))
 }
 

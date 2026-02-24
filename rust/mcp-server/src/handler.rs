@@ -35,6 +35,17 @@ impl BridgeClient {
         }
     }
 
+    /// Check if the bridge is healthy.
+    pub async fn check_health(&self) -> bool {
+        self.http
+            .get(format!("{}/health", self.bridge_url))
+            .timeout(std::time::Duration::from_secs(3))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+    }
+
     /// Fetch tool definitions from beads-bridge and convert to MCP format.
     pub async fn list_tools(&self) -> Result<serde_json::Value, (i32, String)> {
         let url = format!("{}/api/v1/tools", self.bridge_url);

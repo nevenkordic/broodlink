@@ -22,7 +22,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::process;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -66,6 +66,58 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+/// Reject URLs pointing to internal/private networks (SSRF protection).
+fn validate_webhook_url(url: &str) -> Result<(), StatusApiError> {
+    let parsed = url::Url::parse(url)
+        .map_err(|_| StatusApiError::BadRequest("invalid webhook URL".into()))?;
+
+    match parsed.scheme() {
+        "http" | "https" => {}
+        s => {
+            return Err(StatusApiError::BadRequest(format!(
+                "unsupported URL scheme '{s}'; must be http or https"
+            )));
+        }
+    }
+
+    let host = parsed.host_str().ok_or_else(|| {
+        StatusApiError::BadRequest("webhook URL must contain a host".into())
+    })?;
+
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost"
+        || lower == "metadata.google.internal"
+        || lower.ends_with(".internal")
+        || lower.ends_with(".local")
+    {
+        return Err(StatusApiError::BadRequest(
+            "webhook URL must not target internal hosts".into(),
+        ));
+    }
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        let blocked = match ip {
+            IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_broadcast()
+                    || v4.is_unspecified()
+                    || v4.octets()[0] == 169 && v4.octets()[1] == 254
+                    || v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64
+            }
+            IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+        };
+        if blocked {
+            return Err(StatusApiError::BadRequest(
+                "webhook URL must not target private/loopback addresses".into(),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +265,7 @@ pub struct AppState {
     pub start_time: Instant,
     pub login_attempts: RwLock<HashMap<String, (u32, Instant)>>,
     pub http_client: reqwest::Client,
+    pub sse_connections: std::sync::atomic::AtomicUsize,
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +379,9 @@ async fn main() {
             process::exit(1);
         }
     } else {
+        if shared.config.broodlink.env != "dev" && shared.config.broodlink.env != "local" {
+            warn!("TLS is disabled in non-dev environment — traffic is unencrypted");
+        }
         info!(addr = %addr, "listening (plaintext)");
 
         let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -425,8 +481,11 @@ async fn init_state() -> Result<AppState, StatusApiError> {
         start_time: Instant::now(),
         login_attempts: RwLock::new(HashMap::new()),
         http_client: reqwest::Client::new(),
+        sse_connections: std::sync::atomic::AtomicUsize::new(0),
     })
 }
+
+const MAX_SSE_CONNECTIONS: usize = 50;
 
 async fn shutdown_signal() {
     broodlink_runtime::shutdown_signal().await;
@@ -573,7 +632,7 @@ fn build_cors_layer(origins: &[String], env: &str) -> CorsLayer {
     ];
 
     if origins.is_empty() {
-        if env != "dev" {
+        if env != "dev" && env != "local" {
             error!("status_api.cors_origins is empty in non-dev environment — refusing to start");
             process::exit(1);
         }
@@ -1705,6 +1764,9 @@ async fn handler_webhook_create(
         .and_then(|v| v.as_str())
         .unwrap_or("unnamed");
     let webhook_url = body.get("webhook_url").and_then(|v| v.as_str());
+    if let Some(url) = webhook_url {
+        validate_webhook_url(url)?;
+    }
     let events = body.get("events").cloned().unwrap_or(serde_json::json!([]));
     let id = Uuid::new_v4().to_string();
 
@@ -2564,6 +2626,17 @@ async fn handler_stream_sse(
     State(state): State<Arc<AppState>>,
     Path(stream_id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, StatusApiError> {
+    // Enforce global SSE connection limit
+    let current = state.sse_connections.load(std::sync::atomic::Ordering::Relaxed);
+    if current >= MAX_SSE_CONNECTIONS {
+        return Err(StatusApiError::BadRequest(
+            "too many active SSE connections".into(),
+        ));
+    }
+    state
+        .sse_connections
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     // Verify the stream exists and check its status
     let row = sqlx::query_as::<_, (String,)>("SELECT status FROM streams WHERE id = $1")
         .bind(&stream_id)
@@ -2626,7 +2699,17 @@ async fn handler_stream_sse(
     });
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+
+    // Decrement SSE counter when stream ends
+    let state_cleanup = Arc::clone(&state);
+    let cleanup_stream = stream.chain(futures::stream::once(async move {
+        state_cleanup
+            .sse_connections
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Event::default().comment(""))
+    }));
+
+    Ok(Sse::new(cleanup_stream).keep_alive(KeepAlive::default()))
 }
 
 // ---------------------------------------------------------------------------
@@ -3714,6 +3797,9 @@ async fn handler_telegram_register(
         .get("webhook_url")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
+    if let Some(url) = webhook_url {
+        validate_webhook_url(url)?;
+    }
     let secret_token = body
         .get("secret_token")
         .and_then(|v| v.as_str())

@@ -22,7 +22,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::process;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -307,6 +307,7 @@ pub struct AppState {
     pub start_time: Instant,
     pub jwt_decoding_keys: Vec<(String, jsonwebtoken::DecodingKey)>, // (kid, key) pairs
     pub jwt_validation: jsonwebtoken::Validation,
+    pub sse_connections: RwLock<HashMap<String, usize>>, // agent_id → active SSE count
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +373,9 @@ async fn main() {
                 process::exit(1);
             });
     } else {
+        if shared.config.broodlink.env != "dev" && shared.config.broodlink.env != "local" {
+            warn!("TLS is disabled in non-dev environment — traffic is unencrypted");
+        }
         info!(addr = %addr, "listening (plaintext)");
 
         let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -584,6 +588,7 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
         start_time: Instant::now(),
         jwt_decoding_keys,
         jwt_validation,
+        sse_connections: RwLock::new(HashMap::new()),
     })
 }
 
@@ -1572,6 +1577,66 @@ const VALID_ENTITY_TYPES: &[&str] = &[
     "event",
     "other",
 ];
+
+/// Reject URLs pointing to internal/private networks (SSRF protection).
+fn validate_outbound_url(url: &str) -> Result<(), BroodlinkError> {
+    let parsed = url::Url::parse(url).map_err(|_| BroodlinkError::Validation {
+        field: "url".to_string(),
+        message: "invalid URL".to_string(),
+    })?;
+
+    match parsed.scheme() {
+        "http" | "https" => {}
+        s => {
+            return Err(BroodlinkError::Validation {
+                field: "url".to_string(),
+                message: format!("unsupported scheme '{s}'; must be http or https"),
+            });
+        }
+    }
+
+    let host = parsed.host_str().ok_or_else(|| BroodlinkError::Validation {
+        field: "url".to_string(),
+        message: "URL must contain a host".to_string(),
+    })?;
+
+    // Block known internal hostnames
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost"
+        || lower == "metadata.google.internal"
+        || lower.ends_with(".internal")
+        || lower.ends_with(".local")
+    {
+        return Err(BroodlinkError::Validation {
+            field: "url".to_string(),
+            message: "URL must not target internal hosts".to_string(),
+        });
+    }
+
+    // Block private/loopback/link-local IPs
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        let blocked = match ip {
+            IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_broadcast()
+                    || v4.is_unspecified()
+                    || v4.octets()[0] == 169 && v4.octets()[1] == 254 // link-local
+                    || v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64 // CGNAT 100.64/10
+            }
+            IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+        };
+        if blocked {
+            return Err(BroodlinkError::Validation {
+                field: "url".to_string(),
+                message: "URL must not target private/loopback addresses".to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
 
 /// Validate optional entity_type parameter.
 fn validate_entity_type(entity_type: Option<&str>) -> Result<Option<&str>, BroodlinkError> {
@@ -5343,7 +5408,7 @@ async fn tool_list_chat_sessions(
         .get("status")
         .and_then(|v| v.as_str())
         .unwrap_or("active");
-    let limit: i64 = params.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
+    let limit = clamp_limit(params.get("limit").and_then(|v| v.as_i64()).unwrap_or(20));
 
     let rows: Vec<(
         String,
@@ -7420,6 +7485,7 @@ async fn tool_a2a_discover(
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
     let base_url = param_str(params, "url")?;
+    validate_outbound_url(base_url)?;
     let url = format!("{}/.well-known/agent.json", base_url.trim_end_matches('/'));
 
     let client = reqwest::Client::new();
@@ -7450,6 +7516,7 @@ async fn tool_a2a_delegate(
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
     let base_url = param_str(params, "url")?;
+    validate_outbound_url(base_url)?;
     let message_text = param_str(params, "message")?;
     let api_key = params.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -7564,11 +7631,26 @@ async fn tool_start_workflow(
 // SSE stream handler
 // ---------------------------------------------------------------------------
 
+const MAX_SSE_PER_AGENT: usize = 10;
+
 async fn sse_stream_handler(
     State(state): State<Arc<AppState>>,
     Path(stream_id): Path<String>,
-    axum::Extension(_claims): axum::Extension<Claims>,
+    axum::Extension(claims): axum::Extension<Claims>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, BroodlinkError> {
+    // Enforce per-agent SSE connection limit
+    {
+        let conns = state.sse_connections.read().await;
+        let count = conns.get(&claims.agent_id).copied().unwrap_or(0);
+        if count >= MAX_SSE_PER_AGENT {
+            return Err(BroodlinkError::RateLimited(claims.agent_id.clone()));
+        }
+    }
+    {
+        let mut conns = state.sse_connections.write().await;
+        *conns.entry(claims.agent_id.clone()).or_insert(0) += 1;
+    }
+
     // Verify the stream exists
     let row: Option<(String,)> = sqlx::query_as("SELECT status FROM streams WHERE id = $1")
         .bind(&stream_id)
@@ -7619,7 +7701,25 @@ async fn sse_stream_handler(
 
     let stream = ReceiverStream::new(rx);
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    // Decrement SSE counter when stream/client disconnects
+    let agent_id_cleanup = claims.agent_id.clone();
+    let state_cleanup = Arc::clone(&state);
+    let cleanup_stream = stream.chain(futures::stream::once(async move {
+        // This runs when the upstream stream ends; decrement counter
+        {
+            let mut conns = state_cleanup.sse_connections.write().await;
+            if let Some(count) = conns.get_mut(&agent_id_cleanup) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    conns.remove(&agent_id_cleanup);
+                }
+            }
+        }
+        // Yield a no-op event that won't actually be sent (stream is ending)
+        Ok(Event::default().comment(""))
+    }));
+
+    Ok(Sse::new(cleanup_stream).keep_alive(KeepAlive::default()))
 }
 
 // ===========================================================================

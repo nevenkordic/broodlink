@@ -17,7 +17,7 @@ cargo build --release --workspace
 echo "→ Copying binaries..."
 mkdir -p bin
 for svc in beads-bridge coordinator heartbeat \
-           embedding-worker status-api; do
+           embedding-worker status-api mcp-server a2a-gateway; do
   cp "target/release/$svc" "bin/$svc"
   echo "  ✓ bin/$svc"
 done

@@ -18,7 +18,7 @@ use std::process;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -92,6 +92,7 @@ pub async fn run_http_transport(config: Arc<broodlink_config::Config>, client: B
     let app = Router::new()
         .route("/mcp", post(mcp_post_handler).get(mcp_get_handler))
         .route("/health", get(health_handler))
+        .layer(DefaultBodyLimit::max(1_048_576)) // 1 MiB
         .layer(cors)
         .with_state(state);
 
@@ -349,12 +350,18 @@ async fn mcp_get_handler(State(state): State<Arc<HttpState>>, headers: HeaderMap
 // GET /health
 // ---------------------------------------------------------------------------
 
-async fn health_handler() -> impl IntoResponse {
+async fn health_handler(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    let bridge_ok = state.client.check_health().await;
+    let status = if bridge_ok { "ok" } else { "degraded" };
+
     axum::Json(serde_json::json!({
-        "status": "ok",
+        "status": status,
         "service": "mcp-server",
         "transport": "streamable-http",
         "version": env!("CARGO_PKG_VERSION"),
+        "checks": {
+            "bridge": bridge_ok,
+        },
     }))
 }
 
