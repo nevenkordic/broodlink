@@ -318,6 +318,10 @@ fn require_role(ctx: &AuthContext, minimum: UserRole) -> Result<(), StatusApiErr
     }
 }
 
+fn clamp_limit(limit: i64) -> i64 {
+    limit.clamp(1, 1000)
+}
+
 // ---------------------------------------------------------------------------
 // Startup
 // ---------------------------------------------------------------------------
@@ -1372,10 +1376,12 @@ async fn handler_kg_entities(
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
     let type_filter = params.get("type").cloned();
-    let limit: i64 = params
-        .get("limit")
-        .and_then(|l| l.parse().ok())
-        .unwrap_or(50);
+    let limit: i64 = clamp_limit(
+        params
+            .get("limit")
+            .and_then(|l| l.parse().ok())
+            .unwrap_or(50),
+    );
 
     let rows: Vec<(String, String, String, Option<String>, i32, String, String)> =
         if let Some(etype) = &type_filter {
@@ -1431,10 +1437,12 @@ async fn handler_kg_edges(
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
     let relation_filter = params.get("relation_type").cloned();
-    let limit: i64 = params
-        .get("limit")
-        .and_then(|l| l.parse().ok())
-        .unwrap_or(50);
+    let limit: i64 = clamp_limit(
+        params
+            .get("limit")
+            .and_then(|l| l.parse().ok())
+            .unwrap_or(50),
+    );
 
     let rows: Vec<(String, String, String, String, Option<String>, f64, String)> = if let Some(
         rel,
@@ -1497,10 +1505,12 @@ async fn handler_dlq(
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
     let include_resolved = params.get("resolved").is_some_and(|v| v == "true");
-    let limit: i64 = params
-        .get("limit")
-        .and_then(|l| l.parse().ok())
-        .unwrap_or(50);
+    let limit: i64 = clamp_limit(
+        params
+            .get("limit")
+            .and_then(|l| l.parse().ok())
+            .unwrap_or(50),
+    );
 
     let rows: Vec<(
         i64,
@@ -1677,10 +1687,12 @@ async fn handler_workflows(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let limit: i64 = params
-        .get("limit")
-        .and_then(|l| l.parse().ok())
-        .unwrap_or(20);
+    let limit: i64 = clamp_limit(
+        params
+            .get("limit")
+            .and_then(|l| l.parse().ok())
+            .unwrap_or(20),
+    );
 
     let rows: Vec<(String, String, String, i32, i32, String, String)> = sqlx::query_as(
         "SELECT id, formula_name, status, current_step, total_steps, started_by, created_at::text
@@ -1767,8 +1779,19 @@ async fn handler_webhooks(
 
 async fn handler_webhook_create(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<serde_json::Value>,
+    req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Admin)?;
+
+    let body: serde_json::Value = {
+        let bytes = axum::body::to_bytes(req.into_body(), 10_485_760)
+            .await
+            .map_err(|e| StatusApiError::BadRequest(format!("invalid body: {e}")))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| StatusApiError::BadRequest(format!("invalid JSON: {e}")))?
+    };
     let platform = body
         .get("platform")
         .and_then(|v| v.as_str())
@@ -1811,7 +1834,12 @@ async fn handler_webhook_create(
 async fn handler_webhook_toggle(
     State(state): State<Arc<AppState>>,
     Path(endpoint_id): Path<String>,
+    req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Admin)?;
+
     let result = sqlx::query(
         "UPDATE webhook_endpoints SET active = NOT active, updated_at = NOW() WHERE id = $1",
     )
@@ -1843,7 +1871,12 @@ async fn handler_webhook_toggle(
 async fn handler_webhook_delete(
     State(state): State<Arc<AppState>>,
     Path(endpoint_id): Path<String>,
+    req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Admin)?;
+
     // Delete log entries first (FK constraint)
     sqlx::query("DELETE FROM webhook_log WHERE endpoint_id = $1")
         .bind(&endpoint_id)
@@ -1869,10 +1902,12 @@ async fn handler_webhook_log(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let limit: i64 = params
-        .get("limit")
-        .and_then(|l| l.parse().ok())
-        .unwrap_or(50);
+    let limit: i64 = clamp_limit(
+        params
+            .get("limit")
+            .and_then(|l| l.parse().ok())
+            .unwrap_or(50),
+    );
 
     let rows: Vec<(i64, String, String, String, serde_json::Value, String, Option<String>, String)> = sqlx::query_as(
         "SELECT wl.id, wl.endpoint_id, wl.direction, wl.event_type, wl.payload, wl.status, wl.error_msg, wl.created_at::text
@@ -2799,10 +2834,12 @@ async fn handler_chat_sessions(
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
     let platform = params.get("platform");
     let status = params.get("status").map(String::as_str).unwrap_or("active");
-    let limit: i64 = params
-        .get("limit")
-        .and_then(|l| l.parse().ok())
-        .unwrap_or(50);
+    let limit: i64 = clamp_limit(
+        params
+            .get("limit")
+            .and_then(|l| l.parse().ok())
+            .unwrap_or(50),
+    );
 
     let rows: Vec<(
         String,
@@ -2891,10 +2928,12 @@ async fn handler_chat_messages(
     Path(session_id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let limit: i64 = params
-        .get("limit")
-        .and_then(|l| l.parse().ok())
-        .unwrap_or(50);
+    let limit: i64 = clamp_limit(
+        params
+            .get("limit")
+            .and_then(|l| l.parse().ok())
+            .unwrap_or(50),
+    );
 
     let rows: Vec<(i64, String, String, Option<String>, String)> = sqlx::query_as(
         "SELECT id, direction, content, task_id, created_at::text
@@ -3780,7 +3819,12 @@ async fn handler_reset_password(
 
 async fn handler_telegram_status(
     State(state): State<Arc<AppState>>,
+    req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Operator)?;
+
     let row = sqlx::query_as::<
         _,
         (
@@ -3832,8 +3876,19 @@ async fn handler_telegram_status(
 
 async fn handler_telegram_register(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<serde_json::Value>,
+    req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Admin)?;
+
+    let body: serde_json::Value = {
+        let bytes = axum::body::to_bytes(req.into_body(), 10_485_760)
+            .await
+            .map_err(|e| StatusApiError::BadRequest(format!("invalid body: {e}")))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| StatusApiError::BadRequest(format!("invalid JSON: {e}")))?
+    };
     let bot_token = body.get("bot_token").and_then(|v| v.as_str()).unwrap_or("");
     if bot_token.is_empty() {
         return Err(StatusApiError::BadRequest("bot_token is required".into()));
@@ -3974,7 +4029,12 @@ async fn handler_telegram_register(
 
 async fn handler_telegram_disconnect(
     State(state): State<Arc<AppState>>,
+    req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Admin)?;
+
     // Read token to call deleteWebhook
     let row = sqlx::query_as::<_, (String,)>(
         "SELECT bot_token FROM platform_credentials WHERE platform = 'telegram'",
