@@ -594,6 +594,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/telegram/status", get(handler_telegram_status))
         .route("/telegram/register", post(handler_telegram_register))
         .route("/telegram/disconnect", post(handler_telegram_disconnect))
+        // Service health aggregation
+        .route("/services", get(handler_services))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
@@ -1043,6 +1045,142 @@ async fn handler_beads(
         .collect();
 
     Ok(ok_response(serde_json::json!({ "issues": issues_json })))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/services
+// Probe all Broodlink service health endpoints in parallel
+// ---------------------------------------------------------------------------
+
+async fn handler_services(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let client = &state.http_client;
+    let timeout = Duration::from_secs(3);
+    let config = &state.config;
+
+    // Build probe list: (name, port, url)
+    let probes: Vec<(&str, u16, String)> = vec![
+        (
+            "beads-bridge",
+            config.beads_bridge.port,
+            format!("http://localhost:{}/health", config.beads_bridge.port),
+        ),
+        (
+            "mcp-server",
+            config.mcp_server.port,
+            format!("http://localhost:{}/health", config.mcp_server.port),
+        ),
+        (
+            "a2a-gateway",
+            config.a2a.port,
+            format!("http://localhost:{}/health", config.a2a.port),
+        ),
+    ];
+
+    // Self-report: if we're serving this request, status-api is up
+    let self_entry = serde_json::json!({
+        "name": "status-api",
+        "port": config.status_api.port,
+        "status": "ok",
+        "latency_ms": 0,
+        "details": {},
+        "checked_at": Utc::now().to_rfc3339(),
+    });
+
+    let mut handles = Vec::new();
+    for (name, port, url) in probes {
+        let client = client.clone();
+        let handle = tokio::spawn(async move {
+            let start = Instant::now();
+            let result = tokio::time::timeout(timeout, client.get(&url).send()).await;
+            let latency_ms = start.elapsed().as_millis() as u64;
+            let checked_at = Utc::now().to_rfc3339();
+
+            match result {
+                Ok(Ok(resp)) if resp.status().is_success() => {
+                    let body: serde_json::Value =
+                        resp.json().await.unwrap_or(serde_json::json!({}));
+                    // Extract model degradation info from a2a-gateway
+                    let status_str = body
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .or_else(|| {
+                            body.get("data")
+                                .and_then(|d| d.get("status"))
+                                .and_then(|s| s.as_str())
+                        })
+                        .unwrap_or("ok");
+                    let mut details = serde_json::json!({});
+                    if name == "a2a-gateway" {
+                        if let Some(degraded) = body.get("model_degraded") {
+                            details["model_degraded"] = degraded.clone();
+                        }
+                        if let Some(cm) = body.get("chat_model") {
+                            details["chat_model"] = cm.clone();
+                        }
+                        if let Some(am) = body.get("active_model") {
+                            details["active_model"] = am.clone();
+                        }
+                        if let Some(ds) = body.get("degraded_seconds") {
+                            details["degraded_seconds"] = ds.clone();
+                        }
+                    }
+                    serde_json::json!({
+                        "name": name,
+                        "port": port,
+                        "status": status_str,
+                        "latency_ms": latency_ms,
+                        "details": details,
+                        "checked_at": checked_at,
+                    })
+                }
+                Ok(Ok(resp)) => {
+                    serde_json::json!({
+                        "name": name,
+                        "port": port,
+                        "status": "degraded",
+                        "latency_ms": latency_ms,
+                        "details": { "http_status": resp.status().as_u16() },
+                        "checked_at": checked_at,
+                    })
+                }
+                Ok(Err(e)) => {
+                    serde_json::json!({
+                        "name": name,
+                        "port": port,
+                        "status": "offline",
+                        "latency_ms": null,
+                        "details": { "error": e.to_string() },
+                        "checked_at": checked_at,
+                    })
+                }
+                Err(_) => {
+                    serde_json::json!({
+                        "name": name,
+                        "port": port,
+                        "status": "offline",
+                        "latency_ms": null,
+                        "details": { "error": "timeout" },
+                        "checked_at": checked_at,
+                    })
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
+    let mut services = vec![self_entry];
+    for handle in handles {
+        match handle.await {
+            Ok(svc) => services.push(svc),
+            Err(e) => {
+                warn!(error = %e, "service probe task panicked");
+            }
+        }
+    }
+
+    Ok(ok_response(serde_json::json!({ "services": services })))
 }
 
 // ---------------------------------------------------------------------------

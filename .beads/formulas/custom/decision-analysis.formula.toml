@@ -1,0 +1,35 @@
+# Broodlink — Multi-agent AI orchestration
+# Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[formula]
+name = "decision-analysis"
+version = "1.0.0"
+description = "Structured decision analysis: define alternatives, evaluate trade-offs, select and log outcome"
+
+[[steps]]
+name = "frame_decision"
+agent_role = "analyst"
+tools = ["recall_memory", "semantic_search"]
+prompt = "Frame the decision: {{decision}}. Search memory for prior art, past decisions on similar topics, and relevant constraints."
+output = "framing"
+
+[[steps]]
+name = "evaluate_alternatives"
+agent_role = "architect"
+tools = ["semantic_search"]
+prompt = "Define {{max_alternatives}} concrete alternatives. For each: describe the approach, list pros/cons, estimate effort, and identify risks."
+input = "framing"
+output = "evaluation"
+
+[[steps]]
+name = "select_and_log"
+agent_role = "architect"
+tools = ["log_decision", "store_memory"]
+prompt = "Select the best alternative based on the evaluation. Log the decision with full reasoning, alternatives considered, and expected outcome. Store as memory."
+input = "evaluation"
+output = "decision_record"
+
+[formula.parameters]
+decision = { type = "string", required = true, description = "The decision to analyze" }
+max_alternatives = { type = "integer", required = false, description = "Number of alternatives to evaluate", default = 3 }

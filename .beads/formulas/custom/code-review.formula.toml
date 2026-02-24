@@ -1,0 +1,35 @@
+# Broodlink — Multi-agent AI orchestration
+# Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[formula]
+name = "code-review"
+version = "1.0.0"
+description = "Review code changes for correctness, security, performance, and style"
+
+[[steps]]
+name = "gather_context"
+agent_role = "researcher"
+tools = ["recall_memory", "semantic_search"]
+prompt = "Gather context about the codebase area being changed: {{target}}. Recall relevant patterns, conventions, and past decisions."
+output = "context"
+
+[[steps]]
+name = "analyze_changes"
+agent_role = "analyst"
+tools = ["semantic_search", "recall_memory"]
+prompt = "Analyze the code changes against the codebase context. Check for: correctness, edge cases, error handling, OWASP top 10, performance regressions, and style consistency."
+input = "context"
+output = "findings"
+
+[[steps]]
+name = "produce_review"
+agent_role = "writer"
+tools = ["store_memory", "log_decision"]
+prompt = "Produce a structured code review report with severity-ranked findings. Store notable patterns or anti-patterns as memories for future reviews."
+input = "findings"
+output = "review"
+
+[formula.parameters]
+target = { type = "string", required = true, description = "File path, PR number, or description of code to review" }
+focus = { type = "string", required = false, description = "Focus area: security, performance, correctness, style", default = "all" }

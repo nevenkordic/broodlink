@@ -1,0 +1,35 @@
+# Broodlink — Multi-agent AI orchestration
+# Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[formula]
+name = "knowledge-extract"
+version = "1.0.0"
+description = "Extract entities and relationships from text and ingest into the knowledge graph"
+
+[[steps]]
+name = "parse_text"
+agent_role = "researcher"
+tools = ["recall_memory"]
+prompt = "Parse the input text: {{source_text}}. Identify candidate entities (people, systems, concepts, technologies) and candidate relationships between them."
+output = "candidates"
+
+[[steps]]
+name = "resolve_entities"
+agent_role = "analyst"
+tools = ["semantic_search", "recall_memory"]
+prompt = "Resolve candidate entities against existing KG entities. Deduplicate, merge aliases, and flag new entities not yet in the graph. Use semantic search to find near-matches."
+input = "candidates"
+output = "resolved"
+
+[[steps]]
+name = "ingest_to_kg"
+agent_role = "developer"
+tools = ["store_memory", "log_work"]
+prompt = "Ingest resolved entities and relationships into the knowledge graph. Create new entities, add edges with relationship types, and link entity memories. Log the extraction work."
+input = "resolved"
+output = "ingested"
+
+[formula.parameters]
+source_text = { type = "string", required = true, description = "Text to extract knowledge from" }
+domain = { type = "string", required = false, description = "Domain hint for entity resolution (e.g., 'software', 'infrastructure')", default = "general" }

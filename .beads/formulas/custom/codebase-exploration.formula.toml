@@ -1,0 +1,34 @@
+# Broodlink — Multi-agent AI orchestration
+# Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[formula]
+name = "codebase-exploration"
+version = "1.0.0"
+description = "Deep-dive into a codebase area to understand architecture, patterns, and dependencies"
+
+[[steps]]
+name = "map_structure"
+agent_role = "researcher"
+tools = ["recall_memory", "semantic_search"]
+prompt = "Map the structure of: {{target_area}}. Identify key files, modules, public APIs, and entry points."
+output = "structure"
+
+[[steps]]
+name = "trace_dependencies"
+agent_role = "researcher"
+tools = ["semantic_search", "recall_memory"]
+prompt = "Trace internal and external dependencies for the target area. Identify coupling points, shared state, and integration boundaries."
+input = "structure"
+output = "dependencies"
+
+[[steps]]
+name = "document_patterns"
+agent_role = "writer"
+tools = ["store_memory", "log_work"]
+prompt = "Document the architectural patterns, conventions, and design decisions found. Store key findings as memories for future reference."
+input = ["structure", "dependencies"]
+output = "documentation"
+
+[formula.parameters]
+target_area = { type = "string", required = true, description = "Codebase area to explore (e.g., 'beads-bridge handler layer', 'KG pipeline')" }

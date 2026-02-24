@@ -1,0 +1,35 @@
+# Broodlink — Multi-agent AI orchestration
+# Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[formula]
+name = "task-breakdown"
+version = "1.0.0"
+description = "Decompose a complex goal into actionable sub-tasks with dependencies and priorities"
+
+[[steps]]
+name = "understand_goal"
+agent_role = "analyst"
+tools = ["recall_memory", "semantic_search"]
+prompt = "Analyze the goal: {{goal}}. Search memory for related past work, existing capabilities, and relevant context."
+output = "context"
+
+[[steps]]
+name = "decompose"
+agent_role = "architect"
+tools = ["log_decision"]
+prompt = "Break the goal into concrete sub-tasks. For each task: define scope, estimate complexity (S/M/L), identify the required agent_role, and map dependencies between tasks. Log the decomposition decision."
+input = "context"
+output = "task_tree"
+
+[[steps]]
+name = "create_tasks"
+agent_role = "architect"
+tools = ["create_task", "store_memory"]
+prompt = "Create the sub-tasks in the task queue with proper priority ordering. Store the task breakdown as a memory for tracking."
+input = "task_tree"
+output = "created_tasks"
+
+[formula.parameters]
+goal = { type = "string", required = true, description = "The complex goal to decompose" }
+max_tasks = { type = "integer", required = false, description = "Maximum number of sub-tasks to create", default = 10 }

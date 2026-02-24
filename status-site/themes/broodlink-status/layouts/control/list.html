@@ -36,6 +36,7 @@
   <button role="tab" aria-selected="false" aria-controls="panel-chat" id="tab-chat" class="tab" data-tab="chat">Chat</button>
   <button role="tab" aria-selected="false" aria-controls="panel-formulas" id="tab-formulas" class="tab" data-tab="formulas">Formulas</button>
   <button role="tab" aria-selected="false" aria-controls="panel-users" id="tab-users" class="tab" data-tab="users">Users</button>
+  <button role="tab" aria-selected="false" aria-controls="panel-services" id="tab-services" class="tab" data-tab="services">Services</button>
   <button role="tab" aria-selected="false" aria-controls="panel-telegram" id="tab-telegram" class="tab" data-tab="telegram">Telegram</button>
 </nav>
 
@@ -268,6 +269,26 @@
       </tr>
     </thead>
     <tbody id="ctrl-users-tbody" aria-live="polite"></tbody>
+  </table>
+</section>
+
+<!-- Services Tab -->
+<section role="tabpanel" id="panel-services" aria-labelledby="tab-services" hidden>
+  <div class="ctrl-section-header">
+    <h3>Service Health</h3>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">Service</th>
+        <th scope="col">Port</th>
+        <th scope="col">Status</th>
+        <th scope="col">Model</th>
+        <th scope="col">Latency</th>
+        <th scope="col">Checked</th>
+      </tr>
+    </thead>
+    <tbody id="ctrl-services-tbody" aria-live="polite"></tbody>
   </table>
 </section>
 

@@ -1,0 +1,45 @@
+# Broodlink — Multi-agent AI orchestration
+# Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[formula]
+name = "onboard-agent"
+version = "1.0.0"
+description = "Onboard a new agent: register profile, declare skills, seed initial memory, verify connectivity"
+
+[[steps]]
+name = "register_agent"
+agent_role = "architect"
+tools = ["agent_upsert", "log_work"]
+prompt = "Register the new agent: {{agent_id}} ({{display_name}}). Set role to {{role}}, cost_tier to {{cost_tier}}, and transport to mcp. Log the registration."
+output = "registration"
+
+[[steps]]
+name = "declare_skills"
+agent_role = "architect"
+tools = ["add_skill", "list_skills"]
+prompt = "Declare skills for the new agent based on its role. Reference existing skill definitions for consistency. At minimum register core skills: memory-recall, memory-store, task-execution, self-reporting."
+input = "registration"
+output = "skills"
+
+[[steps]]
+name = "seed_memory"
+agent_role = "writer"
+tools = ["store_memory", "log_work"]
+prompt = "Seed initial memory entries for the new agent: system overview, available tools, communication protocols, and any role-specific context."
+input = "skills"
+output = "memory"
+
+[[steps]]
+name = "verify_connectivity"
+agent_role = "analyst"
+tools = ["ping", "health_check", "send_message"]
+prompt = "Verify the agent can connect to Broodlink services. Send a test message and confirm receipt. Report connectivity status."
+input = "memory"
+output = "verification"
+
+[formula.parameters]
+agent_id = { type = "string", required = true, description = "Unique agent identifier" }
+display_name = { type = "string", required = true, description = "Human-readable agent name" }
+role = { type = "string", required = true, description = "Agent role: researcher, strategist, worker, developer" }
+cost_tier = { type = "string", required = false, description = "Cost tier: low, medium, high", default = "medium" }

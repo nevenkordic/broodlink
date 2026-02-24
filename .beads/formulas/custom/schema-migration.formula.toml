@@ -1,0 +1,35 @@
+# Broodlink — Multi-agent AI orchestration
+# Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[formula]
+name = "schema-migration"
+version = "1.0.0"
+description = "Plan and create database schema migrations for Dolt and Postgres"
+
+[[steps]]
+name = "audit_current_schema"
+agent_role = "analyst"
+tools = ["recall_memory", "semantic_search"]
+prompt = "Audit the current schema state for the change: {{change_description}}. Recall existing table structures, type mapping gotchas (TIMESTAMP casts, JSONB bindings), and migration numbering conventions."
+output = "schema_audit"
+
+[[steps]]
+name = "design_migration"
+agent_role = "architect"
+tools = ["log_decision"]
+prompt = "Design the migration SQL for both Dolt (MySQL) and Postgres. Consider: backwards compatibility, data backfill needs, index impacts, and rollback strategy. Log the design decision."
+input = "schema_audit"
+output = "migration_design"
+
+[[steps]]
+name = "generate_migration"
+agent_role = "developer"
+tools = ["store_memory", "log_work"]
+prompt = "Generate the migration SQL files following the project convention (numbered, with UP/DOWN). Store the migration details as memory for future reference."
+input = "migration_design"
+output = "migration_files"
+
+[formula.parameters]
+change_description = { type = "string", required = true, description = "What schema change is needed and why" }
+target_db = { type = "string", required = false, description = "Target database: dolt, postgres, or both", default = "both" }

@@ -1196,7 +1196,26 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
         .map(|r| r.status().is_success())
         .unwrap_or(false);
 
-    let status = if pg_ok && bridge_ok { "ok" } else { "degraded" };
+    let model_degraded = state.primary_model_degraded.load(std::sync::atomic::Ordering::Relaxed);
+    let degraded_secs = if model_degraded {
+        let guard = state.degraded_since.read().await;
+        guard.map(|t| t.elapsed().as_secs()).unwrap_or(0)
+    } else {
+        0
+    };
+
+    let status = if !pg_ok || !bridge_ok || model_degraded {
+        "degraded"
+    } else {
+        "ok"
+    };
+
+    let chat_cfg = &state.config.chat;
+    let active_model = if model_degraded && !chat_cfg.chat_fallback_model.is_empty() {
+        &chat_cfg.chat_fallback_model
+    } else {
+        &chat_cfg.chat_model
+    };
 
     axum::Json(serde_json::json!({
         "status": status,
@@ -1206,6 +1225,10 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
             "postgres": pg_ok,
             "bridge": bridge_ok,
         },
+        "model_degraded": model_degraded,
+        "chat_model": chat_cfg.chat_model,
+        "active_model": active_model,
+        "degraded_seconds": degraded_secs,
     }))
 }
 
@@ -3150,6 +3173,46 @@ async fn fallback_chat(
         .to_string()
 }
 
+/// Fetch relevant memories from the agent-ledger via semantic search.
+/// Best-effort: returns empty string on any failure.
+async fn fetch_memory_context(state: &AppState, query: &str, limit: u32) -> String {
+    let result = bridge_call(
+        state,
+        "semantic_search",
+        serde_json::json!({ "query": query, "limit": limit }),
+    )
+    .await;
+
+    match result {
+        Ok(data) => {
+            // semantic_search returns {"results": [{"topic": ..., "content": ..., "score": ...}, ...]}
+            let results = data
+                .get("results")
+                .and_then(|r| r.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            if results.is_empty() {
+                return String::new();
+            }
+
+            let mut context = String::new();
+            for entry in &results {
+                let topic = entry.get("topic").and_then(|t| t.as_str()).unwrap_or("");
+                let content = entry.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                if !topic.is_empty() && !content.is_empty() {
+                    context.push_str(&format!("- {topic}: {content}\n"));
+                }
+            }
+            context
+        }
+        Err(e) => {
+            warn!(error = %e, "memory context fetch failed, continuing without memory");
+            String::new()
+        }
+    }
+}
+
 async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> String {
     let ollama_url = &state.config.ollama.url;
     let timeout_secs = state.config.ollama.timeout_seconds;
@@ -3187,6 +3250,28 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
         );
     }
     system_prompt.push_str(" If you don't know something and can't look it up, say so honestly.");
+
+    // Enrich system prompt with relevant memories from the agent-ledger
+    if chat_cfg.memory_enabled {
+        // Extract the last user message as the search query
+        let last_user_msg = history
+            .iter()
+            .rev()
+            .find(|(role, _)| role == "user")
+            .map(|(_, content)| content.as_str());
+
+        if let Some(query) = last_user_msg {
+            let memories = fetch_memory_context(state, query, chat_cfg.memory_max_results).await;
+            if !memories.is_empty() {
+                system_prompt.push_str("\n\n## Relevant context from memory:\n");
+                system_prompt.push_str(&memories);
+                info!(
+                    memory_lines = memories.lines().count(),
+                    "injected memory context into system prompt"
+                );
+            }
+        }
+    }
 
     // Build message array: system prompt + conversation history
     // Limit context when tools are active to keep prompt size manageable for CPU inference

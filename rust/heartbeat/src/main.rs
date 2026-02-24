@@ -565,6 +565,20 @@ async fn run_cycle(state: &AppState) -> Result<(), BroodlinkError> {
     }
 
     // -----------------------------------------------------------------------
+    // 5m. Skill registry sync (config → Dolt)
+    // -----------------------------------------------------------------------
+    match sync_skill_registry(&state.dolt, &state.config).await {
+        Ok(synced) => {
+            if synced > 0 {
+                info!(skills_synced = synced, "skill registry synced");
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "skill registry sync failed");
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // 6. Publish broodlink.<env>.health (NATS)
     // -----------------------------------------------------------------------
     let dolt_ok = sqlx::query("SELECT 1").execute(&state.dolt).await.is_ok();
@@ -1844,6 +1858,47 @@ async fn sync_formula_registry(
     }
 
     Ok(stats)
+}
+
+// ---------------------------------------------------------------------------
+// Skill registry sync: config.toml → Dolt skills table
+// ---------------------------------------------------------------------------
+async fn sync_skill_registry(
+    dolt: &MySqlPool,
+    config: &Arc<Config>,
+) -> Result<u32, BroodlinkError> {
+    let mut synced: u32 = 0;
+
+    for agent_cfg in config.agents.values() {
+        for skill_name in &agent_cfg.skills {
+            let description = match config.skill_definitions.get(skill_name) {
+                Some(d) => d.as_str(),
+                None => {
+                    warn!(
+                        skill = %skill_name,
+                        agent = %agent_cfg.agent_id,
+                        "skill listed in agent config but missing from [skill_definitions], skipping"
+                    );
+                    continue;
+                }
+            };
+
+            sqlx::query(
+                "INSERT INTO skills (name, description, agent_name, created_at, updated_at)
+                 VALUES (?, ?, ?, NOW(), NOW())
+                 ON DUPLICATE KEY UPDATE description = VALUES(description), updated_at = NOW()",
+            )
+            .bind(skill_name)
+            .bind(description)
+            .bind(&agent_cfg.agent_id)
+            .execute(dolt)
+            .await?;
+
+            synced += 1;
+        }
+    }
+
+    Ok(synced)
 }
 
 /// Publish a JSON payload to NATS (best-effort, logs warning on failure).

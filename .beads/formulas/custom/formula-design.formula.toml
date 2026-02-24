@@ -1,0 +1,34 @@
+# Broodlink — Multi-agent AI orchestration
+# Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[formula]
+name = "formula-design"
+version = "1.0.0"
+description = "Meta-formula: design and create a new Beads workflow formula from a goal description"
+
+[[steps]]
+name = "analyze_goal"
+agent_role = "analyst"
+tools = ["recall_memory", "semantic_search", "list_skills"]
+prompt = "Analyze the workflow goal: {{goal}}. Identify required skills, available tools, and existing formulas that could be composed or extended."
+output = "analysis"
+
+[[steps]]
+name = "design_steps"
+agent_role = "architect"
+tools = ["log_decision"]
+prompt = "Design the formula steps. For each step: define name, agent_role, required tools, prompt template, and input/output bindings. Follow the existing formula conventions (TOML format, parameter definitions). Log the design decision."
+input = "analysis"
+output = "design"
+
+[[steps]]
+name = "create_formula"
+agent_role = "developer"
+tools = ["store_memory", "log_work"]
+prompt = "Generate the formula TOML file content. Validate that: all tool references exist, agent_roles match registered skills, input/output bindings form a valid DAG, and parameters have proper types and defaults. Log the work."
+input = "design"
+output = "formula_toml"
+
+[formula.parameters]
+goal = { type = "string", required = true, description = "Description of the workflow to automate" }

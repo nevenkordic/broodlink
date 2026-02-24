@@ -156,6 +156,8 @@ reply_retry_attempts = 3
 default_agent_role = "worker"
 greeting_enabled = true
 greeting_message = "Hello! I'm a Broodlink agent. How can I help?"
+memory_enabled     = true
+memory_max_results = 3
 
 [chat.tools]
 web_search_enabled = true
@@ -176,6 +178,11 @@ role               = "strategist"
 transport          = "mcp"
 cost_tier          = "high"
 preferred_formulas = ["research", "build-feature"]
+skills             = [
+    "memory-recall", "memory-store", "task-execution", "self-reporting",
+    "report-writing", "task-decomposition", "formula-authoring",
+    "code-review", "architectural-planning", "decision-making",
+]
 
 [agents.qwen3]
 agent_id           = "qwen3"
@@ -183,3 +190,63 @@ role               = "worker"
 transport          = "pymysql"
 cost_tier          = "low"
 preferred_formulas = ["daily-review", "knowledge-gap"]
+skills             = [
+    "memory-recall", "memory-store", "task-execution", "self-reporting",
+    "semantic-search", "knowledge-graph-query", "knowledge-extraction",
+    "web-research", "codebase-analysis", "document-summarization",
+]
+
+[agents.a2a-gateway]
+agent_id           = "a2a-gateway"
+role               = "worker"
+transport          = "mcp"
+cost_tier          = "low"
+preferred_formulas = []
+skills             = [
+    "memory-recall", "memory-store", "task-execution", "self-reporting",
+    "conversational-gateway", "model-failover", "webhook-dispatch",
+    "health-monitoring", "formula-execution",
+]
+
+[agents.claude-code]
+agent_id           = "claude-code"
+role               = "strategist"
+transport          = "mcp"
+cost_tier          = "high"
+preferred_formulas = ["build-feature"]
+skills             = [
+    "memory-recall", "memory-store", "task-execution", "self-reporting",
+    "code-generation", "debugging", "testing",
+    "migration-authoring", "ci-cd-management",
+]
+
+# ---------------------------------------------------------------------------
+# Skill definitions: name → description (shared across agents)
+# ---------------------------------------------------------------------------
+[skill_definitions]
+memory-recall            = "Search and retrieve from persistent memory (topic search, semantic search, full recall)"
+memory-store             = "Store structured observations, learnings, and context into persistent memory"
+task-execution           = "Claim, execute, and complete queued tasks from the task queue"
+self-reporting           = "Log work entries, decisions, and conversation context for auditability"
+report-writing           = "Produce structured reports — daily reviews, audits, status updates, postmortems"
+task-decomposition       = "Break complex goals into sub-tasks with dependencies and priority ordering"
+formula-authoring        = "Design and write multi-step Beads workflow formulas in TOML format"
+code-review              = "Review code for correctness, security vulnerabilities, performance, and style"
+architectural-planning   = "Design system architecture, evaluate trade-offs, propose migration strategies"
+decision-making          = "Weigh alternatives, log structured reasoning, and select optimal path forward"
+semantic-search          = "Vector similarity search across memories and knowledge graph entities"
+knowledge-graph-query    = "Traverse KG entities and edges, find relationships between concepts"
+knowledge-extraction     = "Extract entities and relationships from unstructured text into the knowledge graph"
+web-research             = "Search the web, fetch pages, and summarize findings into actionable intelligence"
+codebase-analysis        = "Explore repositories, understand architecture, find patterns and dependencies"
+document-summarization   = "Condense long documents, logs, or conversations into actionable summaries"
+conversational-gateway   = "Handle inbound Slack, Teams, and Telegram messages with session management and routing"
+model-failover           = "Detect model OOM/degradation and transparently switch to fallback models"
+webhook-dispatch         = "Send event notifications to external webhook endpoints with SSRF protection"
+health-monitoring        = "Check service health across all Broodlink components and report anomalies"
+formula-execution        = "Run multi-step Beads workflow formulas end-to-end with step orchestration"
+code-generation          = "Write new code from specs, natural language descriptions, or existing patterns"
+debugging                = "Diagnose failures from logs, stack traces, error messages, and runtime behavior"
+testing                  = "Write and run unit tests, integration tests, and regression test suites"
+migration-authoring      = "Create SQL migrations for Dolt and Postgres schema changes"
+ci-cd-management         = "Interact with CI pipelines, fix failing checks, manage GitHub Actions workflows"

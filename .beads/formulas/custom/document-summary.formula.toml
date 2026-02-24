@@ -1,0 +1,35 @@
+# Broodlink — Multi-agent AI orchestration
+# Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[formula]
+name = "document-summary"
+version = "1.0.0"
+description = "Summarize a document, log, or conversation into actionable key points"
+
+[[steps]]
+name = "ingest_content"
+agent_role = "researcher"
+tools = ["recall_memory", "semantic_search"]
+prompt = "Ingest the content: {{source}}. Identify the document type, structure, and scope. Pull any related context from memory."
+output = "ingested"
+
+[[steps]]
+name = "extract_key_points"
+agent_role = "analyst"
+tools = ["semantic_search"]
+prompt = "Extract key points, decisions, action items, and open questions from the content. Categorize by: facts, decisions, action items, and unknowns."
+input = "ingested"
+output = "key_points"
+
+[[steps]]
+name = "produce_summary"
+agent_role = "writer"
+tools = ["store_memory", "log_work"]
+prompt = "Produce a concise summary with: executive overview (2-3 sentences), categorized key points, and action items. Store the summary as a memory."
+input = "key_points"
+output = "summary"
+
+[formula.parameters]
+source = { type = "string", required = true, description = "Content to summarize (text, file path, or topic to recall)" }
+format = { type = "string", required = false, description = "Output format: brief, detailed, or bullet", default = "brief" }

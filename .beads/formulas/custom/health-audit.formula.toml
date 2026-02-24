@@ -1,0 +1,42 @@
+# Broodlink — Multi-agent AI orchestration
+# Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[formula]
+name = "health-audit"
+version = "1.0.0"
+description = "Full system health audit across all Broodlink services and infrastructure"
+
+[[steps]]
+name = "check_services"
+agent_role = "analyst"
+tools = ["ping", "health_check", "get_config_info"]
+prompt = "Check health of all Broodlink services: beads-bridge, status-api, coordinator, heartbeat, embedding-worker, mcp-server, a2a-gateway. Record response times and any errors."
+output = "service_health"
+
+[[steps]]
+name = "check_infrastructure"
+agent_role = "analyst"
+tools = ["recall_memory", "semantic_search"]
+prompt = "Check infrastructure health: Dolt (3307), Postgres (5432), Qdrant (6333), NATS (4222), Ollama (11434). Verify container status and connectivity."
+input = "service_health"
+output = "infra_health"
+
+[[steps]]
+name = "analyze_anomalies"
+agent_role = "analyst"
+tools = ["get_work_log", "get_decisions", "semantic_search"]
+prompt = "Correlate health data with recent work logs and decisions. Identify degraded services, resource pressure, or drift from expected configuration."
+input = ["service_health", "infra_health"]
+output = "anomalies"
+
+[[steps]]
+name = "produce_report"
+agent_role = "writer"
+tools = ["store_memory", "log_work"]
+prompt = "Produce a health audit report with: overall status, per-service status, anomalies found, and recommended actions. Store as memory."
+input = "anomalies"
+output = "report"
+
+[formula.parameters]
+verbose = { type = "boolean", required = false, description = "Include detailed metrics in report", default = false }

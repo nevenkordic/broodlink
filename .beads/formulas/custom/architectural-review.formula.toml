@@ -1,0 +1,35 @@
+# Broodlink — Multi-agent AI orchestration
+# Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[formula]
+name = "architectural-review"
+version = "1.0.0"
+description = "Review system architecture: assess design, identify debt, propose improvements"
+
+[[steps]]
+name = "assess_current_state"
+agent_role = "analyst"
+tools = ["recall_memory", "semantic_search", "get_config_info"]
+prompt = "Assess the current architecture of: {{component}}. Map services, data flows, integration points, and configuration."
+output = "current_state"
+
+[[steps]]
+name = "identify_issues"
+agent_role = "architect"
+tools = ["semantic_search", "get_decisions"]
+prompt = "Identify architectural issues: technical debt, scaling bottlenecks, single points of failure, coupling violations, and security surface area. Cross-reference with past decisions."
+input = "current_state"
+output = "issues"
+
+[[steps]]
+name = "propose_improvements"
+agent_role = "architect"
+tools = ["log_decision", "store_memory"]
+prompt = "Propose concrete improvements ranked by impact and effort. Include migration path for each proposal. Log as architectural decisions and store the review."
+input = "issues"
+output = "proposals"
+
+[formula.parameters]
+component = { type = "string", required = true, description = "Component or subsystem to review (e.g., 'knowledge graph pipeline', 'auth layer')" }
+scope = { type = "string", required = false, description = "Review scope: quick, standard, deep", default = "standard" }

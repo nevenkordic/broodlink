@@ -34,7 +34,7 @@
     var cls = 'ctrl-badge ';
     var s = String(status || '').toLowerCase();
     if (s === 'active' || s === 'ok' || s === 'completed' || s === 'delivered') cls += 'ctrl-badge-ok';
-    else if (s === 'pending' || s === 'submitted' || s === 'running') cls += 'ctrl-badge-pending';
+    else if (s === 'pending' || s === 'submitted' || s === 'running' || s === 'degraded') cls += 'ctrl-badge-pending';
     else if (s === 'failed' || s === 'error') cls += 'ctrl-badge-failed';
     else if (s === 'claimed' || s === 'in_progress') cls += 'ctrl-badge-claimed';
     else cls += 'ctrl-badge-offline';
@@ -838,6 +838,44 @@
   }
 
   // -----------------------------------------------------------------------
+  // Services
+  // -----------------------------------------------------------------------
+  function loadServices() {
+    BL.fetchApi('/api/v1/services').then(function (data) {
+      var services = (data && data.services) || [];
+      var tb = document.getElementById('ctrl-services-tbody');
+      if (!tb) return;
+      tb.innerHTML = services.map(function (svc) {
+        var details = svc.details || {};
+        var modelCell = '';
+        if (svc.name === 'a2a-gateway' && details.model_degraded) {
+          modelCell = '<span style="color:var(--amber)">' +
+            BL.escapeHtml(details.active_model || '?') + '</span>' +
+            ' <small style="color:var(--text-secondary)">(primary: ' +
+            BL.escapeHtml(details.chat_model || '?') + ')</small>';
+        } else if (svc.name === 'a2a-gateway' && details.active_model) {
+          modelCell = BL.escapeHtml(details.active_model);
+        } else {
+          modelCell = '<span style="color:var(--text-secondary)">—</span>';
+        }
+        var latency = svc.latency_ms != null ? svc.latency_ms + ' ms' : '—';
+        var checkedAt = svc.checked_at ? new Date(svc.checked_at).toLocaleTimeString() : '—';
+        return '<tr>' +
+          '<td>' + BL.escapeHtml(svc.name) + '</td>' +
+          '<td>' + svc.port + '</td>' +
+          '<td>' + badge(svc.status) + '</td>' +
+          '<td>' + modelCell + '</td>' +
+          '<td>' + latency + '</td>' +
+          '<td>' + checkedAt + '</td>' +
+          '</tr>';
+      }).join('');
+    }).catch(function (err) {
+      var tb = document.getElementById('ctrl-services-tbody');
+      if (tb) tb.innerHTML = '<tr><td colspan="6" style="color:var(--red)">Failed to load services: ' + BL.escapeHtml(err.message) + '</td></tr>';
+    });
+  }
+
+  // -----------------------------------------------------------------------
   function loadTab(name) {
     switch (name) {
       case 'agents': loadAgents(); break;
@@ -850,6 +888,7 @@
       case 'chat': loadChat(); break;
       case 'formulas': loadFormulas(); break;
       case 'users': loadUsers(); break;
+      case 'services': loadServices(); break;
       case 'telegram': loadTelegram(); break;
     }
   }

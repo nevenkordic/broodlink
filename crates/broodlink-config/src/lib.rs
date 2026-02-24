@@ -40,6 +40,8 @@ pub struct Config {
     pub rate_limits: RateLimitsConfig,
     #[serde(default)]
     pub agents: HashMap<String, AgentConfig>,
+    #[serde(default)]
+    pub skill_definitions: HashMap<String, String>,
     // --- v0.2.0 additions ---
     #[serde(default)]
     pub telemetry: TelemetryConfig,
@@ -245,6 +247,8 @@ pub struct AgentConfig {
     pub cost_tier: String,
     #[serde(default)]
     pub preferred_formulas: Vec<String>,
+    #[serde(default)]
+    pub skills: Vec<String>,
 }
 
 // --- v0.2.0 config structs ---
@@ -811,6 +815,10 @@ pub struct ChatConfig {
     pub greeting_enabled: bool,
     #[serde(default = "default_chat_greeting_message")]
     pub greeting_message: String,
+    #[serde(default = "default_chat_memory_enabled")]
+    pub memory_enabled: bool,
+    #[serde(default = "default_chat_memory_max_results")]
+    pub memory_max_results: u32,
     #[serde(default)]
     pub tools: ChatToolsConfig,
 }
@@ -857,6 +865,8 @@ impl Default for ChatConfig {
             default_agent_role: default_chat_default_agent_role(),
             greeting_enabled: default_chat_greeting_enabled(),
             greeting_message: default_chat_greeting_message(),
+            memory_enabled: default_chat_memory_enabled(),
+            memory_max_results: default_chat_memory_max_results(),
             tools: ChatToolsConfig::default(),
         }
     }
@@ -912,6 +922,14 @@ fn default_chat_greeting_enabled() -> bool {
 
 fn default_chat_greeting_message() -> String {
     "Hello! I'm a Broodlink agent. How can I help?".to_string()
+}
+
+fn default_chat_memory_enabled() -> bool {
+    true
+}
+
+fn default_chat_memory_max_results() -> u32 {
+    3
 }
 
 // ---------------------------------------------------------------------------

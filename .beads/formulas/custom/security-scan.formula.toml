@@ -1,0 +1,34 @@
+# Broodlink — Multi-agent AI orchestration
+# Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[formula]
+name = "security-scan"
+version = "1.0.0"
+description = "Security audit: scan for vulnerabilities, check RBAC, validate input handling"
+
+[[steps]]
+name = "scan_surface"
+agent_role = "analyst"
+tools = ["recall_memory", "semantic_search"]
+prompt = "Map the attack surface of: {{target}}. Identify HTTP endpoints, auth boundaries, input parsing, external integrations, and secret handling."
+output = "attack_surface"
+
+[[steps]]
+name = "check_vulnerabilities"
+agent_role = "analyst"
+tools = ["semantic_search", "recall_memory"]
+prompt = "Check for OWASP top 10 vulnerabilities: injection (SQL, command, XSS), broken auth, SSRF, missing rate limits, insecure deserialization, and misconfigurations. Cross-reference with the 8-pass audit findings in memory."
+input = "attack_surface"
+output = "vulnerabilities"
+
+[[steps]]
+name = "produce_findings"
+agent_role = "writer"
+tools = ["store_memory", "log_decision", "log_work"]
+prompt = "Produce a security findings report with severity ratings (Critical/High/Medium/Low/Info). For each finding: describe the vulnerability, exploitation scenario, and recommended remediation. Store as memory."
+input = "vulnerabilities"
+output = "security_report"
+
+[formula.parameters]
+target = { type = "string", required = true, description = "Target to scan (service name, endpoint, or code area)" }
