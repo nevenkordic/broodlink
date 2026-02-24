@@ -1576,7 +1576,12 @@ async fn handler_dlq(
 
 async fn handler_budgets(
     State(state): State<Arc<AppState>>,
+    req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Operator)?;
+
     let agents: Vec<(String, i64)> = sqlx::query_as(
         "SELECT agent_id, COALESCE(budget_tokens, 0) FROM agent_profiles ORDER BY agent_id",
     )
@@ -1642,8 +1647,19 @@ struct SetBudgetBody {
 async fn handler_budget_set(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(agent_id): axum::extract::Path<String>,
-    Json(body): Json<SetBudgetBody>,
+    req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Admin)?;
+
+    let body: SetBudgetBody = {
+        let bytes = axum::body::to_bytes(req.into_body(), 10_485_760)
+            .await
+            .map_err(|e| StatusApiError::BadRequest(format!("invalid body: {e}")))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| StatusApiError::BadRequest(format!("invalid JSON: {e}")))?
+    };
     sqlx::query("UPDATE agent_profiles SET budget_tokens = ? WHERE agent_id = ?")
         .bind(body.tokens)
         .bind(&agent_id)
@@ -2831,7 +2847,12 @@ async fn handler_a2a_card(
 async fn handler_chat_sessions(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
+    req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Operator)?;
+
     let platform = params.get("platform");
     let status = params.get("status").map(String::as_str).unwrap_or("active");
     let limit: i64 = clamp_limit(
@@ -2969,7 +2990,12 @@ async fn handler_chat_messages(
 
 async fn handler_chat_stats(
     State(state): State<Arc<AppState>>,
+    req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Operator)?;
+
     let total_sessions: (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM chat_sessions WHERE status = 'active'")
             .fetch_one(&state.pg)
@@ -3011,7 +3037,12 @@ async fn handler_chat_stats(
 async fn handler_chat_close(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
+    req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Operator)?;
+
     sqlx::query("UPDATE chat_sessions SET status = 'closed', updated_at = NOW() WHERE id = $1")
         .bind(&session_id)
         .execute(&state.pg)
@@ -3026,8 +3057,19 @@ async fn handler_chat_close(
 async fn handler_chat_assign(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
-    Json(body): Json<serde_json::Value>,
+    req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Operator)?;
+
+    let body: serde_json::Value = {
+        let bytes = axum::body::to_bytes(req.into_body(), 10_485_760)
+            .await
+            .map_err(|e| StatusApiError::BadRequest(format!("invalid body: {e}")))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| StatusApiError::BadRequest(format!("invalid JSON: {e}")))?
+    };
     let agent = body.get("agent").and_then(|a| a.as_str()).unwrap_or("");
 
     sqlx::query("UPDATE chat_sessions SET assigned_agent = $2, updated_at = NOW() WHERE id = $1")
@@ -3164,8 +3206,19 @@ async fn handler_get_formula(
 
 async fn handler_create_formula(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<serde_json::Value>,
+    req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Admin)?;
+
+    let body: serde_json::Value = {
+        let bytes = axum::body::to_bytes(req.into_body(), 10_485_760)
+            .await
+            .map_err(|e| StatusApiError::BadRequest(format!("invalid body: {e}")))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| StatusApiError::BadRequest(format!("invalid JSON: {e}")))?
+    };
     let name = body.get("name").and_then(|n| n.as_str()).unwrap_or("");
     let display_name = body
         .get("display_name")
@@ -3208,8 +3261,19 @@ async fn handler_create_formula(
 async fn handler_update_formula(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-    Json(body): Json<serde_json::Value>,
+    req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Admin)?;
+
+    let body: serde_json::Value = {
+        let bytes = axum::body::to_bytes(req.into_body(), 10_485_760)
+            .await
+            .map_err(|e| StatusApiError::BadRequest(format!("invalid body: {e}")))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| StatusApiError::BadRequest(format!("invalid JSON: {e}")))?
+    };
     let mut updates = Vec::new();
 
     if let Some(def) = body.get("definition") {
@@ -3265,7 +3329,12 @@ async fn handler_update_formula(
 async fn handler_toggle_formula(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    req: Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Admin)?;
+
     let row: Option<(bool,)> =
         sqlx::query_as("SELECT enabled FROM formula_registry WHERE name = $1")
             .bind(&name)

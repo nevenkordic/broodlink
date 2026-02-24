@@ -112,7 +112,7 @@ fi
 # Apply Dolt migrations (001 + 005b + 008b)
 DOLT_USER="${DOLT_PASSWORD:+broodlink_agent}"
 DOLT_USER="${DOLT_USER:-root}"
-DOLT_PW_ARG="${DOLT_PASSWORD:+-p${DOLT_PASSWORD}}"
+DOLT_PW_ARG="${DOLT_PASSWORD:+"-p${DOLT_PASSWORD}"}"
 
 for migration in 001_dolt_brain 005b_agent_max_concurrent 008b_agent_budget_tokens; do
   echo "  Applying ${migration}..."

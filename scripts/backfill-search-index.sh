@@ -35,7 +35,7 @@ echo "  Records before: ${count_before// /}"
 
 # Export from Dolt as tab-separated and UPSERT into Postgres
 mysql -h 127.0.0.1 -P 3307 -u "$DOLT_USER" \
-  ${DOLT_PASSWORD:+-p$DOLT_PASSWORD} \
+  ${DOLT_PASSWORD:+"-p${DOLT_PASSWORD}"} \
   agent_ledger -N -B \
   -e "SELECT id, agent_name, topic, content, COALESCE(tags, ''), CAST(created_at AS CHAR), CAST(updated_at AS CHAR) FROM agent_memory" 2>/dev/null |
 while IFS=$'\t' read -r id agent_id topic content tags created updated; do

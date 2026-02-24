@@ -20,7 +20,7 @@ PGDB="${BROODLINK_PG_DB:-broodlink_hot}"
 DOLT_HOST="${BROODLINK_DOLT_HOST:-127.0.0.1}"
 DOLT_PORT="${BROODLINK_DOLT_PORT:-3307}"
 DOLT_USER="${DOLT_USER:-root}"
-DOLT_PW_ARG="${DOLT_PASSWORD:+-p${DOLT_PASSWORD}}"
+DOLT_PW_ARG="${DOLT_PASSWORD:+"-p${DOLT_PASSWORD}"}"
 
 echo "=== Broodlink Knowledge Graph Backfill ==="
 echo ""
