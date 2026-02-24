@@ -95,8 +95,26 @@ run_sql() {
     # shellcheck disable=SC2086
     PGPASSWORD=$PGPASSWORD psql -h 127.0.0.1 -U postgres -d broodlink_hot $flags "$@" -c "$sql" 2>/dev/null
   else
+    # podman exec doesn't pass psql -v bindings correctly,
+    # so convert -v key=value args to \set statements piped via stdin.
+    local set_cmds=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -v)
+          local kv="$2"
+          local key="${kv%%=*}"
+          local val="${kv#*=}"
+          # Escape single quotes for psql \set
+          val="${val//\'/\'\'}"
+          set_cmds="${set_cmds}\\set ${key} '${val}'
+"
+          shift 2
+          ;;
+        *) shift ;;
+      esac
+    done
     # shellcheck disable=SC2086
-    podman exec -i broodlink-postgres psql -U postgres -d broodlink_hot $flags "$@" -c "$sql" 2>/dev/null
+    echo "${set_cmds}${sql}" | podman exec -i broodlink-postgres psql -U postgres -d broodlink_hot $flags 2>/dev/null
   fi
 }
 
@@ -129,8 +147,23 @@ print(bcrypt.using(rounds=int(sys.argv[2])).hash(sys.argv[1]))
 fi
 
 # Method 3: Postgres pgcrypto (no Python dependency needed)
+# Note: psql -v variable binding doesn't work through podman exec,
+# so we pipe SQL with \set to bind the password safely via stdin.
 if [[ -z "$HASH" ]]; then
-  HASH=$(run_sql "SELECT crypt(:'pw', gen_salt('bf', :cost));" "-tA" -v "pw=$PASSWORD" -v "cost=$BCRYPT_COST") || true
+  # Validate BCRYPT_COST is a safe integer (prevent injection)
+  if ! [[ "$BCRYPT_COST" =~ ^[0-9]+$ ]]; then
+    echo "Error: invalid bcrypt cost '$BCRYPT_COST'" >&2
+    exit 1
+  fi
+  # Escape single quotes for psql \set ('' is the escape sequence)
+  PW_SET_ESCAPED="${PASSWORD//\'/\'\'}"
+  PG_SQL="\\set pw '${PW_SET_ESCAPED}'
+SELECT crypt(:'pw', gen_salt('bf', ${BCRYPT_COST}));"
+  if command -v psql &>/dev/null; then
+    HASH=$(echo "$PG_SQL" | PGPASSWORD=$PGPASSWORD psql -h 127.0.0.1 -U postgres -d broodlink_hot -tA 2>/dev/null) || true
+  else
+    HASH=$(echo "$PG_SQL" | podman exec -i broodlink-postgres psql -U postgres -d broodlink_hot -tA 2>/dev/null) || true
+  fi
 fi
 
 if [[ -z "$HASH" ]]; then

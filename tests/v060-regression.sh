@@ -719,7 +719,7 @@ else
 fi
 
 # 9h. Create a webhook endpoint via status-api
-WH_CREATE=$(sa_post "webhooks" "{\"platform\":\"generic\",\"name\":\"e2e-test-$TS\",\"webhook_url\":\"http://localhost:9999/test\",\"events\":[\"task.failed\"]}")
+WH_CREATE=$(sa_post "webhooks" "{\"platform\":\"generic\",\"name\":\"e2e-test-$TS\",\"webhook_url\":\"https://hooks.example.com/e2e-test\",\"events\":[\"task.failed\"]}")
 if [ -n "$WH_CREATE" ]; then
   pass "status-api: POST /webhooks creates endpoint"
   WH_ID=$(echo "$WH_CREATE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('data',d).get('id',d.get('endpoint_id','')))" 2>/dev/null || echo "")

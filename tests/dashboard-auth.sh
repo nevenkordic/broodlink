@@ -75,7 +75,7 @@ run_pg "DELETE FROM dashboard_sessions WHERE user_id IN (SELECT id FROM dashboar
 run_pg "DELETE FROM dashboard_users WHERE username LIKE 'test_%';" "-q" || true
 
 bash "$BROOD_DIR/scripts/create-admin.sh" \
-  --username test_admin --password testpass123 --display-name "Test Admin" 2>/dev/null
+  --username test_admin --password testpass123456 --display-name "Test Admin" 2>/dev/null
 
 USER_EXISTS=$(run_pg "SELECT COUNT(*) FROM dashboard_users WHERE username = 'test_admin' AND role = 'admin';" "-tA")
 
@@ -96,7 +96,7 @@ run_pg "-- test marker" "-q" || true
 # We test that the endpoint exists and responds correctly.
 LOGIN_RESP=$(curl -sf -X POST \
   -H "Content-Type: application/json" \
-  -d '{"username":"test_admin","password":"testpass123"}' \
+  -d '{"username":"test_admin","password":"testpass123456"}' \
   "$API/auth/login" 2>/dev/null || echo '{"error":"endpoint error"}')
 
 # When auth disabled, we get a bad_request error (expected behavior)
@@ -209,15 +209,15 @@ else
   fail "login page HTML" "file not found"
 fi
 
-# Check login form elements
-if grep -q 'id="login-form"' "$BROOD_DIR/status-site/public/login/index.html" 2>/dev/null; then
+# Check login form elements (Hugo may minify quotes: id=login-form or id="login-form")
+if grep -qE 'id="?login-form"?' "$BROOD_DIR/status-site/public/login/index.html" 2>/dev/null; then
   ok "login page has login form"
 else
   fail "login page form" "missing login-form"
 fi
 
-# Check Users tab exists in control panel
-if grep -q 'data-tab="users"' "$BROOD_DIR/status-site/public/control/index.html" 2>/dev/null; then
+# Check Users tab exists in control panel (Hugo may minify quotes)
+if grep -qE 'data-tab="?users"?' "$BROOD_DIR/status-site/public/control/index.html" 2>/dev/null; then
   ok "control panel has Users tab"
 else
   fail "control panel Users tab" "missing data-tab=users"
