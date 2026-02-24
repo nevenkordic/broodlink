@@ -2924,24 +2924,22 @@ async fn tool_graph_traverse(
         _ => "CASE WHEN edge.source_id = t.entity_id THEN 'outgoing' ELSE 'incoming' END",
     };
 
-    // Build optional relation_type filter
-    let relation_filter = if let Some(rt_str) = relation_types_str {
-        let types: Vec<&str> = rt_str
+    // Build optional relation_type filter (parameterized to prevent injection)
+    let relation_types: Option<Vec<String>> = relation_types_str.map(|rt_str| {
+        rt_str
             .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .collect();
-        if types.is_empty() {
-            String::new()
-        } else {
-            let quoted: Vec<String> = types
-                .iter()
-                .map(|t| format!("'{}'", t.replace('\'', "''")))
-                .collect();
-            format!(" AND edge.relation_type IN ({})", quoted.join(", "))
-        }
+            .map(String::from)
+            .collect()
+    });
+    let has_relation_filter = relation_types
+        .as_ref()
+        .is_some_and(|v| !v.is_empty());
+    let relation_filter = if has_relation_filter {
+        " AND edge.relation_type = ANY($3)"
     } else {
-        String::new()
+        ""
     };
 
     let sql = format!(
@@ -2989,11 +2987,19 @@ async fn tool_graph_traverse(
         Option<String>,
         Option<String>,
         i32,
-    )> = sqlx::query_as(&sql)
-        .bind(start_entity)
-        .bind(max_hops)
-        .fetch_all(&state.pg)
-        .await?;
+    )> = {
+        let q = sqlx::query_as(&sql)
+            .bind(start_entity)
+            .bind(max_hops);
+        // Bind relation_types as $3 only when filter is active
+        if has_relation_filter {
+            q.bind(relation_types.unwrap_or_default())
+                .fetch_all(&state.pg)
+                .await?
+        } else {
+            q.fetch_all(&state.pg).await?
+        }
+    };
 
     let nodes: Vec<serde_json::Value> = rows
         .iter()
@@ -6029,7 +6035,12 @@ async fn check_guardrails(
                 if applies_to_agent && applies_to_tool {
                     let params_str = params.to_string();
                     for pat in &patterns {
-                        if let Ok(re) = regex::Regex::new(pat) {
+                        // Size-limit regex to prevent ReDoS from malicious patterns
+                        let re = regex::RegexBuilder::new(pat)
+                            .size_limit(1 << 20)  // 1 MiB compiled size limit
+                            .dfa_size_limit(1 << 20)
+                            .build();
+                        if let Ok(re) = re {
                             if re.is_match(&params_str) {
                                 log_guardrail_violation(
                                     state,

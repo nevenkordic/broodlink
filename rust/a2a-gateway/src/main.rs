@@ -549,6 +549,15 @@ async fn bridge_call(
     tool_name: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, GatewayError> {
+    // Reject tool names with path traversal characters
+    if !tool_name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(GatewayError::BadRequest(format!(
+            "invalid tool name: {tool_name}"
+        )));
+    }
     let url = format!("{}/api/v1/tool/{tool_name}", state.bridge_url);
     let body = serde_json::json!({ "params": params });
 

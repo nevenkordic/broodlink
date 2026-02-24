@@ -93,22 +93,19 @@ print(json.dumps(defn))
   display_name=$(echo "$name" | sed 's/-/ /g' | python3 -c "import sys; print(sys.stdin.read().strip().title())")
   id=$(python3 -c "import uuid; print(str(uuid.uuid4()))")
 
-  # Escape single quotes in definition for SQL
-  escaped_def="${definition//\'/\'\'}"
-  escaped_desc="${description//\'/\'\'}"
-  escaped_display="${display_name//\'/\'\'}"
-
-  # Insert with ON CONFLICT DO NOTHING (idempotent)
+  # Use parameterized queries to prevent SQL injection
   sql="INSERT INTO formula_registry (id, name, display_name, description, definition, is_system, author)
-VALUES ('$id', '$name', '$escaped_display', '$escaped_desc', '$escaped_def'::jsonb, true, 'system')
+VALUES (:'fid', :'fname', :'fdisplay', :'fdesc', :'fdef'::jsonb, true, 'system')
 ON CONFLICT (name) DO NOTHING;"
 
-  if podman exec -i broodlink-postgres psql -U "$PG_USER" -d "$PG_DB" -c "$sql" -q 2>/dev/null; then
+  psql_vars=(-v "fid=$id" -v "fname=$name" -v "fdisplay=$display_name" -v "fdesc=$description" -v "fdef=$definition")
+
+  if podman exec -i broodlink-postgres psql -U "$PG_USER" -d "$PG_DB" -c "$sql" -q "${psql_vars[@]}" 2>/dev/null; then
     echo "    Seeded: $name"
     COUNT=$((COUNT + 1))
   else
     # Try direct psql if podman fails
-    if psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -c "$sql" -q 2>/dev/null; then
+    if psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -c "$sql" -q "${psql_vars[@]}" 2>/dev/null; then
       echo "    Seeded: $name"
       COUNT=$((COUNT + 1))
     else

@@ -105,7 +105,9 @@ echo "JWT saved to: ${TOKEN_FILE}"
 # --- Register agent via beads-bridge ---
 
 echo "Registering agent with beads-bridge..."
-HTTP_CODE=$(curl -s -o /tmp/broodlink-onboard-response.json -w '%{http_code}' \
+RESP_FILE=$(mktemp /tmp/broodlink-onboard-XXXXXX.json)
+chmod 600 "$RESP_FILE"
+HTTP_CODE=$(curl -s -o "$RESP_FILE" -w '%{http_code}' \
   -X POST "${BRIDGE_URL}/api/v1/tool/agent_upsert" \
   -H "Authorization: Bearer ${JWT}" \
   -H "Content-Type: application/json" \
@@ -117,11 +119,12 @@ if [[ "$HTTP_CODE" == "200" ]]; then
 else
   echo "WARNING: Registration returned HTTP ${HTTP_CODE} (bridge may be offline)."
   echo "The JWT is still valid. Register manually later or restart with bridge running."
-  if [[ -f /tmp/broodlink-onboard-response.json ]]; then
-    cat /tmp/broodlink-onboard-response.json 2>/dev/null
+  if [[ -s "$RESP_FILE" ]]; then
+    cat "$RESP_FILE" 2>/dev/null
     echo ""
   fi
 fi
+rm -f "$RESP_FILE"
 
 # --- Output env vars ---
 

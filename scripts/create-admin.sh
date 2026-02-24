@@ -64,15 +64,16 @@ decrypt_or_default() {
 }
 
 # Helper: run SQL against Postgres (tries local psql, then podman)
+# Usage: run_sql "SQL" [flags] [-v var=val ...]
 run_sql() {
-  local sql="$1"
-  local flags="${2:--q}"
+  local sql="$1"; shift
+  local flags="${1:--q}"; shift || true
   if command -v psql &>/dev/null; then
     # shellcheck disable=SC2086
-    PGPASSWORD=$PGPASSWORD psql -h 127.0.0.1 -U postgres -d broodlink_hot $flags -c "$sql" 2>/dev/null
+    PGPASSWORD=$PGPASSWORD psql -h 127.0.0.1 -U postgres -d broodlink_hot $flags "$@" -c "$sql" 2>/dev/null
   else
     # shellcheck disable=SC2086
-    podman exec -i broodlink-postgres psql -U postgres -d broodlink_hot $flags -c "$sql" 2>/dev/null
+    podman exec -i broodlink-postgres psql -U postgres -d broodlink_hot $flags "$@" -c "$sql" 2>/dev/null
   fi
 }
 
@@ -106,8 +107,7 @@ fi
 
 # Method 3: Postgres pgcrypto (no Python dependency needed)
 if [[ -z "$HASH" ]]; then
-  SAFE_PW="${PASSWORD//\'/\'\'}"
-  HASH=$(run_sql "SELECT crypt('$SAFE_PW', gen_salt('bf', $BCRYPT_COST));" "-tA") || true
+  HASH=$(run_sql "SELECT crypt(:'pw', gen_salt('bf', :cost));" "-tA" -v "pw=$PASSWORD" -v "cost=$BCRYPT_COST") || true
 fi
 
 if [[ -z "$HASH" ]]; then
@@ -120,13 +120,10 @@ USER_ID=$(python3 -c "import uuid; print(str(uuid.uuid4()))")
 
 echo "Creating dashboard user: $USERNAME (role=$ROLE)"
 
-SAFE_USER="${USERNAME//\'/\'\'}"
-SAFE_HASH="${HASH//\'/\'\'}"
-SAFE_ROLE="${ROLE//\'/\'\'}"
-SAFE_DISPLAY="${DISPLAY_NAME//\'/\'\'}"
-DISPLAY_SQL=$([ -n "$DISPLAY_NAME" ] && echo "'$SAFE_DISPLAY'" || echo "NULL")
+DISPLAY_VAL="${DISPLAY_NAME:-}"
 run_sql "INSERT INTO dashboard_users (id, username, password_hash, role, display_name)
-    VALUES ('$USER_ID', '$SAFE_USER', '$SAFE_HASH', '$SAFE_ROLE', $DISPLAY_SQL)
-    ON CONFLICT (username) DO NOTHING;" "-q"
+    VALUES (:'uid', :'uname', :'phash', :'urole', NULLIF(:'dname', ''))
+    ON CONFLICT (username) DO NOTHING;" "-q" \
+    -v "uid=$USER_ID" -v "uname=$USERNAME" -v "phash=$HASH" -v "urole=$ROLE" -v "dname=$DISPLAY_VAL"
 
 echo "Done. User '$USERNAME' is ready (ON CONFLICT = no-op if exists)."

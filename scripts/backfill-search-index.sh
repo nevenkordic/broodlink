@@ -39,16 +39,17 @@ mysql -h 127.0.0.1 -P 3307 -u "$DOLT_USER" \
   agent_ledger -N -B \
   -e "SELECT id, agent_name, topic, content, COALESCE(tags, ''), CAST(created_at AS CHAR), CAST(updated_at AS CHAR) FROM agent_memory" 2>/dev/null |
 while IFS=$'\t' read -r id agent_id topic content tags created updated; do
-  PGPASSWORD=$PGPASSWORD psql -h 127.0.0.1 -U postgres -d broodlink_hot -q -c "
-    INSERT INTO memory_search_index (memory_id, agent_id, topic, content, tags, created_at, updated_at)
+  # Validate id is numeric
+  if ! [[ "$id" =~ ^[0-9]+$ ]]; then continue; fi
+  PGPASSWORD=$PGPASSWORD psql -h 127.0.0.1 -U postgres -d broodlink_hot -q \
+    -v "mid=$id" -v "aid=$agent_id" -v "vtopic=$topic" -v "vcontent=$content" \
+    -v "vtags=$tags" -v "vcreated=$created" -v "vupdated=$updated" \
+    -c "INSERT INTO memory_search_index (memory_id, agent_id, topic, content, tags, created_at, updated_at)
     VALUES (
-      $id,
-      \$tag\$${agent_id}\$tag\$,
-      \$tag\$${topic}\$tag\$,
-      \$tag\$${content}\$tag\$,
-      NULLIF(\$tag\$${tags}\$tag\$, ''),
-      '${created}'::timestamptz,
-      '${updated}'::timestamptz
+      :'mid'::int, :'aid', :'vtopic', :'vcontent',
+      NULLIF(:'vtags', ''),
+      :'vcreated'::timestamptz,
+      :'vupdated'::timestamptz
     )
     ON CONFLICT (agent_id, topic) DO UPDATE SET
       content = EXCLUDED.content,

@@ -88,6 +88,16 @@ impl BridgeClient {
         name: &str,
         arguments: &serde_json::Value,
     ) -> Result<serde_json::Value, (i32, String)> {
+        // Reject tool names with path traversal characters
+        if !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err((
+                protocol::INVALID_REQUEST,
+                format!("invalid tool name: {name}"),
+            ));
+        }
         let url = format!("{}/api/v1/tool/{}", self.bridge_url, name);
 
         let body = json!({ "params": arguments });

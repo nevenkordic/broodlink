@@ -46,9 +46,15 @@ echo ""
 for MID in $MEMORY_IDS; do
     COUNT=$((COUNT + 1))
 
-    # Check if already processed
+    # Validate MID is numeric (comes from Dolt auto-increment)
+    if ! [[ "$MID" =~ ^[0-9]+$ ]]; then
+        echo "  WARNING: invalid memory ID '$MID', skipping"
+        continue
+    fi
+
+    # Check if already processed (parameterized)
     EXISTS=$(PGPASSWORD=$PGPASSWORD psql -h "$PGHOST" -U "$PGUSER" -d "$PGDB" \
-        -t -c "SELECT COUNT(*) FROM kg_entity_memories WHERE memory_id = $MID" 2>/dev/null | tr -d ' ')
+        -t -v "mid=$MID" -c "SELECT COUNT(*) FROM kg_entity_memories WHERE memory_id = :'mid'::int" 2>/dev/null | tr -d ' ')
 
     if [[ "$EXISTS" -gt 0 ]]; then
         SKIPPED=$((SKIPPED + 1))
@@ -71,11 +77,12 @@ for MID in $MEMORY_IDS; do
         continue
     fi
 
-    # Insert into outbox for kg_extract processing
+    # Insert into outbox for kg_extract processing (parameterized)
     TRACE_ID=$(uuidgen 2>/dev/null || python3 -c "import uuid; print(uuid.uuid4())")
     PGPASSWORD=$PGPASSWORD psql -h "$PGHOST" -U "$PGUSER" -d "$PGDB" -q \
+        -v "tid=$TRACE_ID" -v "payload=$ROW" \
         -c "INSERT INTO outbox (trace_id, operation, payload, status, created_at)
-            VALUES ('$TRACE_ID', 'kg_extract', '${ROW//\'/\'\'}'::jsonb, 'pending', NOW())" 2>/dev/null
+            VALUES (:'tid', 'kg_extract', :'payload'::jsonb, 'pending', NOW())" 2>/dev/null
 
     QUEUED=$((QUEUED + 1))
 
