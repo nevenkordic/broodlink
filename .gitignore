@@ -17,8 +17,13 @@ broodlink-prompt.md
 # Build artifacts
 target/
 dist/
+public/
 status-site/public/
 .hugo_build.lock
+
+# Python
+__pycache__/
+*.pyc
 
 # Runtime
 *.log
