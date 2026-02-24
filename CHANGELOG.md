@@ -42,6 +42,37 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 - `formulas_custom_dir` config field in `[beads]` section (default:
   `.beads/formulas/custom`) with tilde expansion.
 - 12 new unit tests in broodlink-formulas crate (249 → 261 workspace total).
+- **Proactive Skills** — Three new autonomous capabilities that make Broodlink
+  proactive instead of purely reactive:
+  - **Scheduled Task Promotion**: `scheduled_tasks` table tracks one-shot and
+    recurring tasks. Coordinator polls every 60 seconds, promotes due tasks into
+    `task_queue`, publishes NATS `task_available`, handles one-shot disable and
+    recurring advancement (`next_run_at += recurrence_secs`). Optional formula
+    execution on fire.
+  - **Notification Rules & Incident Detection**: Heartbeat evaluates
+    `notification_rules` each cycle. Condition types: `service_event_error`
+    (error spike in last 15 min), `dlq_spike` (unresolved DLQ count),
+    `budget_low` (agents below token threshold). Cooldown enforcement prevents
+    alert storms. Optional `auto_postmortem` triggers `incident-postmortem`
+    workflow formula automatically.
+  - **Notification Dispatch**: beads-bridge `send_notification` tool inserts into
+    `notification_log` and publishes NATS `notification.send`. a2a-gateway
+    subscribes and delivers to Telegram (via bot API) or Slack (via incoming
+    webhook). Delivery status tracked in `notification_log` (pending/sent/failed).
+  - 6 new beads-bridge tools (84 → 90): `schedule_task`, `list_scheduled_tasks`,
+    `cancel_scheduled_task`, `send_notification`, `create_notification_rule`,
+    `list_notification_rules`.
+  - Migration 028: 3 new Postgres tables (`scheduled_tasks`, `notification_rules`,
+    `notification_log`).
+  - `NotificationsConfig` struct in broodlink-config (`[notifications]` section).
+- **Remember Tool in Chat**: a2a-gateway chat model can call `remember(topic,
+  content)` to store memories during conversation. Tool definitions refactored
+  from single if/else to Vec builder (web_search + remember, gated by config).
+- **`incident-postmortem` formula**: 4-step workflow (gather_evidence →
+  root_cause_analysis → prevention_plan → final_report) in
+  `.beads/formulas/custom/`.
+- 3 new skills registered: `schedule-task` (claude-code), `incident-response`
+  (a2a-gateway), `notification-dispatch` (a2a-gateway).
 
 ## [0.7.0] - 2026-02-23
 

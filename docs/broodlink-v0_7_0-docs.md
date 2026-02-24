@@ -95,7 +95,7 @@ A2A Gateway → Google A2A protocol for cross-platform agent interop
 - Users tab in control panel with create/edit/toggle/reset-password actions and role enforcement
 - Formulas tab in control panel for formula CRUD and toggle
 - Chat session expiry and dashboard session cleanup cycles in heartbeat
-- 6 new beads-bridge tools (78 → 84): chat session + formula registry tools
+- 6 new beads-bridge tools (78 → 84): chat session + formula registry tools; 6 more proactive tools (84 → 90): schedule_task, list_scheduled_tasks, cancel_scheduled_task, send_notification, create_notification_rule, list_notification_rules
 - 5 new Postgres migrations (019-021, 023-024)
 - 3 new status-api endpoint groups: `/api/v1/chat/*`, `/api/v1/formulas/*`, `/api/v1/users/*`, `/api/v1/auth/*`
 - 45 new unit tests (204 → 249)
@@ -157,11 +157,13 @@ A2A Gateway → Google A2A protocol for cross-platform agent interop
 
 ```
 broodlink/
-├── .beads/formulas/           # 4 workflow formula definitions
+├── .beads/formulas/           # 4 system + custom workflow formula definitions
 │   ├── build-feature.formula.toml
 │   ├── daily-review.formula.toml
 │   ├── knowledge-gap.formula.toml
-│   └── research.formula.toml
+│   ├── research.formula.toml
+│   └── custom/
+│       └── incident-postmortem.formula.toml
 ├── agents/                    # Python agent SDK
 │   ├── broodlink_agent/       # Package (12 modules, 829 lines)
 │   └── requirements.txt
@@ -179,7 +181,7 @@ broodlink/
 ├── migrations/                # 26 SQL migration files (~960 lines)
 ├── rust/                      # 7 Rust services
 │   ├── a2a-gateway/           # A2A protocol + webhook + chat gateway + Ollama tool calling (~3,540 lines)
-│   ├── beads-bridge/          # Main tool API (~7,904 lines, 84 tools)
+│   ├── beads-bridge/          # Main tool API (~8,200 lines, 90 tools)
 │   ├── coordinator/           # Task routing + workflow orchestration + DLQ + workflow branching + task decomposition (~2,755 lines)
 │   ├── embedding-worker/      # Vector + KG extraction pipeline (1,576 lines)
 │   ├── heartbeat/             # Health monitor + search sync + KG backfill + KG expiry + budget replenishment + chat/session cleanup (~1,642 lines)
@@ -240,6 +242,7 @@ pub struct Config {
     pub jwt: JwtConfig,                        // v0.6.0: JWT key rotation
     pub chat: ChatConfig,                       // v0.7.0: Conversational gateway + tools (ChatToolsConfig)
     pub dashboard_auth: DashboardAuthConfig,    // v0.7.0: Role-based dashboard access
+    pub notifications: NotificationsConfig,     // post-v0.7.0: Proactive notification rules
 }
 ```
 
@@ -380,6 +383,8 @@ pub struct Config {
 | | session_ttl_hours | u32 | 8 |
 | | bcrypt_cost | u32 | 12 |
 | | max_sessions_per_user | u32 | 5 |
+| **notifications** | enabled | bool | true |
+| | default_cooldown_minutes | u32 | 30 |
 
 ### v0.4.0 + v0.6.0 Config: `[memory_search]`
 
@@ -525,7 +530,7 @@ preferred_formulas = ["daily-review", "knowledge-gap"]
 | GET | /api/v1/stream/:stream_id | sse_stream_handler | JWT |
 | GET | /api/v1/.well-known/jwks.json | jwks_handler | No |
 
-#### Tool Registry (84 tools)
+#### Tool Registry (90 tools)
 
 **Memory (5):** store_memory, recall_memory, delete_memory, semantic_search, **hybrid_search** (v0.4.0)
 **Knowledge Graph (5):** **graph_search**, **graph_traverse**, **graph_update_edge**, **graph_stats** (v0.5.0), **graph_prune** (v0.6.0)
@@ -551,6 +556,7 @@ preferred_formulas = ["daily-review", "knowledge-gap"]
 **Collaboration (2):** **decompose_task**, **merge_results** (v0.6.0)
 **Chat (4):** **list_chat_sessions**, **reply_to_chat**, **close_chat_session**, **assign_chat_agent** (v0.7.0)
 **Formula Registry (5):** **create_formula**, **get_formula**, **update_formula**, **delete_formula**, **list_formulas** (v0.7.0)
+**Proactive (6):** **schedule_task**, **list_scheduled_tasks**, **cancel_scheduled_task**, **send_notification**, **create_notification_rule**, **list_notification_rules** (post-v0.7.0)
 
 #### AppState
 
@@ -738,7 +744,7 @@ Circuit breaker (3), rate limiter (2), parameter extraction (8), tool registry (
 ### 4.2 coordinator (No HTTP)
 
 **File:** `rust/coordinator/src/main.rs` (~2,755 lines)
-**Purpose:** NATS-driven task routing with smart scoring + workflow orchestration + DLQ + task decomposition
+**Purpose:** NATS-driven task routing with smart scoring + workflow orchestration + DLQ + task decomposition + scheduled task promotion
 **Deps:** Dolt, Postgres, NATS
 
 #### Task Routing Algorithm
@@ -816,6 +822,18 @@ FormulaStep now supports:
 
 The `decompose_task` tool splits a parent task into sub-tasks, tracked via `task_decompositions` table. The coordinator monitors sub-task completion and triggers `merge_results` when all children complete. Merge strategies: `concatenate` (default), `vote` (majority result), `best` (highest-scoring result).
 
+#### Scheduled Task Promotion (post-v0.7.0)
+
+Background loop (`scheduled_task_loop`) runs on 60-second interval alongside DLQ retry loop:
+
+1. Query `scheduled_tasks WHERE enabled = TRUE AND next_run_at <= NOW() ORDER BY next_run_at LIMIT 10`
+2. For each due task:
+   - INSERT into `task_queue` (id, trace_id, title, description, priority, formula_name)
+   - Publish NATS `{prefix}.{env}.coordinator.task_available`
+   - Increment `run_count`, set `last_run_at = NOW()`
+   - If one-shot (`recurrence_secs IS NULL`): set `enabled = false`
+   - If recurring: advance `next_run_at += make_interval(secs => recurrence_secs)`; if `max_runs` reached, disable
+
 #### Unit Tests (31)
 
 Backoff calculation (1), cost tier ordering (1), cost tier score values (1), compute_score variants (4), rank_agents (2), recency score (4), task payload deserialisation (3), routing decision (1), render_prompt (4), workflow payload deserialisation (3), formula parsing (5), formula input types (2).
@@ -842,6 +860,9 @@ Backoff calculation (1), cost tier ordering (1), cost tier score values (1), com
 5h. **Budget replenishment** (v0.6.0) — At `budget.replenish_hour_utc` (default midnight UTC): for each active agent, set `budget_tokens = budget.daily_replenishment` if current balance < daily_replenishment. Inserts `budget_transactions` audit row with action "replenish".
 5i. **Chat session expiry** (v0.7.0) — Closes chat sessions where `last_message_at` exceeds `chat.session_timeout_hours` (default 24h). Sets status to "expired".
 5j. **Dashboard session cleanup** (v0.7.0) — Deletes expired rows from `dashboard_sessions` where `expires_at < NOW()`.
+5k. **Formula registry sync** (post-v0.7.0) — Bidirectional TOML↔Postgres sync with definition_hash skip.
+5l. **Skill registry sync** (post-v0.7.0) — Syncs skills from config.toml agent definitions to Dolt.
+5n. **Notification rule evaluation** (post-v0.7.0) — Queries `notification_rules WHERE enabled = TRUE`. Evaluates conditions: `service_event_error` (error count in 15 min > threshold), `dlq_spike` (unresolved DLQ > threshold), `budget_low` (agents below budget threshold). Checks cooldown (`last_triggered_at + cooldown_minutes`). On trigger: renders template with `{{count}}`/`{{agents}}`/`{{type}}` variables, inserts `notification_log`, publishes NATS `{prefix}.{env}.notification.send`, updates `last_triggered_at`. If `condition_config.auto_postmortem = true` on `service_event_error`, also publishes `workflow_start` for `incident-postmortem` formula.
 6. **Deactivate stale agents** — `last_seen < NOW() - 1 HOUR` → `active = false`
 7. **Expire approval gates** — pending gates past `expires_at` → status `expired`, linked tasks too
 8. **Compute agent_metrics** — for each active agent: completed/failed counts, avg duration, load, success_rate → upsert `agent_metrics` (PG)
@@ -1917,6 +1938,56 @@ Index on `expires_at`.
 | created_at | TIMESTAMPTZ DEFAULT NOW() | |
 | updated_at | TIMESTAMPTZ DEFAULT NOW() | |
 
+#### scheduled_tasks (Migration 028, post-v0.7.0)
+| Column | Type | Notes |
+|--------|------|-------|
+| id | BIGSERIAL PK | |
+| title | VARCHAR(255) NOT NULL | Task title |
+| description | TEXT DEFAULT '' | |
+| priority | INT DEFAULT 0 | |
+| formula_name | VARCHAR(100) | Optional formula to execute |
+| params | JSONB DEFAULT '{}' | Formula params or task metadata |
+| next_run_at | TIMESTAMPTZ NOT NULL | When this task next fires |
+| recurrence_secs | BIGINT | NULL = one-shot, >0 = repeat interval |
+| last_run_at | TIMESTAMPTZ | |
+| run_count | INT DEFAULT 0 | |
+| max_runs | INT | NULL = unlimited |
+| enabled | BOOLEAN DEFAULT TRUE | Set FALSE after one-shot fires or max_runs reached |
+| created_by | VARCHAR(100) | |
+| created_at | TIMESTAMPTZ DEFAULT NOW() | |
+
+INDEX: `idx_scheduled_tasks_due ON scheduled_tasks (next_run_at) WHERE enabled = TRUE`
+
+#### notification_rules (Migration 028, post-v0.7.0)
+| Column | Type | Notes |
+|--------|------|-------|
+| id | BIGSERIAL PK | |
+| name | VARCHAR(100) NOT NULL UNIQUE | Rule identifier |
+| condition_type | VARCHAR(50) NOT NULL | service_event_error, dlq_spike, budget_low |
+| condition_config | JSONB NOT NULL DEFAULT '{}' | `{threshold, auto_postmortem}` |
+| channel | VARCHAR(20) NOT NULL | telegram, slack |
+| target | VARCHAR(255) NOT NULL | Chat ID or webhook URL |
+| template | TEXT | Message with `{{count}}`, `{{agents}}`, `{{type}}` placeholders |
+| cooldown_minutes | INT DEFAULT 30 | |
+| enabled | BOOLEAN DEFAULT TRUE | |
+| last_triggered_at | TIMESTAMPTZ | |
+| created_at | TIMESTAMPTZ DEFAULT NOW() | |
+
+#### notification_log (Migration 028, post-v0.7.0)
+| Column | Type | Notes |
+|--------|------|-------|
+| id | BIGSERIAL PK | |
+| rule_id | BIGINT FK → notification_rules(id) | NULL for direct send_notification |
+| rule_name | VARCHAR(100) | |
+| channel | VARCHAR(20) NOT NULL | telegram, slack |
+| target | VARCHAR(255) NOT NULL | |
+| message | TEXT NOT NULL | |
+| status | VARCHAR(20) DEFAULT 'pending' | pending, sent, failed |
+| error_msg | TEXT | |
+| created_at | TIMESTAMPTZ DEFAULT NOW() | |
+
+INDEX: `idx_notification_log_time ON notification_log (created_at DESC)`
+
 ### 6.3 Qdrant (port 6333)
 
 **Collection: `broodlink_memory`**
@@ -1955,6 +2026,7 @@ All prefixed with `{config.nats.subject_prefix}.{config.broodlink.env}` (default
 | `{p}.{e}.agent.{to}.delegation` | Delegation sent |
 | `{p}.{e}.agent.{from}.delegation_response` | Delegation accepted/rejected/completed |
 | `{p}.{e}.stream.{stream_id}` | Streaming events |
+| `{p}.{e}.notification.send` | Notification dispatch (from send_notification tool) |
 
 ### coordinator
 
@@ -1983,6 +2055,8 @@ All prefixed with `{config.nats.subject_prefix}.{config.broodlink.env}` (default
 | `{p}.{e}.health` | Publish |
 | `{p}.{e}.status` | Publish |
 | `{p}.{e}.approvals.expired` | Publish |
+| `{p}.{e}.notification.send` | Publish (when notification rule triggers) |
+| `{p}.{e}.coordinator.workflow_start` | Publish (auto-postmortem on incident) |
 
 ### status-api
 
@@ -1997,6 +2071,7 @@ All prefixed with `{config.nats.subject_prefix}.{config.broodlink.env}` (default
 | `{p}.{e}.coordinator.task_completed` | Subscribe (chat reply delivery) |
 | `{p}.{e}.coordinator.task_failed` | Subscribe (chat failure handling) |
 | `{p}.platform.credentials_changed` | Subscribe (invalidates telegram_creds cache) |
+| `{p}.{e}.notification.send` | Subscribe (delivers to Telegram/Slack, updates notification_log) |
 
 ---
 
@@ -2173,7 +2248,7 @@ Primary → catch exception → try fallback (if configured) → raise. Uses `_s
 
 ## 10. Workflow Formulas
 
-**Location:** `.beads/formulas/` (4 TOML files, 145 lines)
+**Location:** `.beads/formulas/` (4 system + 1 custom TOML files)
 **Execution:** Agent calls `start_workflow(formula_name, params)` → coordinator loads formula TOML → creates step 0 task → on completion, creates step 1 with accumulated results → repeats until all steps done or a step fails. State tracked in `workflow_runs` table.
 
 ### research.formula.toml
@@ -2196,6 +2271,12 @@ Steps: audit_memory (analyst) → prioritize (architect) → fill_gaps (research
 Tools: semantic_search, recall_memory, store_memory, log_decision
 Params: `max_gaps` (integer, optional, default 5)
 
+### custom/incident-postmortem.formula.toml (post-v0.7.0)
+Steps: gather_evidence (analyst) → root_cause_analysis (analyst) → prevention_plan (architect) → final_report (writer)
+Tools: get_audit_log, list_tasks, get_decisions, recall_memory, store_memory, log_decision, log_work
+Params: `incident_type` (string, required), `time_window_hours` (integer, optional, default 24)
+Auto-triggered by heartbeat notification rules when `condition_config.auto_postmortem = true`.
+
 ---
 
 ## 11. Scripts
@@ -2205,7 +2286,7 @@ Params: `max_gaps` (integer, optional, default 5)
 | bootstrap.sh | 120 | One-shot setup: prerequisites, infrastructure, secrets, databases, build, onboard, start |
 | start-services.sh | 110 | Start/stop all 7 services + Hugo, auto-generate JWTs for service agents |
 | build.sh | 28 | cargo deny → cargo test → cargo build --release → hugo --minify |
-| db-setup.sh | 144 | Create Postgres/Dolt databases, run all 26 migrations, create Qdrant collections |
+| db-setup.sh | 144 | Create Postgres/Dolt databases, run all 30 migrations, create Qdrant collections |
 | secrets-init.sh | 112 | Generate age keypair, .sops.yaml, RSA keypair for JWT, env file |
 | onboard-agent.sh | 137 | Generate RS256 JWT, register agent via beads-bridge |
 | backfill-search-index.sh | 66 | One-time backfill of Postgres memory_search_index from Dolt agent_memory (v0.4.0) |
@@ -2694,15 +2775,15 @@ MODEL="qwen3:32b" bash run.sh
 
 | Area | Change |
 |------|--------|
-| **Tools** | Added 6 tools (78 → 84): `list_chat_sessions`, `reply_to_chat`, `create_formula`, `get_formula`, `update_formula`, `list_formulas` |
+| **Tools** | Added 6 tools (78 → 84): `list_chat_sessions`, `reply_to_chat`, `create_formula`, `get_formula`, `update_formula`, `list_formulas`; post-v0.7.0: added 6 proactive tools (84 → 90): `schedule_task`, `list_scheduled_tasks`, `cancel_scheduled_task`, `send_notification`, `create_notification_rule`, `list_notification_rules` |
 | **beads-bridge** | +644 lines (~7,260 → ~7,904): 2 chat tool handlers, 4 formula tool handlers, formula validation, chat/formula tool schemas |
 | **status-api** | +1,457 lines (~2,389 → ~3,846): 5 chat endpoints, 5 formula endpoints, 5 user management endpoints, 3 auth endpoints, UserRole enum, dual auth middleware (session + API key), bcrypt password hashing, Telegram bot registration with access code generation (`rand = "0.8"`), cascade delete on disconnect (CTE removing chat_reply_queue, chat_messages, chat_sessions, platform_credentials), NATS publish of `credentials_changed` on register/disconnect |
 | **a2a-gateway** | +1,995 lines (~1,545 → ~3,540): `handle_chat_message()` session/message pipeline, `reply_delivery_loop()` background task, platform-specific delivery (Slack/Teams/Telegram), `handle_task_completion_for_chat()`, NATS task_completed/task_failed subscriptions, NATS `credentials_changed` subscription (immediate cache invalidation), `call_ollama_chat()` direct LLM with tool calling loop, `execute_brave_search()`, Telegram long-polling with offset persistence and post-getUpdates credential refresh, `.env` loader, `AppState` efficiency fields (ollama_semaphore, brave_cache, inflight_chats, ollama_client), dedup before DB/bridge, typing refresh via `tokio::select!`, `normalize_search_query()`, `chat_dedup_key()`, `strip_think_tags()`, `add_telegram_allowed_user()` (atomic JSONB append + cache invalidation), `get_telegram_creds()` expanded to 4-tuple (token, secret, allowed_user_ids, auth_code), access code authentication with allow list enforcement at webhook + polling entry points, auth code security hardening (no message text in logs for unauthenticated users, auth codes never stored in chat history) |
-| **heartbeat** | +121 lines (~1,521 → ~1,642): chat session expiry cycle, dashboard session cleanup cycle |
-| **coordinator** | +110 lines (~2,645 → ~2,755): formula_registry lookup (Postgres first, TOML fallback) |
-| **broodlink-config** | +269 lines (~982 → ~1,251): `ChatConfig` (9 fields), `ChatToolsConfig` (6 fields), `DashboardAuthConfig` (4 fields), `OllamaConfig.num_ctx`, `A2aConfig` +3 fields (ollama_concurrency, busy_message, dedup_window_secs) |
-| **config.toml** | +24 lines (~160 → ~184): `[chat]`, `[chat.tools]`, `[dashboard_auth]` sections, efficiency fields on `[a2a]` and `[ollama]` |
-| **Migrations 019-021, 023-024** | New: `chat_sessions`, `chat_messages`, `chat_reply_queue` (019), `formula_registry` (020), `dashboard_users`, `dashboard_sessions` (021), `platform_credentials` (023), `platform_credentials.meta` JSONB (024) |
+| **heartbeat** | +121 lines (~1,521 → ~1,642): chat session expiry cycle, dashboard session cleanup cycle; post-v0.7.0: +~150 lines: notification rule evaluation (step 5n), `check_notification_rules()` with condition evaluation, cooldown, template rendering, auto-postmortem |
+| **coordinator** | +110 lines (~2,645 → ~2,755): formula_registry lookup (Postgres first, TOML fallback); post-v0.7.0: +~80 lines: `scheduled_task_loop()` (60s polling), `check_scheduled_tasks()` (promotes due tasks to task_queue) |
+| **broodlink-config** | +269 lines (~982 → ~1,251): `ChatConfig` (9 fields), `ChatToolsConfig` (6 fields), `DashboardAuthConfig` (4 fields), `OllamaConfig.num_ctx`, `A2aConfig` +3 fields (ollama_concurrency, busy_message, dedup_window_secs); post-v0.7.0: `NotificationsConfig` (2 fields) |
+| **config.toml** | +24 lines (~160 → ~184): `[chat]`, `[chat.tools]`, `[dashboard_auth]` sections, efficiency fields on `[a2a]` and `[ollama]`; post-v0.7.0: `[notifications]` section, 3 new skill_definitions, updated agent skills arrays |
+| **Migrations 019-021, 023-024, 028** | New: `chat_sessions`, `chat_messages`, `chat_reply_queue` (019), `formula_registry` (020), `dashboard_users`, `dashboard_sessions` (021), `platform_credentials` (023), `platform_credentials.meta` JSONB (024); post-v0.7.0: `scheduled_tasks`, `notification_rules`, `notification_log` (028) |
 | **Dashboard** | New: `/chat/` page (session monitoring, platform filtering, message threads), `/login/` page (session-based auth). Control panel: added Users tab (admin CRUD), Formulas tab (formula CRUD + toggle), Telegram tab (access code display, authorized user count, registration form fix). auth.js client module for session management. Page count: 13 → 15 |
 | **JS modules** | New: `chat.js` (147 lines), `auth.js` (129 lines); `control.js` expanded (534 → ~891 lines); 15 → 17 files total (~2,600 → ~3,241 lines) |
 | **CSS** | +88 lines (~1,261 → ~1,349): chat session cards, platform badges, chat modal, login form, role badges, users table |

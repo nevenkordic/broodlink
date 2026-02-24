@@ -1,0 +1,44 @@
+# Broodlink — Multi-agent AI orchestration
+# Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[formula]
+name = "incident-postmortem"
+version = "1.0.0"
+description = "Conduct a full incident postmortem: gather evidence, analyse root cause, propose prevention, produce final report"
+
+[[steps]]
+name = "gather_evidence"
+agent_role = "analyst"
+tools = ["get_work_log", "get_decisions", "recall_memory", "semantic_search"]
+prompt = "Gather all evidence for the incident: {{incident_title}}. Search work logs, recent decisions, and memory for related changes, deployments, and anomalies. If affected services are specified ({{affected_services}}), focus on those."
+output = "evidence"
+
+[[steps]]
+name = "root_cause_analysis"
+agent_role = "analyst"
+tools = ["semantic_search", "recall_memory", "get_decisions"]
+prompt = "Analyse the gathered evidence to identify the root cause. Consider: timeline of events, contributing factors, what changed recently, and why existing safeguards did not prevent the incident. Severity: {{severity}}."
+input = "evidence"
+output = "root_cause"
+
+[[steps]]
+name = "prevention_plan"
+agent_role = "architect"
+tools = ["log_decision", "store_memory"]
+prompt = "Based on the root cause, design a prevention plan. Include: immediate mitigation steps already taken, short-term fixes, long-term architectural improvements, and monitoring/alerting changes. Log the key decisions."
+input = "root_cause"
+output = "prevention"
+
+[[steps]]
+name = "final_report"
+agent_role = "reporter"
+tools = ["store_memory", "log_work"]
+prompt = "Produce a structured postmortem report covering: summary, impact, timeline, root cause, contributing factors, prevention plan, and action items. Store as a memory for future reference and log the work entry."
+input = "prevention"
+output = "report"
+
+[formula.parameters]
+incident_title = { type = "string", required = true, description = "Title or brief description of the incident" }
+severity = { type = "string", required = false, description = "Incident severity (critical, high, medium, low)", default = "medium" }
+affected_services = { type = "string", required = false, description = "Comma-separated list of affected services", default = "unknown" }

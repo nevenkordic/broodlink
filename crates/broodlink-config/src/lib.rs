@@ -78,6 +78,9 @@ pub struct Config {
     pub dashboard_auth: DashboardAuthConfig,
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
+    // --- proactive skills ---
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -1012,6 +1015,33 @@ fn default_heartbeat_cycle_timeout_secs() -> u64 {
 
 fn default_heartbeat_stale_agent_minutes() -> u32 {
     60
+}
+
+// --- Proactive notifications ---
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct NotificationsConfig {
+    #[serde(default = "default_notifications_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_notifications_cooldown_minutes")]
+    pub default_cooldown_minutes: u32,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_notifications_enabled(),
+            default_cooldown_minutes: default_notifications_cooldown_minutes(),
+        }
+    }
+}
+
+fn default_notifications_enabled() -> bool {
+    true
+}
+
+fn default_notifications_cooldown_minutes() -> u32 {
+    30
 }
 
 /// Expand a leading `~` to the user's home directory.

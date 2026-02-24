@@ -2055,6 +2055,131 @@ async fn check_dlq_retries(state: &AppState) -> Result<u64, BroodlinkError> {
 }
 
 // ---------------------------------------------------------------------------
+// Scheduled task promotion loop
+// ---------------------------------------------------------------------------
+
+async fn scheduled_task_loop(state: Arc<AppState>, mut shutdown_rx: watch::Receiver<bool>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(60));
+
+    info!("scheduled task loop started");
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                match check_scheduled_tasks(&state).await {
+                    Ok(promoted) => {
+                        if promoted > 0 {
+                            info!(promoted = promoted, "scheduled tasks promoted");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "scheduled task check failed");
+                    }
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                info!("shutdown signal, stopping scheduled task loop");
+                break;
+            }
+        }
+    }
+}
+
+async fn check_scheduled_tasks(state: &AppState) -> Result<u64, BroodlinkError> {
+    let entries: Vec<(i64, String, String, i32, Option<String>, Option<serde_json::Value>, Option<i64>, Option<i32>, i32)> = sqlx::query_as(
+        "SELECT id, title, COALESCE(description, ''), priority, formula_name, params,
+                recurrence_secs, max_runs, run_count
+         FROM scheduled_tasks
+         WHERE enabled = TRUE AND next_run_at <= NOW()
+         ORDER BY next_run_at ASC
+         LIMIT 10",
+    )
+    .fetch_all(&state.pg)
+    .await?;
+
+    let mut promoted = 0u64;
+
+    for (sched_id, title, description, priority, formula_name, _params, recurrence_secs, max_runs, run_count) in &entries {
+        // Create task in task_queue
+        let task_id = Uuid::new_v4().to_string();
+        let trace_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO task_queue (id, trace_id, title, description, priority, formula_name, status, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, 'pending', NOW(), NOW())",
+        )
+        .bind(&task_id)
+        .bind(&trace_id)
+        .bind(title)
+        .bind(description)
+        .bind(priority)
+        .bind(formula_name)
+        .execute(&state.pg)
+        .await?;
+
+        // Publish task_available NATS event
+        let subject = format!(
+            "{}.{}.coordinator.task_available",
+            state.config.nats.subject_prefix, state.config.broodlink.env,
+        );
+        let nats_payload = serde_json::json!({
+            "task_id": task_id,
+            "scheduled_task_id": sched_id,
+        });
+        if let Ok(bytes) = serde_json::to_vec(&nats_payload) {
+            if let Err(e) = state.nats.publish(subject, bytes.into()).await {
+                warn!(error = %e, task_id = %task_id, "failed to publish scheduled task event");
+            }
+        }
+
+        // Update scheduled_task
+        let new_count = run_count + 1;
+        match recurrence_secs {
+            Some(interval_secs) if *interval_secs > 0 => {
+                // Recurring: advance next_run_at, check max_runs
+                let max_reached = max_runs.map_or(false, |m| new_count >= m);
+                if max_reached {
+                    sqlx::query(
+                        "UPDATE scheduled_tasks SET run_count = $1, last_run_at = NOW(), enabled = FALSE
+                         WHERE id = $2",
+                    )
+                    .bind(new_count)
+                    .bind(sched_id)
+                    .execute(&state.pg)
+                    .await?;
+                } else {
+                    sqlx::query(
+                        "UPDATE scheduled_tasks SET run_count = $1, last_run_at = NOW(),
+                                next_run_at = next_run_at + make_interval(secs => $2::double precision)
+                         WHERE id = $3",
+                    )
+                    .bind(new_count)
+                    .bind(*interval_secs as f64)
+                    .bind(sched_id)
+                    .execute(&state.pg)
+                    .await?;
+                }
+            }
+            _ => {
+                // One-shot: disable
+                sqlx::query(
+                    "UPDATE scheduled_tasks SET run_count = $1, last_run_at = NOW(), enabled = FALSE
+                     WHERE id = $2",
+                )
+                .bind(new_count)
+                .bind(sched_id)
+                .execute(&state.pg)
+                .await?;
+            }
+        }
+
+        info!(task_id = %task_id, scheduled_id = %sched_id, title = %title, "scheduled task promoted");
+        promoted += 1;
+    }
+
+    Ok(promoted)
+}
+
+// ---------------------------------------------------------------------------
 // Initialization
 // ---------------------------------------------------------------------------
 
@@ -2215,6 +2340,13 @@ async fn main() {
         dlq_retry_loop(dlq_state, dlq_shutdown).await;
     });
 
+    // Spawn the scheduled task promotion loop
+    let sched_state = Arc::clone(&state);
+    let sched_shutdown = shutdown_rx.clone();
+    let sched_handle = tokio::spawn(async move {
+        scheduled_task_loop(sched_state, sched_shutdown).await;
+    });
+
     // Wait for shutdown signal
     shutdown_signal().await;
 
@@ -2243,6 +2375,9 @@ async fn main() {
         }
         if let Err(e) = dlq_handle.await {
             warn!(error = %e, "DLQ retry task panicked");
+        }
+        if let Err(e) = sched_handle.await {
+            warn!(error = %e, "scheduled task loop panicked");
         }
     })
     .await

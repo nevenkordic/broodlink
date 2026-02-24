@@ -579,6 +579,22 @@ async fn run_cycle(state: &AppState) -> Result<(), BroodlinkError> {
     }
 
     // -----------------------------------------------------------------------
+    // 5n. Incident detection + notification dispatch
+    // -----------------------------------------------------------------------
+    if state.config.notifications.enabled {
+        match check_notification_rules(&state.pg, &state.nats, &state.config).await {
+            Ok(fired) => {
+                if fired > 0 {
+                    info!(notifications_fired = fired, "notification rules evaluated");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "notification rule check failed");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // 6. Publish broodlink.<env>.health (NATS)
     // -----------------------------------------------------------------------
     let dolt_ok = sqlx::query("SELECT 1").execute(&state.dolt).await.is_ok();
@@ -1913,4 +1929,215 @@ async fn publish_nats<T: Serialize>(nats: &async_nats::Client, subject: &str, pa
             warn!(error = %e, subject = %subject, "failed to serialize nats payload");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Notification rule evaluation (incident detection + alerting)
+// ---------------------------------------------------------------------------
+
+async fn check_notification_rules(
+    pg: &PgPool,
+    nats: &async_nats::Client,
+    config: &Config,
+) -> Result<u64, BroodlinkError> {
+    let rules: Vec<(i64, String, String, serde_json::Value, String, String, Option<String>, i32, Option<String>)> =
+        sqlx::query_as(
+            "SELECT id, name, condition_type, condition_config, channel, target, template,
+                    cooldown_minutes, last_triggered_at::text
+             FROM notification_rules
+             WHERE enabled = TRUE",
+        )
+        .fetch_all(pg)
+        .await?;
+
+    if rules.is_empty() {
+        return Ok(0);
+    }
+
+    let mut fired = 0u64;
+    let prefix = &config.nats.subject_prefix;
+    let env = &config.broodlink.env;
+
+    for (rule_id, name, condition_type, condition_config, channel, target, template, cooldown_minutes, last_triggered) in &rules {
+        // Check cooldown
+        if let Some(last) = last_triggered {
+            if let Ok(ts) = chrono::NaiveDateTime::parse_from_str(last, "%Y-%m-%d %H:%M:%S%.f%z")
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(last, "%Y-%m-%d %H:%M:%S%.f"))
+            {
+                let elapsed = (Utc::now().naive_utc() - ts).num_minutes();
+                if elapsed < *cooldown_minutes as i64 {
+                    continue;
+                }
+            }
+        }
+
+        let window_minutes = condition_config
+            .get("window_minutes")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(15);
+        let threshold = condition_config
+            .get("threshold")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(1);
+
+        let (should_fire, message_vars) = match condition_type.as_str() {
+            "service_event_error" => {
+                let count: (i64,) = sqlx::query_as(
+                    "SELECT COUNT(*) FROM service_events
+                     WHERE severity = 'error'
+                       AND created_at > NOW() - make_interval(mins => $1::double precision)",
+                )
+                .bind(window_minutes as f64)
+                .fetch_one(pg)
+                .await
+                .unwrap_or((0,));
+
+                (count.0 >= threshold, serde_json::json!({"count": count.0, "type": "service_event_error"}))
+            }
+            "dlq_spike" => {
+                let count: (i64,) = sqlx::query_as(
+                    "SELECT COUNT(*) FROM dead_letter_queue
+                     WHERE resolved = FALSE
+                       AND created_at > NOW() - make_interval(mins => $1::double precision)",
+                )
+                .bind(window_minutes as f64)
+                .fetch_one(pg)
+                .await
+                .unwrap_or((0,));
+
+                (count.0 >= threshold, serde_json::json!({"count": count.0, "type": "dlq_spike"}))
+            }
+            "budget_low" => {
+                let budget_threshold = condition_config
+                    .get("budget_threshold")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(config.budget.low_budget_threshold);
+
+                let agents: Vec<(String, i64)> = sqlx::query_as(
+                    "SELECT agent_id, budget_tokens FROM agent_profiles
+                     WHERE active = true AND budget_tokens < $1",
+                )
+                .bind(budget_threshold)
+                .fetch_all(pg)
+                .await
+                .unwrap_or_default();
+
+                let agent_names: Vec<&str> = agents.iter().map(|(a, _)| a.as_str()).collect();
+                (!agents.is_empty(), serde_json::json!({"agents": agent_names, "count": agents.len(), "type": "budget_low"}))
+            }
+            _ => {
+                warn!(condition_type = %condition_type, rule = %name, "unknown notification condition type");
+                continue;
+            }
+        };
+
+        if !should_fire {
+            continue;
+        }
+
+        // Render message from template or generate default
+        let message = if let Some(tmpl) = template {
+            let mut msg = tmpl.clone();
+            if let Some(obj) = message_vars.as_object() {
+                for (key, val) in obj {
+                    let replacement = match val {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    msg = msg.replace(&format!("{{{{{key}}}}}"), &replacement);
+                }
+            }
+            msg
+        } else {
+            format!(
+                "[Broodlink Alert] Rule '{}' triggered: {}",
+                name,
+                message_vars
+            )
+        };
+
+        // Insert notification_log entry
+        let log_id: (i64,) = sqlx::query_as(
+            "INSERT INTO notification_log (rule_id, rule_name, channel, target, message, status, created_at)
+             VALUES ($1, $2, $3, $4, $5, 'pending', NOW())
+             RETURNING id",
+        )
+        .bind(rule_id)
+        .bind(name)
+        .bind(channel)
+        .bind(target)
+        .bind(&message)
+        .fetch_one(pg)
+        .await?;
+
+        // Publish NATS event for a2a-gateway to deliver
+        let notify_subject = format!("{prefix}.{env}.notification.send");
+        let notify_payload = serde_json::json!({
+            "log_id": log_id.0,
+            "rule_id": rule_id,
+            "rule_name": name,
+            "channel": channel,
+            "target": target,
+            "message": message,
+        });
+        if let Ok(bytes) = serde_json::to_vec(&notify_payload) {
+            if let Err(e) = nats.publish(notify_subject, bytes.into()).await {
+                warn!(error = %e, rule = %name, "failed to publish notification event");
+            }
+        }
+
+        // Update last_triggered_at
+        let _ = sqlx::query(
+            "UPDATE notification_rules SET last_triggered_at = NOW() WHERE id = $1",
+        )
+        .bind(rule_id)
+        .execute(pg)
+        .await;
+
+        // Auto-postmortem for service_event_error
+        if condition_type == "service_event_error"
+            && condition_config
+                .get("auto_postmortem")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        {
+            let workflow_id = Uuid::new_v4().to_string();
+            let convoy_id = Uuid::new_v4().to_string();
+            let wf_subject = format!("{prefix}.{env}.coordinator.workflow_start");
+            let wf_payload = serde_json::json!({
+                "workflow_id": workflow_id,
+                "convoy_id": convoy_id,
+                "formula_name": "incident-postmortem",
+                "params": {
+                    "incident_title": format!("Auto-detected: {} error events in {}min", message_vars["count"], window_minutes),
+                    "severity": "high",
+                    "affected_services": "auto-detected",
+                },
+                "started_by": "heartbeat",
+            });
+
+            // Create workflow_runs entry first
+            let _ = sqlx::query(
+                "INSERT INTO workflow_runs (id, convoy_id, formula_name, status, started_by, created_at, updated_at)
+                 VALUES ($1, $2, 'incident-postmortem', 'pending', 'heartbeat', NOW(), NOW())",
+            )
+            .bind(&workflow_id)
+            .bind(&convoy_id)
+            .execute(pg)
+            .await;
+
+            if let Ok(bytes) = serde_json::to_vec(&wf_payload) {
+                if let Err(e) = nats.publish(wf_subject, bytes.into()).await {
+                    warn!(error = %e, "failed to publish auto-postmortem workflow");
+                } else {
+                    info!(workflow_id = %workflow_id, "auto-postmortem triggered by incident detection");
+                }
+            }
+        }
+
+        info!(rule = %name, channel = %channel, "notification rule fired");
+        fired += 1;
+    }
+
+    Ok(fired)
 }

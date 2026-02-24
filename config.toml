@@ -163,8 +163,12 @@ memory_max_results = 3
 web_search_enabled = true
 max_tool_rounds = 3
 search_result_count = 5
-tool_context_messages = 4
+tool_context_messages = 10
 search_cache_ttl_secs = 300
+
+[notifications]
+enabled = true
+default_cooldown_minutes = 30
 
 [dashboard_auth]
 enabled = false
@@ -206,6 +210,7 @@ skills             = [
     "memory-recall", "memory-store", "task-execution", "self-reporting",
     "conversational-gateway", "model-failover", "webhook-dispatch",
     "health-monitoring", "formula-execution",
+    "incident-response", "notification-dispatch",
 ]
 
 [agents.claude-code]
@@ -218,6 +223,7 @@ skills             = [
     "memory-recall", "memory-store", "task-execution", "self-reporting",
     "code-generation", "debugging", "testing",
     "migration-authoring", "ci-cd-management",
+    "schedule-task",
 ]
 
 # ---------------------------------------------------------------------------
@@ -250,3 +256,6 @@ debugging                = "Diagnose failures from logs, stack traces, error mes
 testing                  = "Write and run unit tests, integration tests, and regression test suites"
 migration-authoring      = "Create SQL migrations for Dolt and Postgres schema changes"
 ci-cd-management         = "Interact with CI pipelines, fix failing checks, manage GitHub Actions workflows"
+schedule-task            = "Schedule one-shot or recurring tasks with optional formula execution at specified times"
+incident-response        = "Auto-detect service anomalies (DLQ spikes, error events, budget exhaustion) and trigger incident postmortems"
+notification-dispatch    = "Send proactive alerts to Telegram or Slack when configurable thresholds are crossed"

@@ -840,6 +840,25 @@
   // -----------------------------------------------------------------------
   // Services
   // -----------------------------------------------------------------------
+  function severityBadge(severity) {
+    var s = String(severity || '').toLowerCase();
+    var cls = 'ctrl-badge ';
+    if (s === 'info') cls += 'ctrl-badge-ok';
+    else if (s === 'warning') cls += 'ctrl-badge-pending';
+    else if (s === 'error') cls += 'ctrl-badge-failed';
+    else cls += 'ctrl-badge-offline';
+    return '<span class="' + cls + '">' + BL.escapeHtml(s || 'unknown') + '</span>';
+  }
+
+  function formatEventDetails(details) {
+    if (!details || typeof details !== 'object') return '—';
+    var parts = [];
+    Object.keys(details).forEach(function (k) {
+      parts.push(BL.escapeHtml(k) + '=' + BL.escapeHtml(String(details[k])));
+    });
+    return parts.length ? '<small>' + parts.join(', ') + '</small>' : '—';
+  }
+
   function loadServices() {
     BL.fetchApi('/api/v1/services').then(function (data) {
       var services = (data && data.services) || [];
@@ -872,6 +891,30 @@
     }).catch(function (err) {
       var tb = document.getElementById('ctrl-services-tbody');
       if (tb) tb.innerHTML = '<tr><td colspan="6" style="color:var(--red)">Failed to load services: ' + BL.escapeHtml(err.message) + '</td></tr>';
+    });
+
+    // Load service events
+    BL.fetchApi('/api/v1/services/events?limit=20').then(function (data) {
+      var events = (data && data.events) || [];
+      var tb = document.getElementById('ctrl-service-events-tbody');
+      if (!tb) return;
+      if (!events.length) {
+        tb.innerHTML = emptyState('empty', 'No Events', 'No service events recorded yet.', 5);
+        return;
+      }
+      tb.innerHTML = events.map(function (evt) {
+        var time = evt.created_at ? new Date(evt.created_at).toLocaleString() : '—';
+        return '<tr>' +
+          '<td>' + BL.escapeHtml(time) + '</td>' +
+          '<td>' + BL.escapeHtml(evt.service || '') + '</td>' +
+          '<td>' + BL.escapeHtml(evt.event_type || '') + '</td>' +
+          '<td>' + severityBadge(evt.severity) + '</td>' +
+          '<td>' + formatEventDetails(evt.details) + '</td>' +
+          '</tr>';
+      }).join('');
+    }).catch(function (err) {
+      var tb = document.getElementById('ctrl-service-events-tbody');
+      if (tb) tb.innerHTML = '<tr><td colspan="5" style="color:var(--red)">Failed to load events: ' + BL.escapeHtml(err.message) + '</td></tr>';
     });
   }
 

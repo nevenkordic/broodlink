@@ -853,6 +853,42 @@ static TOOL_REGISTRY: std::sync::LazyLock<Vec<serde_json::Value>> = std::sync::L
                 "task_id": p_str("Task ID to mark failed"),
             }), &["task_id"]),
 
+            // --- Scheduled Tasks ---
+            tool_def("schedule_task", "Schedule a task to run at a future time, optionally recurring.", serde_json::json!({
+                "title": p_str("Task title"),
+                "description": p_str("Task description"),
+                "priority": p_int("Priority (higher = more urgent)"),
+                "formula_name": p_str("Optional formula to execute when task fires"),
+                "run_at": p_str("When to run (ISO 8601 datetime, e.g. 2026-02-25T10:00:00Z)"),
+                "recurrence_secs": p_int("Repeat interval in seconds (omit for one-shot)"),
+                "max_runs": p_int("Maximum number of runs (omit for unlimited)"),
+            }), &["title", "run_at"]),
+            tool_def("list_scheduled_tasks", "List active scheduled tasks.", serde_json::json!({
+                "limit": p_int("Number of tasks (default 50)"),
+            }), &[]),
+            tool_def("cancel_scheduled_task", "Cancel (disable) a scheduled task.", serde_json::json!({
+                "id": p_int("Scheduled task ID to cancel"),
+            }), &["id"]),
+
+            // --- Notifications ---
+            tool_def("send_notification", "Send a notification to a channel immediately.", serde_json::json!({
+                "channel": p_str("Delivery channel: telegram or slack"),
+                "target": p_str("Chat ID (telegram) or webhook URL (slack)"),
+                "message": p_str("Message text to send"),
+            }), &["channel", "target", "message"]),
+            tool_def("create_notification_rule", "Create an automated notification rule.", serde_json::json!({
+                "name": p_str("Unique rule name"),
+                "condition_type": p_str("Condition: service_event_error, dlq_spike, budget_low"),
+                "condition_config": p_str("JSON config: {threshold, window_minutes, auto_postmortem}"),
+                "channel": p_str("Delivery channel: telegram or slack"),
+                "target": p_str("Chat ID (telegram) or webhook URL (slack)"),
+                "template": p_str("Message template with {{count}}, {{agents}}, {{type}} placeholders"),
+                "cooldown_minutes": p_int("Minimum minutes between alerts (default 30)"),
+            }), &["name", "condition_type", "channel", "target"]),
+            tool_def("list_notification_rules", "List notification rules.", serde_json::json!({
+                "limit": p_int("Number of rules (default 50)"),
+            }), &[]),
+
             // --- Agent ---
             tool_def("agent_upsert", "Register or update an agent profile.", serde_json::json!({
                 "agent_id": p_str("Unique agent identifier"),
@@ -1387,6 +1423,16 @@ async fn tool_dispatch(
         "claim_task" => tool_claim_task(&state, agent_id, params).await,
         "complete_task" => tool_complete_task(&state, agent_id, params).await,
         "fail_task" => tool_fail_task(&state, agent_id, params).await,
+
+        // --- Scheduled Tasks (Postgres) ---
+        "schedule_task" => tool_schedule_task(&state, agent_id, params).await,
+        "list_scheduled_tasks" => tool_list_scheduled_tasks(&state, params).await,
+        "cancel_scheduled_task" => tool_cancel_scheduled_task(&state, params).await,
+
+        // --- Notifications (Postgres + NATS) ---
+        "send_notification" => tool_send_notification(&state, params).await,
+        "create_notification_rule" => tool_create_notification_rule(&state, params).await,
+        "list_notification_rules" => tool_list_notification_rules(&state, params).await,
 
         // --- Agent (Dolt) ---
         "agent_upsert" => tool_agent_upsert(&state, agent_id, params).await,
@@ -4260,6 +4306,266 @@ async fn tool_fail_task(
 }
 
 // ---------------------------------------------------------------------------
+// Scheduled task tools (Postgres: scheduled_tasks)
+// ---------------------------------------------------------------------------
+
+async fn tool_schedule_task(
+    state: &AppState,
+    agent_id: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let title = param_str(params, "title")?;
+    let description = param_str_opt(params, "description").unwrap_or_default();
+    let priority = param_i64_opt(params, "priority").unwrap_or(0);
+    let formula_name = param_str_opt(params, "formula_name");
+    let run_at_str = param_str(params, "run_at")?;
+    let recurrence_secs = param_i64_opt(params, "recurrence_secs");
+    let max_runs = param_i64_opt(params, "max_runs");
+
+    // Parse ISO 8601 datetime
+    let run_at = chrono::DateTime::parse_from_rfc3339(run_at_str)
+        .map_err(|e| BroodlinkError::Validation {
+            field: "run_at".into(),
+            message: format!("invalid ISO 8601 datetime: {e}"),
+        })?;
+
+    let row: (i64,) = sqlx::query_as(
+        "INSERT INTO scheduled_tasks (title, description, priority, formula_name, next_run_at,
+                recurrence_secs, max_runs, created_by, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+         RETURNING id",
+    )
+    .bind(title)
+    .bind(&description)
+    .bind(priority as i32)
+    .bind(formula_name)
+    .bind(run_at)
+    .bind(recurrence_secs)
+    .bind(max_runs.map(|v| v as i32))
+    .bind(agent_id)
+    .fetch_one(&state.pg)
+    .await?;
+
+    Ok(serde_json::json!({
+        "id": row.0,
+        "title": title,
+        "next_run_at": run_at.to_rfc3339(),
+        "recurring": recurrence_secs.is_some(),
+    }))
+}
+
+async fn tool_list_scheduled_tasks(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(50));
+
+    let rows: Vec<(i64, String, Option<String>, i32, Option<String>, String, Option<i64>, i32, Option<i32>, String)> =
+        sqlx::query_as(
+            "SELECT id, title, description, priority, formula_name, next_run_at::text,
+                    recurrence_secs, run_count, max_runs, created_at::text
+             FROM scheduled_tasks
+             WHERE enabled = TRUE
+             ORDER BY next_run_at ASC
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&state.pg)
+        .await?;
+
+    let tasks: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(id, title, desc, priority, formula, next_run, recurrence, runs, max, created)| {
+            serde_json::json!({
+                "id": id,
+                "title": title,
+                "description": desc.unwrap_or_default(),
+                "priority": priority,
+                "formula_name": formula,
+                "next_run_at": next_run,
+                "recurrence_secs": recurrence,
+                "run_count": runs,
+                "max_runs": max,
+                "created_at": created,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({ "scheduled_tasks": tasks }))
+}
+
+async fn tool_cancel_scheduled_task(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let id = param_i64(params, "id")?;
+
+    let affected = sqlx::query("UPDATE scheduled_tasks SET enabled = FALSE WHERE id = $1 AND enabled = TRUE")
+        .bind(id)
+        .execute(&state.pg)
+        .await?;
+
+    if affected.rows_affected() == 0 {
+        return Err(BroodlinkError::NotFound(format!(
+            "scheduled task {id} not found or already disabled"
+        )));
+    }
+
+    Ok(serde_json::json!({ "id": id, "cancelled": true }))
+}
+
+// ---------------------------------------------------------------------------
+// Notification tools (Postgres: notification_rules, notification_log)
+// ---------------------------------------------------------------------------
+
+async fn tool_send_notification(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let channel = param_str(params, "channel")?;
+    let target = param_str(params, "target")?;
+    let message = param_str(params, "message")?;
+
+    if !matches!(channel, "telegram" | "slack") {
+        return Err(BroodlinkError::Validation {
+            field: "channel".into(),
+            message: "channel must be 'telegram' or 'slack'".into(),
+        });
+    }
+
+    // Insert log entry
+    let row: (i64,) = sqlx::query_as(
+        "INSERT INTO notification_log (channel, target, message, status, created_at)
+         VALUES ($1, $2, $3, 'pending', NOW())
+         RETURNING id",
+    )
+    .bind(channel)
+    .bind(target)
+    .bind(message)
+    .fetch_one(&state.pg)
+    .await?;
+
+    // Publish NATS event for a2a-gateway delivery
+    let subject = format!(
+        "{}.{}.notification.send",
+        state.config.nats.subject_prefix, state.config.broodlink.env,
+    );
+    let payload = serde_json::json!({
+        "log_id": row.0,
+        "channel": channel,
+        "target": target,
+        "message": message,
+    });
+    if let Ok(bytes) = serde_json::to_vec(&payload) {
+        if let Err(e) = state.nats.publish(subject, bytes.into()).await {
+            warn!(error = %e, "failed to publish notification event");
+        }
+    }
+
+    Ok(serde_json::json!({
+        "id": row.0,
+        "channel": channel,
+        "status": "pending",
+    }))
+}
+
+async fn tool_create_notification_rule(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let name = param_str(params, "name")?;
+    let condition_type = param_str(params, "condition_type")?;
+    let channel = param_str(params, "channel")?;
+    let target = param_str(params, "target")?;
+    let template = param_str_opt(params, "template");
+    let cooldown = param_i64_opt(params, "cooldown_minutes")
+        .unwrap_or(state.config.notifications.default_cooldown_minutes as i64);
+
+    if !matches!(condition_type, "service_event_error" | "dlq_spike" | "budget_low") {
+        return Err(BroodlinkError::Validation {
+            field: "condition_type".into(),
+            message: "must be: service_event_error, dlq_spike, or budget_low".into(),
+        });
+    }
+
+    // Parse condition_config from string or use as-is
+    let condition_config = params
+        .get("condition_config")
+        .and_then(|v| {
+            if let Some(s) = v.as_str() {
+                serde_json::from_str::<serde_json::Value>(s).ok()
+            } else if v.is_object() {
+                Some(v.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let row: (i64,) = sqlx::query_as(
+        "INSERT INTO notification_rules (name, condition_type, condition_config, channel, target,
+                template, cooldown_minutes, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+         RETURNING id",
+    )
+    .bind(name)
+    .bind(condition_type)
+    .bind(&condition_config)
+    .bind(channel)
+    .bind(target)
+    .bind(template)
+    .bind(cooldown as i32)
+    .fetch_one(&state.pg)
+    .await?;
+
+    Ok(serde_json::json!({
+        "id": row.0,
+        "name": name,
+        "created": true,
+    }))
+}
+
+async fn tool_list_notification_rules(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(50));
+
+    let rows: Vec<(i64, String, String, serde_json::Value, String, String, Option<String>, i32, bool, Option<String>, String)> =
+        sqlx::query_as(
+            "SELECT id, name, condition_type, condition_config, channel, target,
+                    template, cooldown_minutes, enabled, last_triggered_at::text, created_at::text
+             FROM notification_rules
+             ORDER BY created_at DESC
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&state.pg)
+        .await?;
+
+    let rules: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(id, name, ctype, cconfig, channel, target, template, cooldown, enabled, last_triggered, created)| {
+            serde_json::json!({
+                "id": id,
+                "name": name,
+                "condition_type": ctype,
+                "condition_config": cconfig,
+                "channel": channel,
+                "target": target,
+                "template": template,
+                "cooldown_minutes": cooldown,
+                "enabled": enabled,
+                "last_triggered_at": last_triggered,
+                "created_at": created,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({ "notification_rules": rules }))
+}
+
+// ---------------------------------------------------------------------------
 // Agent tools (Dolt: agent_profiles)
 // ---------------------------------------------------------------------------
 
@@ -4778,6 +5084,8 @@ fn is_readonly_tool(tool: &str) -> bool {
             | "list_chat_sessions"
             | "list_formulas"
             | "get_formula"
+            | "list_scheduled_tasks"
+            | "list_notification_rules"
     )
 }
 
@@ -7985,8 +8293,8 @@ mod tests {
         // Must match the number of match arms in tool_dispatch (excluding the _ fallback)
         assert_eq!(
             TOOL_REGISTRY.len(),
-            84,
-            "tool registry should have 84 tools"
+            90,
+            "tool registry should have 90 tools"
         );
     }
 

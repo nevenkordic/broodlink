@@ -596,6 +596,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/telegram/disconnect", post(handler_telegram_disconnect))
         // Service health aggregation
         .route("/services", get(handler_services))
+        .route("/services/events", get(handler_service_events))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
@@ -1181,6 +1182,48 @@ async fn handler_services(
     }
 
     Ok(ok_response(serde_json::json!({ "services": services })))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/services/events
+// Recent service-level events (model degradation, recovery, etc.)
+// ---------------------------------------------------------------------------
+
+async fn handler_service_events(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let limit: i64 = clamp_limit(
+        params
+            .get("limit")
+            .and_then(|l| l.parse().ok())
+            .unwrap_or(50),
+    );
+
+    let rows: Vec<(i64, String, String, String, Option<serde_json::Value>, String)> =
+        sqlx::query_as(
+            "SELECT id, service, event_type, severity, details, created_at::text \
+             FROM service_events ORDER BY created_at DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&state.pg)
+        .await?;
+
+    let events: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(id, service, event_type, severity, details, created_at)| {
+            serde_json::json!({
+                "id": id,
+                "service": service,
+                "event_type": event_type,
+                "severity": severity,
+                "details": details,
+                "created_at": created_at,
+            })
+        })
+        .collect();
+
+    Ok(ok_response(serde_json::json!({ "events": events })))
 }
 
 // ---------------------------------------------------------------------------

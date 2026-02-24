@@ -418,6 +418,8 @@ async fn async_main() {
             });
 
             // task_failed
+            let nc3 = nc2.clone(); // clone for notification subscriber
+            let st_notify = Arc::clone(&st); // clone before st moves into task_failed
             let subj_failed = format!("{prefix}.*.coordinator.task_failed");
             tokio::spawn(async move {
                 match nc2.subscribe(subj_failed.clone()).await {
@@ -445,6 +447,92 @@ async fn async_main() {
                     }
                     Err(e) => {
                         error!(error = %e, "failed to subscribe to task_failed");
+                    }
+                }
+            });
+
+            // notification dispatch
+            let nc_notify = nc3;
+            let env = config.broodlink.env.clone();
+            let subj_notify = format!("{prefix}.{env}.notification.send");
+            tokio::spawn(async move {
+                match nc_notify.subscribe(subj_notify.clone()).await {
+                    Ok(mut sub) => {
+                        info!(subject = %subj_notify, "subscribed for notification dispatch");
+                        while let Some(msg) = sub.next().await {
+                            if let Ok(payload) =
+                                serde_json::from_slice::<serde_json::Value>(&msg.payload)
+                            {
+                                let channel = payload
+                                    .get("channel")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let target = payload
+                                    .get("target")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let message = payload
+                                    .get("message")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let log_id = payload
+                                    .get("log_id")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(0);
+
+                                if channel.is_empty() || target.is_empty() || message.is_empty() {
+                                    warn!("notification event missing required fields");
+                                    continue;
+                                }
+
+                                let result = match channel {
+                                    "telegram" => {
+                                        deliver_notification_telegram(&st_notify, target, message)
+                                            .await
+                                    }
+                                    "slack" => {
+                                        deliver_notification_slack(&st_notify, target, message)
+                                            .await
+                                    }
+                                    _ => Err(format!("unknown notification channel: {channel}")),
+                                };
+
+                                let (status, error_msg) = match &result {
+                                    Ok(()) => ("sent", None),
+                                    Err(e) => ("failed", Some(e.as_str())),
+                                };
+
+                                if let Err(e) = sqlx::query(
+                                    "UPDATE notification_log SET status = $1, error_msg = $2
+                                     WHERE id = $3",
+                                )
+                                .bind(status)
+                                .bind(error_msg)
+                                .bind(log_id)
+                                .execute(&st_notify.pg)
+                                .await
+                                {
+                                    warn!(error = %e, log_id = log_id, "failed to update notification_log");
+                                }
+
+                                match result {
+                                    Ok(()) => info!(
+                                        channel = %channel,
+                                        target = %target,
+                                        "notification delivered"
+                                    ),
+                                    Err(ref e) => warn!(
+                                        channel = %channel,
+                                        target = %target,
+                                        error = %e,
+                                        "notification delivery failed"
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "failed to subscribe for notification dispatch");
                     }
                 }
             });
@@ -3002,6 +3090,29 @@ async fn send_ollama_request(
 /// How long to stay in degraded mode before retrying the primary model.
 const DEGRADED_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Persist a service-level event to Postgres for post-mortem analysis.
+async fn log_service_event(
+    pg: &sqlx::PgPool,
+    service: &str,
+    event_type: &str,
+    severity: &str,
+    details: serde_json::Value,
+) {
+    if let Err(e) = sqlx::query(
+        "INSERT INTO service_events (service, event_type, severity, details, created_at) \
+         VALUES ($1, $2, $3, $4, NOW())",
+    )
+    .bind(service)
+    .bind(event_type)
+    .bind(severity)
+    .bind(&details)
+    .execute(pg)
+    .await
+    {
+        warn!(error = %e, "failed to log service event");
+    }
+}
+
 /// Attempt to recover from an Ollama model error by unloading the failed model
 /// to free memory, then retrying it. If recovery fails, enters degraded mode
 /// and answers the user's question using the fallback model directly.
@@ -3017,22 +3128,45 @@ async fn handle_ollama_recovery(
     let ollama_url = &state.config.ollama.url;
     let num_ctx = state.config.ollama.num_ctx;
 
-    // Step 1: Unload the failed model to free memory
-    info!(model = %primary_model, "unloading model to free memory");
-    let unload_payload = serde_json::json!({
-        "model": primary_model,
-        "keep_alive": 0,
-    });
+    // Step 1: Unload all known models to maximize free memory for the primary.
+    // We explicitly unload the primary (just failed), fallback, and any models
+    // reported by /api/ps. This ensures resident models don't block recovery.
     let unload_url = format!("{ollama_url}/api/generate");
-    match state
-        .ollama_client
-        .post(&unload_url)
-        .json(&unload_payload)
-        .send()
-        .await
+    let mut models_to_unload = vec![primary_model.to_string()];
+    if !fallback_model.is_empty() && fallback_model != primary_model {
+        models_to_unload.push(fallback_model.to_string());
+    }
+    // Also discover any other resident models (e.g. embedding)
+    let ps_url = format!("{ollama_url}/api/ps");
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        state.ollama_client.get(&ps_url).send(),
+    )
+    .await
     {
-        Ok(_) => info!(model = %primary_model, "model unload requested"),
-        Err(e) => warn!(model = %primary_model, error = %e, "failed to request model unload"),
+        Ok(Ok(resp)) => {
+            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                if let Some(arr) = body.get("models").and_then(|m| m.as_array()) {
+                    for m in arr {
+                        if let Some(name) = m.get("name").and_then(|n| n.as_str()) {
+                            if !models_to_unload.iter().any(|x| x == name) {
+                                models_to_unload.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Err(e)) => warn!(error = %e, "failed to query /api/ps"),
+        Err(_) => warn!("timeout querying /api/ps"),
+    }
+    info!(count = models_to_unload.len(), models = ?models_to_unload, "unloading models to free memory");
+    for model_name in &models_to_unload {
+        let payload = serde_json::json!({ "model": model_name, "keep_alive": 0 });
+        match state.ollama_client.post(&unload_url).json(&payload).send().await {
+            Ok(_) => info!(model = %model_name, "model unload requested"),
+            Err(e) => warn!(model = %model_name, error = %e, "failed to request model unload"),
+        }
     }
 
     // Step 2: Wait for memory to settle
@@ -3063,8 +3197,24 @@ async fn handle_ollama_recovery(
                 if !cleaned.is_empty() {
                     // Primary recovered — clear degraded flag if it was set
                     if state.primary_model_degraded.swap(false, Ordering::Relaxed) {
-                        *state.degraded_since.write().await = None;
+                        let degraded_secs = {
+                            let mut ds = state.degraded_since.write().await;
+                            let secs = ds.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                            *ds = None;
+                            secs
+                        };
                         info!(model = %primary_model, "primary model recovered — leaving degraded mode");
+                        log_service_event(
+                            &state.pg,
+                            "a2a-gateway",
+                            "model_degraded_recover",
+                            "info",
+                            serde_json::json!({
+                                "model": primary_model,
+                                "degraded_seconds": degraded_secs,
+                            }),
+                        )
+                        .await;
                     }
                     return cleaned;
                 }
@@ -3096,6 +3246,18 @@ async fn handle_ollama_recovery(
             "entering degraded mode — routing chat to fallback model for {}s",
             DEGRADED_RETRY_INTERVAL.as_secs()
         );
+        log_service_event(
+            &state.pg,
+            "a2a-gateway",
+            "model_degraded_enter",
+            "warning",
+            serde_json::json!({
+                "model": primary_model,
+                "fallback": fallback_model,
+                "error": _error_msg,
+            }),
+        )
+        .await;
     }
 
     // Step 5: Answer using the fallback model (not just a status message)
@@ -3249,6 +3411,14 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
              When you do search, cite your sources.",
         );
     }
+    if chat_cfg.memory_enabled {
+        system_prompt.push_str(
+            " You have a remember tool. Use it to save important facts the user tells you \
+             about themselves, their preferences, or things they explicitly ask you to remember. \
+             Call remember with a short topic and the content to store. \
+             Do NOT remember every message — only save noteworthy personal facts or explicit requests.",
+        );
+    }
     system_prompt.push_str(" If you don't know something and can't look it up, say so honestly.");
 
     // Enrich system prompt with relevant memories from the agent-ledger
@@ -3273,9 +3443,59 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
         }
     }
 
+    // Tool definitions — conditionally include web_search and remember
+    let mut tools_vec: Vec<serde_json::Value> = Vec::new();
+    if tools_available {
+        tools_vec.push(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web for current information, recent events, or facts you are unsure about.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["query"],
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The search query"
+                        }
+                    }
+                }
+            }
+        }));
+    }
+    if chat_cfg.memory_enabled {
+        tools_vec.push(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "remember",
+                "description": "Save an important fact, preference, or piece of information to persistent memory.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["topic", "content"],
+                    "properties": {
+                        "topic": {
+                            "type": "string",
+                            "description": "Short topic label (e.g. 'user-name', 'preference-timezone')"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "The information to remember"
+                        }
+                    }
+                }
+            }
+        }));
+    }
+    let tools_def = if tools_vec.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!(tools_vec))
+    };
+
     // Build message array: system prompt + conversation history
     // Limit context when tools are active to keep prompt size manageable for CPU inference
-    let max_history = if tools_available {
+    let max_history = if tools_def.is_some() {
         tool_cfg.tool_context_messages as usize
     } else {
         history.len()
@@ -3297,29 +3517,6 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
         }));
     }
 
-    // Tool definitions
-    let tools_def = if tools_available {
-        Some(serde_json::json!([{
-            "type": "function",
-            "function": {
-                "name": "web_search",
-                "description": "Search the web for current information, recent events, or facts you are unsure about.",
-                "parameters": {
-                    "type": "object",
-                    "required": ["query"],
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "The search query"
-                        }
-                    }
-                }
-            }
-        }]))
-    } else {
-        None
-    };
-
     let max_rounds = tool_cfg.max_tool_rounds;
     let model = &chat_cfg.chat_model;
     let fallback = &chat_cfg.chat_fallback_model;
@@ -3333,6 +3530,28 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
         };
         if should_retry {
             info!(model = %model, "degraded cooldown expired — probing primary model");
+            log_service_event(
+                &state.pg,
+                "a2a-gateway",
+                "model_degraded_probe",
+                "info",
+                serde_json::json!({
+                    "model": model,
+                    "cooldown_seconds": DEGRADED_RETRY_INTERVAL.as_secs(),
+                }),
+            )
+            .await;
+            // Unload the fallback model to free memory for the primary
+            let unload_url = format!("{}/api/generate", &state.config.ollama.url);
+            let unload_payload = serde_json::json!({
+                "model": fallback,
+                "keep_alive": 0,
+            });
+            match state.ollama_client.post(&unload_url).json(&unload_payload).send().await {
+                Ok(_) => info!(model = %fallback, "unloaded fallback model before probing primary"),
+                Err(e) => warn!(model = %fallback, error = %e, "failed to unload fallback model"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             // Clear flag optimistically; handle_ollama_recovery re-sets it on failure
             state.primary_model_degraded.store(false, Ordering::Relaxed);
             *state.degraded_since.write().await = None;
@@ -3510,6 +3729,51 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
                                 }
                             } else {
                                 "Search unavailable: no API key configured.".to_string()
+                            }
+                        }
+                        "remember" => {
+                            let parsed = args_raw
+                                .and_then(|a| {
+                                    if let Some(s) = a.as_str() {
+                                        serde_json::from_str::<serde_json::Value>(s).ok()
+                                    } else {
+                                        Some(a.clone())
+                                    }
+                                })
+                                .unwrap_or_default();
+                            let topic = parsed
+                                .get("topic")
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("chat-note")
+                                .to_string();
+                            let content = parsed
+                                .get("content")
+                                .and_then(|c| c.as_str())
+                                .unwrap_or("")
+                                .to_string();
+
+                            if content.is_empty() {
+                                "Error: content is required for remember tool.".to_string()
+                            } else {
+                                match bridge_call(
+                                    state,
+                                    "store_memory",
+                                    serde_json::json!({
+                                        "topic": topic,
+                                        "content": content,
+                                    }),
+                                )
+                                .await
+                                {
+                                    Ok(_) => {
+                                        info!(topic = %topic, "stored memory via remember tool");
+                                        format!("Remembered: {topic}")
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, topic = %topic, "remember tool failed");
+                                        format!("Failed to remember: {e}")
+                                    }
+                                }
                             }
                         }
                         _ => format!("Unknown tool: {name}"),
@@ -3816,6 +4080,38 @@ async fn deliver_telegram(
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         return Err(format!("telegram API returned {status}: {body}"));
+    }
+    Ok(())
+}
+
+/// Deliver a proactive notification via Telegram (no session required).
+async fn deliver_notification_telegram(
+    state: &AppState,
+    chat_id: &str,
+    text: &str,
+) -> Result<(), String> {
+    deliver_telegram(state, chat_id, None, text).await
+}
+
+/// Deliver a proactive notification via Slack incoming webhook.
+async fn deliver_notification_slack(
+    state: &AppState,
+    webhook_url: &str,
+    text: &str,
+) -> Result<(), String> {
+    let payload = serde_json::json!({ "text": text });
+    let resp = state
+        .http_client
+        .post(webhook_url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("slack webhook returned {status}: {body}"));
     }
     Ok(())
 }
