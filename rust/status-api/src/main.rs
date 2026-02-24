@@ -634,6 +634,10 @@ async fn security_headers_middleware(req: Request<axum::body::Body>, next: Next)
         "Permissions-Policy",
         header::HeaderValue::from_static("geolocation=(), microphone=(), camera=()"),
     );
+    headers.insert(
+        "Strict-Transport-Security",
+        header::HeaderValue::from_static("max-age=63072000; includeSubDomains"),
+    );
     resp
 }
 

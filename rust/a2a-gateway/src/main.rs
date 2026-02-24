@@ -169,8 +169,10 @@ fn load_dotenv() {
                 if let Some((key, val)) = line.split_once('=') {
                     let key = key.trim();
                     let val = val.trim();
-                    // Safe: called from single-threaded main before tokio runtime.
-                    // set_var is only unsafe when other threads may read env concurrently.
+                    // SAFETY: load_dotenv() is called from main() before
+                    // tokio::runtime::Builder::build(), so no other threads exist.
+                    // set_var is unsafe in edition 2024 due to potential data races
+                    // with concurrent getenv, but here we are strictly single-threaded.
                     unsafe {
                         std::env::set_var(key, val);
                     }
@@ -607,6 +609,10 @@ async fn security_headers_middleware(req: Request<axum::body::Body>, next: Next)
     headers.insert(
         "Permissions-Policy",
         header::HeaderValue::from_static("geolocation=(), microphone=(), camera=()"),
+    );
+    headers.insert(
+        "Strict-Transport-Security",
+        header::HeaderValue::from_static("max-age=63072000; includeSubDomains"),
     );
     resp
 }
@@ -3123,8 +3129,19 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
                                             cache_key,
                                             (result.clone(), std::time::Instant::now()),
                                         );
+                                        // Evict expired entries when soft limit exceeded
                                         if guard.len() > 100 {
                                             guard.retain(|_, (_, ts)| ts.elapsed() < cache_ttl);
+                                        }
+                                        // Hard cap: if still over 200 after TTL eviction, drop oldest
+                                        if guard.len() > 200 {
+                                            if let Some(oldest_key) = guard
+                                                .iter()
+                                                .min_by_key(|(_, (_, ts))| *ts)
+                                                .map(|(k, _)| k.clone())
+                                            {
+                                                guard.remove(&oldest_key);
+                                            }
                                         }
                                     }
                                     result
