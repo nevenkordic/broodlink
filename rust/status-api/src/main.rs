@@ -56,6 +56,18 @@ use uuid::Uuid;
 const SERVICE_NAME: &str = "status-api";
 const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Constant-time byte comparison to prevent timing side-channels on secret comparison.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -369,6 +381,8 @@ async fn init_state() -> Result<AppState, StatusApiError> {
         .min_connections(config.dolt.min_connections)
         .max_connections(config.dolt.max_connections)
         .acquire_timeout(Duration::from_secs(5))
+        .idle_timeout(Duration::from_secs(300))
+        .max_lifetime(Duration::from_secs(1800))
         .connect(&dolt_url)
         .await?;
     info!("dolt pool connected");
@@ -386,6 +400,8 @@ async fn init_state() -> Result<AppState, StatusApiError> {
         .min_connections(config.postgres.min_connections)
         .max_connections(config.postgres.max_connections)
         .acquire_timeout(Duration::from_secs(5))
+        .idle_timeout(Duration::from_secs(300))
+        .max_lifetime(Duration::from_secs(1800))
         .connect(&pg_url)
         .await?;
     info!("postgres pool connected");
@@ -422,7 +438,7 @@ async fn shutdown_signal() {
 
 fn build_router(state: Arc<AppState>) -> Router {
     // Build CORS layer from config origins
-    let cors = build_cors_layer(&state.config.status_api.cors_origins);
+    let cors = build_cors_layer(&state.config.status_api.cors_origins, &state.config.broodlink.env);
 
     let api_routes = Router::new()
         .route("/agents", get(handler_agents))
@@ -526,6 +542,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .nest("/api/v1", api_routes)
         .nest("/api/v1", auth_routes)
         .layer(middleware::from_fn(security_headers_middleware))
+        .layer(axum::extract::DefaultBodyLimit::max(10_485_760)) // 10 MiB
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(cors)
 }
@@ -545,7 +562,7 @@ async fn security_headers_middleware(req: Request<axum::body::Body>, next: Next)
     resp
 }
 
-fn build_cors_layer(origins: &[String]) -> CorsLayer {
+fn build_cors_layer(origins: &[String], env: &str) -> CorsLayer {
     let api_key_header = HeaderName::from_static("x-broodlink-api-key");
     let session_header = HeaderName::from_static("x-broodlink-session");
     let allowed_headers = [
@@ -556,6 +573,10 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
     ];
 
     if origins.is_empty() {
+        if env != "dev" {
+            error!("status_api.cors_origins is empty in non-dev environment — refusing to start");
+            process::exit(1);
+        }
         warn!("status_api.cors_origins is empty — defaulting to http://localhost:1313 for dev");
         let localhost = "http://localhost:1313"
             .parse::<header::HeaderValue>()
@@ -643,7 +664,7 @@ async fn auth_middleware(
         .get("X-Broodlink-Api-Key")
         .and_then(|v| v.to_str().ok())
     {
-        if provided_key == state.api_key {
+        if constant_time_eq(provided_key.as_bytes(), state.api_key.as_bytes()) {
             req.extensions_mut().insert(AuthContext {
                 role: UserRole::Admin,
                 user_id: None,
@@ -837,9 +858,9 @@ async fn handler_convoys(
         "SELECT
              convoy_id,
              COUNT(*) AS total,
-             SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open_count,
-             SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) AS in_progress_count,
-             SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) AS closed_count
+             CAST(SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS SIGNED) AS open_count,
+             CAST(SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) AS SIGNED) AS in_progress_count,
+             CAST(SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) AS SIGNED) AS closed_count
          FROM beads_issues
          GROUP BY convoy_id
          ORDER BY total DESC",

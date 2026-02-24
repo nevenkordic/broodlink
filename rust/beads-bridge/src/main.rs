@@ -454,7 +454,7 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
 
     let mut jwt_validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
     jwt_validation.validate_exp = true;
-    jwt_validation.leeway = 300; // 5 minutes clock skew tolerance
+    jwt_validation.leeway = 60; // 60 seconds clock skew tolerance
     jwt_validation.set_required_spec_claims(&["sub", "agent_id", "exp", "iat"]);
 
     // Dolt (MySQL) pool
@@ -466,6 +466,8 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
         .min_connections(config.dolt.min_connections)
         .max_connections(config.dolt.max_connections)
         .acquire_timeout(Duration::from_secs(5))
+        .idle_timeout(Duration::from_secs(300))
+        .max_lifetime(Duration::from_secs(1800))
         .connect(&dolt_url)
         .await?;
     info!("dolt pool connected");
@@ -483,6 +485,8 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
         .min_connections(config.postgres.min_connections)
         .max_connections(config.postgres.max_connections)
         .acquire_timeout(Duration::from_secs(5))
+        .idle_timeout(Duration::from_secs(300))
+        .max_lifetime(Duration::from_secs(1800))
         .connect(&pg_url)
         .await?;
     info!("postgres pool connected");
@@ -490,11 +494,18 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
     // NATS client (cluster-aware via broodlink-runtime)
     let nats = broodlink_runtime::connect_nats(&config.nats).await?;
 
-    // Rate limiter from config
-    let rate_limiter = RateLimiter::new(
-        config.rate_limits.requests_per_minute_per_agent,
-        config.rate_limits.burst,
-    );
+    // Rate limiter from config (validate bounds)
+    let rpm = config.rate_limits.requests_per_minute_per_agent;
+    let burst = config.rate_limits.burst;
+    if rpm == 0 || rpm > 10_000 {
+        error!("invalid rate_limits.requests_per_minute_per_agent: {rpm} (must be 1–10000)");
+        process::exit(1);
+    }
+    if burst == 0 || burst > 1_000 {
+        error!("invalid rate_limits.burst: {burst} (must be 1–1000)");
+        process::exit(1);
+    }
+    let rate_limiter = RateLimiter::new(rpm, burst);
 
     // Read replica pool (optional)
     let pg_read = if !config.postgres_read_replicas.urls.is_empty() {
@@ -503,6 +514,8 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
             .min_connections(1)
             .max_connections(5)
             .acquire_timeout(Duration::from_secs(3))
+            .idle_timeout(Duration::from_secs(300))
+            .max_lifetime(Duration::from_secs(1800))
             .connect(replica_url)
             .await
         {
@@ -1128,10 +1141,18 @@ async fn auth_middleware(
         if let Some(ref kid) = header_kid {
             // Try the specific key matching the kid
             if let Some((_, key)) = state.jwt_decoding_keys.iter().find(|(k, _)| k == kid) {
-                jsonwebtoken::decode::<Claims>(token, key, &state.jwt_validation)
-                    .map_err(|e| BroodlinkError::Auth(format!("invalid token (kid={kid}): {e}")))?
+                match jsonwebtoken::decode::<Claims>(token, key, &state.jwt_validation) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        let msg = format!("invalid token (kid={kid}): {e}");
+                        log_auth_failure(&state.pg, &msg).await;
+                        return Err(BroodlinkError::Auth(msg));
+                    }
+                }
             } else {
-                return Err(BroodlinkError::Auth(format!("unknown key id: {kid}")));
+                let msg = format!("unknown key id: {kid}");
+                log_auth_failure(&state.pg, &msg).await;
+                return Err(BroodlinkError::Auth(msg));
             }
         } else {
             // No kid in header — try all keys (backward compatibility)
@@ -1146,7 +1167,14 @@ async fn auth_middleware(
                     Err(e) => last_err = e.to_string(),
                 }
             }
-            result.ok_or_else(|| BroodlinkError::Auth(format!("invalid token: {last_err}")))?
+            match result {
+                Some(data) => data,
+                None => {
+                    let msg = format!("invalid token: {last_err}");
+                    log_auth_failure(&state.pg, &msg).await;
+                    return Err(BroodlinkError::Auth(msg));
+                }
+            }
         }
     };
 
@@ -1489,6 +1517,19 @@ async fn write_audit_log(
     Ok(())
 }
 
+/// Fire-and-forget audit entry for authentication failures.
+async fn log_auth_failure(pg: &PgPool, reason: &str) {
+    let trace_id = Uuid::new_v4().to_string();
+    let _ = sqlx::query(
+        "INSERT INTO audit_log (trace_id, agent_id, service, operation, result_status, result_summary, created_at)
+         VALUES ($1, 'unknown', 'beads-bridge', 'auth', 'error', $2, NOW())",
+    )
+    .bind(&trace_id)
+    .bind(reason)
+    .execute(pg)
+    .await;
+}
+
 // ---------------------------------------------------------------------------
 // Outbox helper (Postgres) — for memory operations → embedding pipeline
 // ---------------------------------------------------------------------------
@@ -1515,18 +1556,87 @@ async fn write_outbox(
 // Param extraction helpers
 // ---------------------------------------------------------------------------
 
+/// Maximum byte length for short text fields (topic, title, agent_id, etc.)
+const MAX_SHORT_TEXT: usize = 512;
+/// Maximum byte length for long text fields (content, description, reasoning, etc.)
+const MAX_LONG_TEXT: usize = 100_000;
+
+/// Valid entity types for the knowledge graph.
+const VALID_ENTITY_TYPES: &[&str] = &[
+    "person",
+    "service",
+    "concept",
+    "location",
+    "technology",
+    "organization",
+    "event",
+    "other",
+];
+
+/// Validate optional entity_type parameter.
+fn validate_entity_type(entity_type: Option<&str>) -> Result<Option<&str>, BroodlinkError> {
+    match entity_type {
+        None => Ok(None),
+        Some(et) => {
+            if VALID_ENTITY_TYPES.contains(&et) {
+                Ok(Some(et))
+            } else {
+                Err(BroodlinkError::Validation {
+                    field: "entity_type".to_string(),
+                    message: format!(
+                        "invalid entity_type '{et}'; must be one of: {}",
+                        VALID_ENTITY_TYPES.join(", ")
+                    ),
+                })
+            }
+        }
+    }
+}
+
 fn param_str<'a>(params: &'a serde_json::Value, field: &str) -> Result<&'a str, BroodlinkError> {
-    params
+    let val = params
         .get(field)
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| BroodlinkError::Validation {
             field: field.to_string(),
             message: "required string field".to_string(),
-        })
+        })?;
+    if val.len() > MAX_LONG_TEXT {
+        return Err(BroodlinkError::Validation {
+            field: field.to_string(),
+            message: format!("exceeds maximum length of {MAX_LONG_TEXT} bytes"),
+        });
+    }
+    Ok(val)
 }
 
 fn param_str_opt<'a>(params: &'a serde_json::Value, field: &str) -> Option<&'a str> {
-    params.get(field).and_then(serde_json::Value::as_str)
+    let val = params.get(field).and_then(serde_json::Value::as_str)?;
+    if val.len() > MAX_LONG_TEXT {
+        return None;
+    }
+    Some(val)
+}
+
+/// Extract a required string field with a short-text length limit (512 bytes).
+fn param_str_short<'a>(
+    params: &'a serde_json::Value,
+    field: &str,
+) -> Result<&'a str, BroodlinkError> {
+    let val = params
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| BroodlinkError::Validation {
+            field: field.to_string(),
+            message: "required string field".to_string(),
+        })?;
+    if val.len() > MAX_SHORT_TEXT {
+        return Err(BroodlinkError::Validation {
+            field: field.to_string(),
+            message: format!("exceeds maximum length of {MAX_SHORT_TEXT} bytes"),
+        });
+    }
+    Ok(val)
 }
 
 /// Extract a JSON value from params: accepts either a JSON object/array directly
@@ -1616,7 +1726,7 @@ async fn tool_store_memory(
     agent_id: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
-    let topic = param_str(params, "topic")?;
+    let topic = param_str_short(params, "topic")?;
     let content = param_str(params, "content")?;
     let tags_str = param_str_opt(params, "tags");
     // Convert comma-separated tags string to JSON array for Dolt JSON column
@@ -1736,7 +1846,7 @@ async fn tool_delete_memory(
     agent_id: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
-    let topic = param_str(params, "topic")?;
+    let topic = param_str_short(params, "topic")?;
 
     let result = sqlx::query("DELETE FROM agent_memory WHERE topic = ?")
         .bind(topic)
@@ -2520,7 +2630,7 @@ async fn tool_graph_search(
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
     let query = param_str(params, "query")?;
-    let entity_type = param_str_opt(params, "entity_type");
+    let entity_type = validate_entity_type(param_str_opt(params, "entity_type"))?;
     let include_edges = param_bool_opt(params, "include_edges").unwrap_or(true);
     let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(10));
 
@@ -3440,7 +3550,7 @@ async fn tool_log_conversation(
     state: &AppState,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
-    let agent_name = param_str(params, "agent_name")?;
+    let agent_name = param_str_short(params, "agent_name")?;
     let role = param_str(params, "role")?;
     let content = param_str(params, "content")?;
     let user_id = param_str_opt(params, "user_id");
@@ -3571,7 +3681,7 @@ async fn tool_beads_create_issue(
     _agent_id: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
-    let title = param_str(params, "title")?;
+    let title = param_str_short(params, "title")?;
     let description = param_str_opt(params, "description").unwrap_or("");
     let assignee = param_str_opt(params, "assignee");
     let convoy_id = param_str_opt(params, "convoy_id");
@@ -3684,7 +3794,7 @@ async fn tool_send_message(
     agent_id: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
-    let recipient = param_str(params, "to")?;
+    let recipient = param_str_short(params, "to")?;
     let body = param_str(params, "content")?;
     let subject_field = param_str_opt(params, "subject").unwrap_or("direct");
     let id = Uuid::new_v4().to_string();
@@ -4058,7 +4168,7 @@ async fn tool_agent_upsert(
     _agent_id: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
-    let target_agent_id = param_str(params, "agent_id")?;
+    let target_agent_id = param_str_short(params, "agent_id")?;
     let display_name = param_str(params, "display_name")?;
     let role = param_str(params, "role")?;
     let transport = param_str_opt(params, "transport").unwrap_or("mcp");
@@ -4185,7 +4295,7 @@ async fn tool_get_agent(
     state: &AppState,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
-    let agent_id = param_str(params, "agent_id")?;
+    let agent_id = param_str_short(params, "agent_id")?;
 
     let row = sqlx::query_as::<_, (String, String, String, String, String, Option<serde_json::Value>, bool, String, String)>(
         "SELECT agent_id, display_name, role, transport, cost_tier, capabilities, active, CAST(created_at AS CHAR), CAST(updated_at AS CHAR)
@@ -4332,7 +4442,7 @@ async fn tool_create_task(
     _agent_id: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
-    let title = param_str(params, "title")?;
+    let title = param_str_short(params, "title")?;
     let description = param_str_opt(params, "description").unwrap_or("");
     let priority = param_i64_opt(params, "priority");
     let role = param_str_opt(params, "role");
@@ -4726,7 +4836,7 @@ async fn tool_set_budget(
     agent_id: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
-    let target = param_str(params, "agent_id")?;
+    let target = param_str_short(params, "agent_id")?;
     let tokens = param_i64(params, "tokens")?;
 
     // Read old balance
@@ -5903,7 +6013,10 @@ async fn check_guardrails(
         )
         .fetch_all(&state.pg)
         .await
-        .unwrap_or_default();
+        .map_err(|e| {
+            error!(error = %e, "failed to load approval policies — denying request");
+            BroodlinkError::Internal("approval policy check unavailable".to_string())
+        })?;
 
         for (_policy_id, policy_name, conditions) in &approval_policies {
             // Check if this policy applies to this agent+tool (ignore severity —
@@ -6794,17 +6907,20 @@ async fn tool_get_routing_scores(
         .await?
     };
 
-    // Fetch metrics from Postgres
-    let metrics: Vec<(String, i64, i64, i32, f64)> = sqlx::query_as(
+    // Fetch metrics from Postgres (INT→i32, REAL→f32, cast to f64 for scoring)
+    let metrics: Vec<(String, i32, i32, i32, f32)> = sqlx::query_as(
         "SELECT agent_id, tasks_completed, tasks_failed, current_load, success_rate FROM agent_metrics",
     )
     .fetch_all(&state.pg)
     .await
-    .unwrap_or_default();
+    .map_err(|e| {
+        error!(error = %e, "failed to load agent metrics");
+        BroodlinkError::Database(e)
+    })?;
 
-    let metrics_map: HashMap<String, (i64, i64, i32, f64)> = metrics
+    let metrics_map: HashMap<String, (i32, i32, i32, f64)> = metrics
         .into_iter()
-        .map(|(aid, completed, failed, load, rate)| (aid, (completed, failed, load, rate)))
+        .map(|(aid, completed, failed, load, rate)| (aid, (completed, failed, load, f64::from(rate))))
         .collect();
 
     let weights = &state.config.routing.weights;
@@ -6872,7 +6988,7 @@ async fn tool_delegate_task(
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
     let to_agent = param_str(params, "to_agent")?;
-    let title = param_str(params, "title")?;
+    let title = param_str_short(params, "title")?;
     let description = param_str_opt(params, "description");
     let parent_task_id = param_str_opt(params, "parent_task_id");
 

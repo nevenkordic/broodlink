@@ -149,9 +149,8 @@ struct AppState {
 // Entry point
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() {
-    // Load .env file if present (secrets stay out of config.toml)
+/// Load .env file before the async runtime starts (single-threaded context).
+fn load_dotenv() {
     match std::fs::read_to_string(".env") {
         Ok(contents) => {
             for line in contents.lines() {
@@ -162,7 +161,8 @@ async fn main() {
                 if let Some((key, val)) = line.split_once('=') {
                     let key = key.trim();
                     let val = val.trim();
-                    // SAFETY: called before any threads are spawned
+                    // Safe: called from single-threaded main before tokio runtime.
+                    // set_var is only unsafe when other threads may read env concurrently.
                     unsafe {
                         std::env::set_var(key, val);
                     }
@@ -174,6 +174,20 @@ async fn main() {
             eprintln!(".env: not loaded ({e})");
         }
     }
+}
+
+fn main() {
+    // Load .env in single-threaded context before spawning the tokio runtime
+    load_dotenv();
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime")
+        .block_on(async_main());
+}
+
+async fn async_main() {
 
     let config = match Config::load() {
         Ok(c) => Arc::new(c),
@@ -1439,30 +1453,10 @@ fn verify_teams_signature(shared_secret: &str, body: &str, auth_header: &str) ->
 }
 
 fn base64_decode(input: &str) -> Option<Vec<u8>> {
-    // Simple base64 decode (standard alphabet with padding)
-    use std::collections::HashMap;
-    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let table: HashMap<u8, u8> = alphabet
-        .iter()
-        .enumerate()
-        .map(|(i, &c)| (c, i as u8))
-        .collect();
-
-    let input = input.trim_end_matches('=');
-    let mut out = Vec::with_capacity(input.len() * 3 / 4);
-    let mut buf: u32 = 0;
-    let mut bits: u32 = 0;
-    for &b in input.as_bytes() {
-        let val = *table.get(&b)?;
-        buf = (buf << 6) | u32::from(val);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buf >> bits) as u8);
-            buf &= (1 << bits) - 1;
-        }
-    }
-    Some(out)
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(input)
+        .ok()
 }
 
 // ---------------------------------------------------------------------------

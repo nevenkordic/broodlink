@@ -9,6 +9,7 @@ dependencies = [
  "async-nats",
  "axum",
  "axum-server",
+ "base64 0.22.1",
  "broodlink-config",
  "broodlink-runtime",
  "broodlink-secrets",
