@@ -41,9 +41,32 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$USERNAME" || -z "$PASSWORD" ]]; then
-  echo "Error: --username and --password are required."
+if [[ -z "$USERNAME" ]]; then
+  echo "Error: --username is required."
   usage
+fi
+
+# Prompt for password interactively if not provided via CLI
+if [[ -z "$PASSWORD" ]]; then
+  if [[ -t 0 ]]; then
+    read -rs -p "Password: " PASSWORD
+    echo ""
+    read -rs -p "Confirm password: " PASSWORD_CONFIRM
+    echo ""
+    if [[ "$PASSWORD" != "$PASSWORD_CONFIRM" ]]; then
+      echo "Error: passwords do not match." >&2
+      exit 1
+    fi
+  else
+    echo "Error: --password is required (or run interactively to be prompted)."
+    usage
+  fi
+fi
+
+# Validate password strength
+if [[ ${#PASSWORD} -lt 12 ]]; then
+  echo "Error: password must be at least 12 characters." >&2
+  exit 1
 fi
 
 # Validate role

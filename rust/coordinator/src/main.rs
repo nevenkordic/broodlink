@@ -803,9 +803,9 @@ fn evaluate_condition(expr: &str, step_results: &serde_json::Value) -> bool {
             .is_some_and(|s| s == val);
     }
 
-    // Default: true (unknown conditions don't block)
-    warn!(condition = %expr, "unknown condition expression, defaulting to true");
-    true
+    // Default: false (fail-closed — unknown conditions block execution)
+    warn!(condition = %expr, "unknown condition expression, defaulting to false");
+    false
 }
 
 // ---------------------------------------------------------------------------

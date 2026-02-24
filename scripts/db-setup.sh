@@ -34,8 +34,8 @@ echo ""
 echo "--- Postgres ---"
 
 psql -h 127.0.0.1 -U postgres \
-  -c "CREATE USER broodlink_agent
-      WITH PASSWORD '$PGPASSWORD';" 2>/dev/null || true
+  -v "pw=$PGPASSWORD" \
+  -c "CREATE USER broodlink_agent WITH PASSWORD :'pw';" 2>/dev/null || true
 
 psql -h 127.0.0.1 -U postgres \
   -c "CREATE DATABASE broodlink_hot
@@ -91,13 +91,15 @@ dolt sql \
 
 # Create user (if password is non-empty)
 if [[ -n "$DOLT_PASSWORD" ]]; then
+  # Escape single quotes in password for MySQL string literal
+  DOLT_PW_ESCAPED="${DOLT_PASSWORD//\'/\'\'}"
   dolt sql \
     -u root \
     --host 127.0.0.1 \
     --port 3307 \
     --query "CREATE USER IF NOT EXISTS
       'broodlink_agent'@'%'
-      IDENTIFIED BY '${DOLT_PASSWORD}';" 2>/dev/null || true
+      IDENTIFIED BY '${DOLT_PW_ESCAPED}';" 2>/dev/null || true
 
   dolt sql \
     -u root \

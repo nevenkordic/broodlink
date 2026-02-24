@@ -597,6 +597,7 @@ fn build_router(state: Arc<AppState>) -> Router {
     let auth_routes = Router::new()
         .route("/auth/login", post(handler_auth_login))
         .route("/auth/logout", post(handler_auth_logout))
+        .route("/auth/logout-all", post(handler_auth_logout_all))
         .route("/auth/me", get(handler_auth_me))
         .with_state(Arc::clone(&state));
 
@@ -3414,6 +3415,37 @@ async fn handler_auth_logout(
         .await?;
 
     Ok(ok_response(serde_json::json!({"logged_out": true})))
+}
+
+/// Invalidate all sessions for the current user (logout everywhere).
+async fn handler_auth_logout_all(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let session_token = headers
+        .get("X-Broodlink-Session")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| StatusApiError::Auth("missing X-Broodlink-Session header".to_string()))?;
+
+    // Look up the user_id for the current session
+    let user_id: Option<(String,)> =
+        sqlx::query_as("SELECT user_id FROM dashboard_sessions WHERE id = $1 AND expires_at > NOW()")
+            .bind(session_token)
+            .fetch_optional(&state.pg)
+            .await?;
+
+    let (user_id,) = user_id.ok_or_else(|| StatusApiError::Auth("invalid session".to_string()))?;
+
+    // Delete all sessions for this user
+    let result = sqlx::query("DELETE FROM dashboard_sessions WHERE user_id = $1")
+        .bind(&user_id)
+        .execute(&state.pg)
+        .await?;
+
+    Ok(ok_response(serde_json::json!({
+        "logged_out": true,
+        "sessions_invalidated": result.rows_affected()
+    })))
 }
 
 async fn handler_auth_me(
