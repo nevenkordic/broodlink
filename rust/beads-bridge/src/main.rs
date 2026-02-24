@@ -4323,11 +4323,12 @@ async fn tool_schedule_task(
     let max_runs = param_i64_opt(params, "max_runs");
 
     // Parse ISO 8601 datetime
-    let run_at = chrono::DateTime::parse_from_rfc3339(run_at_str)
-        .map_err(|e| BroodlinkError::Validation {
+    let run_at = chrono::DateTime::parse_from_rfc3339(run_at_str).map_err(|e| {
+        BroodlinkError::Validation {
             field: "run_at".into(),
             message: format!("invalid ISO 8601 datetime: {e}"),
-        })?;
+        }
+    })?;
 
     let row: (i64,) = sqlx::query_as(
         "INSERT INTO scheduled_tasks (title, description, priority, formula_name, next_run_at,
@@ -4360,35 +4361,47 @@ async fn tool_list_scheduled_tasks(
 ) -> Result<serde_json::Value, BroodlinkError> {
     let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(50));
 
-    let rows: Vec<(i64, String, Option<String>, i32, Option<String>, String, Option<i64>, i32, Option<i32>, String)> =
-        sqlx::query_as(
-            "SELECT id, title, description, priority, formula_name, next_run_at::text,
+    let rows: Vec<(
+        i64,
+        String,
+        Option<String>,
+        i32,
+        Option<String>,
+        String,
+        Option<i64>,
+        i32,
+        Option<i32>,
+        String,
+    )> = sqlx::query_as(
+        "SELECT id, title, description, priority, formula_name, next_run_at::text,
                     recurrence_secs, run_count, max_runs, created_at::text
              FROM scheduled_tasks
              WHERE enabled = TRUE
              ORDER BY next_run_at ASC
              LIMIT $1",
-        )
-        .bind(limit)
-        .fetch_all(&state.pg)
-        .await?;
+    )
+    .bind(limit)
+    .fetch_all(&state.pg)
+    .await?;
 
     let tasks: Vec<serde_json::Value> = rows
         .into_iter()
-        .map(|(id, title, desc, priority, formula, next_run, recurrence, runs, max, created)| {
-            serde_json::json!({
-                "id": id,
-                "title": title,
-                "description": desc.unwrap_or_default(),
-                "priority": priority,
-                "formula_name": formula,
-                "next_run_at": next_run,
-                "recurrence_secs": recurrence,
-                "run_count": runs,
-                "max_runs": max,
-                "created_at": created,
-            })
-        })
+        .map(
+            |(id, title, desc, priority, formula, next_run, recurrence, runs, max, created)| {
+                serde_json::json!({
+                    "id": id,
+                    "title": title,
+                    "description": desc.unwrap_or_default(),
+                    "priority": priority,
+                    "formula_name": formula,
+                    "next_run_at": next_run,
+                    "recurrence_secs": recurrence,
+                    "run_count": runs,
+                    "max_runs": max,
+                    "created_at": created,
+                })
+            },
+        )
         .collect();
 
     Ok(serde_json::json!({ "scheduled_tasks": tasks }))
@@ -4400,10 +4413,11 @@ async fn tool_cancel_scheduled_task(
 ) -> Result<serde_json::Value, BroodlinkError> {
     let id = param_i64(params, "id")?;
 
-    let affected = sqlx::query("UPDATE scheduled_tasks SET enabled = FALSE WHERE id = $1 AND enabled = TRUE")
-        .bind(id)
-        .execute(&state.pg)
-        .await?;
+    let affected =
+        sqlx::query("UPDATE scheduled_tasks SET enabled = FALSE WHERE id = $1 AND enabled = TRUE")
+            .bind(id)
+            .execute(&state.pg)
+            .await?;
 
     if affected.rows_affected() == 0 {
         return Err(BroodlinkError::NotFound(format!(
@@ -4481,7 +4495,10 @@ async fn tool_create_notification_rule(
     let cooldown = param_i64_opt(params, "cooldown_minutes")
         .unwrap_or(state.config.notifications.default_cooldown_minutes as i64);
 
-    if !matches!(condition_type, "service_event_error" | "dlq_spike" | "budget_low") {
+    if !matches!(
+        condition_type,
+        "service_event_error" | "dlq_spike" | "budget_low"
+    ) {
         return Err(BroodlinkError::Validation {
             field: "condition_type".into(),
             message: "must be: service_event_error, dlq_spike, or budget_low".into(),
@@ -4531,35 +4548,60 @@ async fn tool_list_notification_rules(
 ) -> Result<serde_json::Value, BroodlinkError> {
     let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(50));
 
-    let rows: Vec<(i64, String, String, serde_json::Value, String, String, Option<String>, i32, bool, Option<String>, String)> =
-        sqlx::query_as(
-            "SELECT id, name, condition_type, condition_config, channel, target,
+    let rows: Vec<(
+        i64,
+        String,
+        String,
+        serde_json::Value,
+        String,
+        String,
+        Option<String>,
+        i32,
+        bool,
+        Option<String>,
+        String,
+    )> = sqlx::query_as(
+        "SELECT id, name, condition_type, condition_config, channel, target,
                     template, cooldown_minutes, enabled, last_triggered_at::text, created_at::text
              FROM notification_rules
              ORDER BY created_at DESC
              LIMIT $1",
-        )
-        .bind(limit)
-        .fetch_all(&state.pg)
-        .await?;
+    )
+    .bind(limit)
+    .fetch_all(&state.pg)
+    .await?;
 
     let rules: Vec<serde_json::Value> = rows
         .into_iter()
-        .map(|(id, name, ctype, cconfig, channel, target, template, cooldown, enabled, last_triggered, created)| {
-            serde_json::json!({
-                "id": id,
-                "name": name,
-                "condition_type": ctype,
-                "condition_config": cconfig,
-                "channel": channel,
-                "target": target,
-                "template": template,
-                "cooldown_minutes": cooldown,
-                "enabled": enabled,
-                "last_triggered_at": last_triggered,
-                "created_at": created,
-            })
-        })
+        .map(
+            |(
+                id,
+                name,
+                ctype,
+                cconfig,
+                channel,
+                target,
+                template,
+                cooldown,
+                enabled,
+                last_triggered,
+                created,
+            )| {
+                serde_json::json!({
+                    "id": id,
+                    "name": name,
+                    "condition_type": ctype,
+                    "condition_config": cconfig,
+                    "channel": channel,
+                    "target": target,
+                    "template": template,
+                    "cooldown_minutes": cooldown,
+                    "enabled": enabled,
+                    "last_triggered_at": last_triggered,
+                    "created_at": created,
+                })
+            },
+        )
         .collect();
 
     Ok(serde_json::json!({ "notification_rules": rules }))

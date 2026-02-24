@@ -2086,7 +2086,17 @@ async fn scheduled_task_loop(state: Arc<AppState>, mut shutdown_rx: watch::Recei
 }
 
 async fn check_scheduled_tasks(state: &AppState) -> Result<u64, BroodlinkError> {
-    let entries: Vec<(i64, String, String, i32, Option<String>, Option<serde_json::Value>, Option<i64>, Option<i32>, i32)> = sqlx::query_as(
+    let entries: Vec<(
+        i64,
+        String,
+        String,
+        i32,
+        Option<String>,
+        Option<serde_json::Value>,
+        Option<i64>,
+        Option<i32>,
+        i32,
+    )> = sqlx::query_as(
         "SELECT id, title, COALESCE(description, ''), priority, formula_name, params,
                 recurrence_secs, max_runs, run_count
          FROM scheduled_tasks
@@ -2099,7 +2109,18 @@ async fn check_scheduled_tasks(state: &AppState) -> Result<u64, BroodlinkError> 
 
     let mut promoted = 0u64;
 
-    for (sched_id, title, description, priority, formula_name, _params, recurrence_secs, max_runs, run_count) in &entries {
+    for (
+        sched_id,
+        title,
+        description,
+        priority,
+        formula_name,
+        _params,
+        recurrence_secs,
+        max_runs,
+        run_count,
+    ) in &entries
+    {
         // Create task in task_queue
         let task_id = Uuid::new_v4().to_string();
         let trace_id = Uuid::new_v4().to_string();

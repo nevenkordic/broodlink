@@ -1940,15 +1940,24 @@ async fn check_notification_rules(
     nats: &async_nats::Client,
     config: &Config,
 ) -> Result<u64, BroodlinkError> {
-    let rules: Vec<(i64, String, String, serde_json::Value, String, String, Option<String>, i32, Option<String>)> =
-        sqlx::query_as(
-            "SELECT id, name, condition_type, condition_config, channel, target, template,
+    let rules: Vec<(
+        i64,
+        String,
+        String,
+        serde_json::Value,
+        String,
+        String,
+        Option<String>,
+        i32,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT id, name, condition_type, condition_config, channel, target, template,
                     cooldown_minutes, last_triggered_at::text
              FROM notification_rules
              WHERE enabled = TRUE",
-        )
-        .fetch_all(pg)
-        .await?;
+    )
+    .fetch_all(pg)
+    .await?;
 
     if rules.is_empty() {
         return Ok(0);
@@ -1958,7 +1967,18 @@ async fn check_notification_rules(
     let prefix = &config.nats.subject_prefix;
     let env = &config.broodlink.env;
 
-    for (rule_id, name, condition_type, condition_config, channel, target, template, cooldown_minutes, last_triggered) in &rules {
+    for (
+        rule_id,
+        name,
+        condition_type,
+        condition_config,
+        channel,
+        target,
+        template,
+        cooldown_minutes,
+        last_triggered,
+    ) in &rules
+    {
         // Check cooldown
         if let Some(last) = last_triggered {
             if let Ok(ts) = chrono::NaiveDateTime::parse_from_str(last, "%Y-%m-%d %H:%M:%S%.f%z")
@@ -1992,7 +2012,10 @@ async fn check_notification_rules(
                 .await
                 .unwrap_or((0,));
 
-                (count.0 >= threshold, serde_json::json!({"count": count.0, "type": "service_event_error"}))
+                (
+                    count.0 >= threshold,
+                    serde_json::json!({"count": count.0, "type": "service_event_error"}),
+                )
             }
             "dlq_spike" => {
                 let count: (i64,) = sqlx::query_as(
@@ -2005,7 +2028,10 @@ async fn check_notification_rules(
                 .await
                 .unwrap_or((0,));
 
-                (count.0 >= threshold, serde_json::json!({"count": count.0, "type": "dlq_spike"}))
+                (
+                    count.0 >= threshold,
+                    serde_json::json!({"count": count.0, "type": "dlq_spike"}),
+                )
             }
             "budget_low" => {
                 let budget_threshold = condition_config
@@ -2023,7 +2049,10 @@ async fn check_notification_rules(
                 .unwrap_or_default();
 
                 let agent_names: Vec<&str> = agents.iter().map(|(a, _)| a.as_str()).collect();
-                (!agents.is_empty(), serde_json::json!({"agents": agent_names, "count": agents.len(), "type": "budget_low"}))
+                (
+                    !agents.is_empty(),
+                    serde_json::json!({"agents": agent_names, "count": agents.len(), "type": "budget_low"}),
+                )
             }
             _ => {
                 warn!(condition_type = %condition_type, rule = %name, "unknown notification condition type");
@@ -2051,8 +2080,7 @@ async fn check_notification_rules(
         } else {
             format!(
                 "[Broodlink Alert] Rule '{}' triggered: {}",
-                name,
-                message_vars
+                name, message_vars
             )
         };
 
@@ -2087,12 +2115,11 @@ async fn check_notification_rules(
         }
 
         // Update last_triggered_at
-        let _ = sqlx::query(
-            "UPDATE notification_rules SET last_triggered_at = NOW() WHERE id = $1",
-        )
-        .bind(rule_id)
-        .execute(pg)
-        .await;
+        let _ =
+            sqlx::query("UPDATE notification_rules SET last_triggered_at = NOW() WHERE id = $1")
+                .bind(rule_id)
+                .execute(pg)
+                .await;
 
         // Auto-postmortem for service_event_error
         if condition_type == "service_event_error"

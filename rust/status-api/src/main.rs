@@ -1200,14 +1200,20 @@ async fn handler_service_events(
             .unwrap_or(50),
     );
 
-    let rows: Vec<(i64, String, String, String, Option<serde_json::Value>, String)> =
-        sqlx::query_as(
-            "SELECT id, service, event_type, severity, details, created_at::text \
+    let rows: Vec<(
+        i64,
+        String,
+        String,
+        String,
+        Option<serde_json::Value>,
+        String,
+    )> = sqlx::query_as(
+        "SELECT id, service, event_type, severity, details, created_at::text \
              FROM service_events ORDER BY created_at DESC LIMIT $1",
-        )
-        .bind(limit)
-        .fetch_all(&state.pg)
-        .await?;
+    )
+    .bind(limit)
+    .fetch_all(&state.pg)
+    .await?;
 
     let events: Vec<serde_json::Value> = rows
         .into_iter()

@@ -467,18 +467,14 @@ async fn async_main() {
                                     .get("channel")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("");
-                                let target = payload
-                                    .get("target")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
+                                let target =
+                                    payload.get("target").and_then(|v| v.as_str()).unwrap_or("");
                                 let message = payload
                                     .get("message")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("");
-                                let log_id = payload
-                                    .get("log_id")
-                                    .and_then(|v| v.as_i64())
-                                    .unwrap_or(0);
+                                let log_id =
+                                    payload.get("log_id").and_then(|v| v.as_i64()).unwrap_or(0);
 
                                 if channel.is_empty() || target.is_empty() || message.is_empty() {
                                     warn!("notification event missing required fields");
@@ -1284,7 +1280,9 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
         .map(|r| r.status().is_success())
         .unwrap_or(false);
 
-    let model_degraded = state.primary_model_degraded.load(std::sync::atomic::Ordering::Relaxed);
+    let model_degraded = state
+        .primary_model_degraded
+        .load(std::sync::atomic::Ordering::Relaxed);
     let degraded_secs = if model_degraded {
         let guard = state.degraded_since.read().await;
         guard.map(|t| t.elapsed().as_secs()).unwrap_or(0)
@@ -3163,7 +3161,13 @@ async fn handle_ollama_recovery(
     info!(count = models_to_unload.len(), models = ?models_to_unload, "unloading models to free memory");
     for model_name in &models_to_unload {
         let payload = serde_json::json!({ "model": model_name, "keep_alive": 0 });
-        match state.ollama_client.post(&unload_url).json(&payload).send().await {
+        match state
+            .ollama_client
+            .post(&unload_url)
+            .json(&payload)
+            .send()
+            .await
+        {
             Ok(_) => info!(model = %model_name, "model unload requested"),
             Err(e) => warn!(model = %model_name, error = %e, "failed to request model unload"),
         }
@@ -3547,7 +3551,13 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
                 "model": fallback,
                 "keep_alive": 0,
             });
-            match state.ollama_client.post(&unload_url).json(&unload_payload).send().await {
+            match state
+                .ollama_client
+                .post(&unload_url)
+                .json(&unload_payload)
+                .send()
+                .await
+            {
                 Ok(_) => info!(model = %fallback, "unloaded fallback model before probing primary"),
                 Err(e) => warn!(model = %fallback, error = %e, "failed to unload fallback model"),
             }
