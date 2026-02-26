@@ -419,7 +419,9 @@ async fn async_main() {
 
             // task_failed
             let nc3 = nc2.clone(); // clone for notification subscriber
+            let nc4 = nc2.clone(); // clone for task dispatch subscriber
             let st_notify = Arc::clone(&st); // clone before st moves into task_failed
+            let st_dispatch = Arc::clone(&st); // clone for task dispatch handler
             let subj_failed = format!("{prefix}.*.coordinator.task_failed");
             tokio::spawn(async move {
                 match nc2.subscribe(subj_failed.clone()).await {
@@ -529,6 +531,66 @@ async fn async_main() {
                     }
                     Err(e) => {
                         error!(error = %e, "failed to subscribe for notification dispatch");
+                    }
+                }
+            });
+
+            // task_dispatch — handle tasks assigned to a2a-gateway by the coordinator
+            let subj_dispatch = format!(
+                "{}.{}.agent.a2a-gateway.task",
+                config.nats.subject_prefix, config.broodlink.env,
+            );
+            tokio::spawn(async move {
+                match nc4.subscribe(subj_dispatch.clone()).await {
+                    Ok(mut sub) => {
+                        info!(subject = %subj_dispatch, "subscribed for task dispatch");
+                        while let Some(msg) = sub.next().await {
+                            let payload: serde_json::Value =
+                                match serde_json::from_slice(&msg.payload) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        warn!(error = %e, "failed to parse task dispatch payload");
+                                        continue;
+                                    }
+                                };
+                            let task_id = payload
+                                .get("task_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            let description = payload
+                                .get("description")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let title = payload
+                                .get("title")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+
+                            if task_id.is_empty() {
+                                continue;
+                            }
+
+                            // Use description if available, fall back to title
+                            let prompt = if description.is_empty() {
+                                title
+                            } else {
+                                description
+                            };
+                            if prompt.is_empty() {
+                                continue;
+                            }
+
+                            let st_inner = Arc::clone(&st_dispatch);
+                            tokio::spawn(async move {
+                                handle_dispatched_task(&st_inner, &task_id, &prompt).await;
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "failed to subscribe for task dispatch");
                     }
                 }
             });
@@ -2984,6 +3046,48 @@ async fn handle_task_completion_for_chat(
 }
 
 // ---------------------------------------------------------------------------
+// Dispatched task handler — performs LLM inference for coordinator-assigned tasks
+// ---------------------------------------------------------------------------
+
+async fn handle_dispatched_task(state: &AppState, task_id: &str, description: &str) {
+    info!(task_id = task_id, "handling dispatched task");
+
+    // Build a minimal conversation: the task description as a user message
+    let history = vec![("user".to_string(), description.to_string())];
+
+    // Acquire the Ollama semaphore to respect concurrency limits
+    let reply = match state.ollama_semaphore.try_acquire() {
+        Ok(_permit) => call_ollama_chat(state, &history).await,
+        Err(_) => {
+            warn!(task_id = task_id, "Ollama busy, failing dispatched task");
+            let _ = bridge_call(
+                state,
+                "fail_task",
+                serde_json::json!({ "task_id": task_id }),
+            )
+            .await;
+            return;
+        }
+    };
+
+    info!(task_id = task_id, result_len = reply.len(), "dispatched task inference complete");
+
+    // Complete the task via beads-bridge (publishes task_completed to NATS automatically)
+    if let Err(e) = bridge_call(
+        state,
+        "complete_task",
+        serde_json::json!({
+            "task_id": task_id,
+            "result": reply,
+        }),
+    )
+    .await
+    {
+        warn!(task_id = task_id, error = %e, "failed to complete dispatched task via bridge");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Telegram typing indicator
 // ---------------------------------------------------------------------------
 
@@ -3182,7 +3286,7 @@ async fn handle_ollama_recovery(
         "model": primary_model,
         "messages": messages,
         "stream": false,
-        "think": false,
+        "think": true,
         "options": {
             "temperature": 0.7,
             "num_predict": 512,
@@ -3303,7 +3407,7 @@ async fn fallback_chat(
         "model": fallback_model,
         "messages": fallback_messages,
         "stream": false,
-        "think": false,
+        "think": true,
         "options": {
             "temperature": 0.7,
             "num_predict": 512,
@@ -3379,6 +3483,95 @@ async fn fetch_memory_context(state: &AppState, query: &str, limit: u32) -> Stri
     }
 }
 
+/// Extract confidence score from model response.
+fn parse_confidence(text: &str) -> Option<u8> {
+    if let Some(start) = text.find("[CONFIDENCE: ") {
+        let rest = &text[start + 13..];
+        if let Some(slash) = rest.find('/') {
+            if let Ok(n) = rest[..slash].trim().parse::<u8>() {
+                return Some(n.min(5));
+            }
+        }
+    }
+    None
+}
+
+/// Strip the confidence tag from text for clean display.
+fn strip_confidence_tag(text: &str) -> String {
+    if let Some(start) = text.find("[CONFIDENCE: ") {
+        if let Some(end) = text[start..].find(']') {
+            let before = text[..start].trim_end();
+            let after = text[start + end + 1..].trim_start();
+            if after.is_empty() {
+                return before.to_string();
+            }
+            return format!("{before} {after}");
+        }
+    }
+    text.to_string()
+}
+
+/// Use a fast verifier model to fact-check low-confidence responses.
+async fn verify_response(
+    client: &reqwest::Client,
+    ollama_url: &str,
+    verifier_model: &str,
+    timeout_secs: u64,
+    original_response: &str,
+    user_query: &str,
+    memory_context: &str,
+    num_ctx: u32,
+) -> Option<String> {
+    let verification_prompt = format!(
+        "You are a fact-checker. The user asked: \"{user_query}\"\n\n\
+         The AI responded: \"{original_response}\"\n\n\
+         Known facts from memory:\n{memory_context}\n\n\
+         Check the response for factual errors, unsupported claims, or contradictions with known facts.\n\
+         If the response is accurate, respond with exactly: VERIFIED\n\
+         If there are issues, respond with: CORRECTED: <your corrected response>"
+    );
+
+    let messages = vec![
+        serde_json::json!({"role": "system", "content": "You are a precise fact-checker. Be concise. Do not add unnecessary information."}),
+        serde_json::json!({"role": "user", "content": verification_prompt}),
+    ];
+
+    let url = format!("{ollama_url}/api/chat");
+    let payload = serde_json::json!({
+        "model": verifier_model,
+        "messages": messages,
+        "stream": false,
+        "think": true,
+        "options": {
+            "temperature": 0.1,
+            "num_predict": 512,
+            "num_ctx": num_ctx,
+        }
+    });
+
+    let resp = client
+        .post(&url)
+        .json(&payload)
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .send()
+        .await
+        .ok()?;
+
+    let body: serde_json::Value = resp.json().await.ok()?;
+    let content = body.get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())?;
+
+    let cleaned = strip_think_tags(content.trim());
+    if cleaned.contains("VERIFIED") {
+        None
+    } else if let Some(idx) = cleaned.find("CORRECTED:") {
+        Some(cleaned[idx + 10..].trim().to_string())
+    } else {
+        None
+    }
+}
+
 async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> String {
     let ollama_url = &state.config.ollama.url;
     let timeout_secs = state.config.ollama.timeout_seconds;
@@ -3400,10 +3593,11 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
         "chat tool availability"
     );
 
-    // Dynamic system prompt
-    let mut system_prompt = String::from(
-        "You are Broodlink, an AI assistant. Keep responses concise and conversational.",
-    );
+    // Dynamic system prompt — prefer config over hardcoded default
+    let base_prompt = state.config.agents.get("a2a-gateway")
+        .and_then(|a| a.system_prompt.as_deref())
+        .unwrap_or("You are Broodlink, an AI assistant. Keep responses concise and conversational.");
+    let mut system_prompt = String::from(base_prompt);
     if tools_available {
         system_prompt.push_str(
             " You have a web_search tool. ONLY use it for: \
@@ -3425,27 +3619,34 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
     }
     system_prompt.push_str(" If you don't know something and can't look it up, say so honestly.");
 
-    // Enrich system prompt with relevant memories from the agent-ledger
-    if chat_cfg.memory_enabled {
-        // Extract the last user message as the search query
-        let last_user_msg = history
-            .iter()
-            .rev()
-            .find(|(role, _)| role == "user")
-            .map(|(_, content)| content.as_str());
+    // Extract the last user message (used for memory search and verification)
+    let last_user_msg = history
+        .iter()
+        .rev()
+        .find(|(role, _)| role == "user")
+        .map(|(_, content)| content.as_str());
 
+    // Enrich system prompt with relevant memories from the agent-ledger
+    let mut memory_ctx = String::new();
+    if chat_cfg.memory_enabled {
         if let Some(query) = last_user_msg {
-            let memories = fetch_memory_context(state, query, chat_cfg.memory_max_results).await;
-            if !memories.is_empty() {
+            memory_ctx = fetch_memory_context(state, query, chat_cfg.memory_max_results).await;
+            if !memory_ctx.is_empty() {
                 system_prompt.push_str("\n\n## Relevant context from memory:\n");
-                system_prompt.push_str(&memories);
+                system_prompt.push_str(&memory_ctx);
                 info!(
-                    memory_lines = memories.lines().count(),
+                    memory_lines = memory_ctx.lines().count(),
                     "injected memory context into system prompt"
                 );
             }
         }
     }
+
+    // Append confidence scoring instruction
+    system_prompt.push_str(
+        "\n\nAt the end of every response, include a confidence rating in this exact format: \
+         [CONFIDENCE: N/5] where N is 1=guessing, 2=uncertain, 3=reasonable, 4=confident, 5=certain."
+    );
 
     // Tool definitions — conditionally include web_search and remember
     let mut tools_vec: Vec<serde_json::Value> = Vec::new();
@@ -3586,7 +3787,7 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
             "model": model,
             "messages": messages,
             "stream": false,
-            "think": false,
+            "think": true,
             "options": {
                 "temperature": 0.7,
                 "num_predict": 512,
@@ -3809,12 +4010,35 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
             .unwrap_or("")
             .trim();
 
-        let cleaned = strip_think_tags(content);
-        return if cleaned.is_empty() {
-            "I wasn't able to generate a response. Please try again.".to_string()
-        } else {
-            cleaned
-        };
+        let final_text = strip_think_tags(content);
+        if final_text.is_empty() {
+            return "I wasn't able to generate a response. Please try again.".to_string();
+        }
+
+        // Parse confidence and strip tag for clean display
+        let confidence = parse_confidence(&final_text);
+        let clean_text = strip_confidence_tag(&final_text);
+
+        // Verify low-confidence responses using a fast verifier model
+        if confidence.unwrap_or(3) < 3 && !chat_cfg.verifier_model.is_empty() {
+            if let Some(corrected) = verify_response(
+                &state.ollama_client,
+                &state.config.ollama.url,
+                &chat_cfg.verifier_model,
+                chat_cfg.verifier_timeout_seconds,
+                &clean_text,
+                last_user_msg.unwrap_or(""),
+                &memory_ctx,
+                state.config.ollama.num_ctx,
+            )
+            .await
+            {
+                info!(confidence = ?confidence, "response corrected by verifier");
+                return corrected;
+            }
+        }
+
+        return clean_text;
     }
 
     // Exhausted all rounds without a text response
@@ -3826,6 +4050,16 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
 fn strip_think_tags(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut rest = s;
+
+    // Handle orphaned </think> at the start (qwen3 MoE outputs thinking in content
+    // without an opening <think> tag when think:false)
+    if let Some(end) = rest.find("</think>") {
+        if !rest[..end].contains("<think>") {
+            // No opening tag before this closing tag — strip everything before it
+            rest = &rest[end + 8..];
+        }
+    }
+
     while let Some(start) = rest.find("<think>") {
         result.push_str(&rest[..start]);
         if let Some(end) = rest[start..].find("</think>") {
@@ -4509,6 +4743,185 @@ mod tests {
         assert!(
             !(greeting_enabled && msg_count == 1),
             "greeting should NOT fire when disabled"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Task dispatch payload parsing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_task_dispatch_payload_extracts_fields() {
+        let payload: serde_json::Value = serde_json::json!({
+            "task_id": "abc-123",
+            "title": "What is 2+2?",
+            "description": "A2A task from user: What is 2+2?",
+            "priority": 0,
+            "assigned_by": "coordinator",
+        });
+
+        let task_id = payload
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let description = payload
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let title = payload
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        assert_eq!(task_id, "abc-123");
+        assert_eq!(description, "A2A task from user: What is 2+2?");
+        assert_eq!(title, "What is 2+2?");
+
+        // description is preferred over title
+        let prompt = if description.is_empty() {
+            title
+        } else {
+            description
+        };
+        assert_eq!(prompt, "A2A task from user: What is 2+2?");
+    }
+
+    #[test]
+    fn test_task_dispatch_payload_falls_back_to_title() {
+        let payload: serde_json::Value = serde_json::json!({
+            "task_id": "xyz-789",
+            "title": "Summarize logs",
+            "priority": 1,
+            "assigned_by": "coordinator",
+        });
+
+        let description = payload
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let title = payload
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        assert!(description.is_empty());
+        let prompt = if description.is_empty() {
+            title
+        } else {
+            description
+        };
+        assert_eq!(prompt, "Summarize logs");
+    }
+
+    #[test]
+    fn test_task_dispatch_payload_skips_empty() {
+        // Missing task_id should be skipped
+        let payload: serde_json::Value = serde_json::json!({
+            "title": "test",
+            "description": "test desc",
+        });
+
+        let task_id = payload
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(task_id.is_empty(), "missing task_id should yield empty string");
+
+        // Missing both title and description should be skipped
+        let payload2: serde_json::Value = serde_json::json!({
+            "task_id": "abc",
+        });
+        let description = payload2
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let title = payload2
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let prompt = if description.is_empty() {
+            title
+        } else {
+            description
+        };
+        assert!(prompt.is_empty(), "no title or description should yield empty prompt");
+    }
+
+    // -----------------------------------------------------------------------
+    // Confidence scoring tests (v0.8.0)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_confidence_present() {
+        assert_eq!(parse_confidence("Some answer [CONFIDENCE: 5/5]"), Some(5));
+        assert_eq!(parse_confidence("Result [CONFIDENCE: 1/5]"), Some(1));
+        assert_eq!(parse_confidence("Text [CONFIDENCE: 3/5] more text"), Some(3));
+    }
+
+    #[test]
+    fn test_parse_confidence_absent() {
+        assert_eq!(parse_confidence("No confidence tag here"), None);
+        assert_eq!(parse_confidence(""), None);
+        assert_eq!(parse_confidence("[CONFIDENCE: X/5]"), None);
+    }
+
+    #[test]
+    fn test_strip_confidence_tag() {
+        assert_eq!(
+            strip_confidence_tag("Answer text [CONFIDENCE: 4/5]"),
+            "Answer text"
+        );
+        assert_eq!(
+            strip_confidence_tag("No tag here"),
+            "No tag here"
+        );
+        assert_eq!(
+            strip_confidence_tag("Before [CONFIDENCE: 2/5] after"),
+            "Before after"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_think_tags tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strip_think_tags_paired() {
+        assert_eq!(
+            strip_think_tags("<think>inner thought</think>actual response"),
+            "actual response"
+        );
+    }
+
+    #[test]
+    fn test_strip_think_tags_orphaned_close() {
+        // qwen3 MoE outputs thinking without opening <think> tag
+        assert_eq!(
+            strip_think_tags("Thinking out loud here\n</think>\n\nHey! How can I help?"),
+            "Hey! How can I help?"
+        );
+    }
+
+    #[test]
+    fn test_strip_think_tags_no_tags() {
+        assert_eq!(
+            strip_think_tags("Normal response with no tags"),
+            "Normal response with no tags"
+        );
+    }
+
+    #[test]
+    fn test_strip_think_tags_unclosed() {
+        assert_eq!(
+            strip_think_tags("before <think>thinking forever"),
+            "before"
         );
     }
 }

@@ -63,6 +63,13 @@ pub struct FormulaStep {
     pub timeout_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<u32>,
+    // v0.8.0: Intelligence improvements
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub examples: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
 }
 
 /// A step's input can be a single key or multiple keys.

@@ -808,6 +808,11 @@ async fn create_step_task(
     // Render prompt with formula params
     let mut rendered = render_prompt(&step.prompt, params);
 
+    // Prepend step-level system prompt if present
+    if let Some(ref sp) = step.system_prompt {
+        rendered = format!("{sp}\n\n{rendered}");
+    }
+
     // Append previous step outputs as context
     if let Some(ref input) = step.input {
         let keys = match input {
@@ -818,6 +823,21 @@ async fn create_step_task(
             if let Some(val) = step_results.get(key) {
                 rendered.push_str(&format!("\n\n--- Previous output ({key}) ---\n{val}"));
             }
+        }
+    }
+
+    // Append few-shot examples if present
+    if let Some(ref examples) = step.examples {
+        rendered.push_str("\n\n## Examples:\n");
+        rendered.push_str(examples);
+    }
+
+    // Append output schema guidance if present
+    if let Some(ref schema) = step.output_schema {
+        if let Ok(schema_str) = serde_json::to_string_pretty(schema) {
+            rendered.push_str(&format!(
+                "\n\n## Required output format:\nYour response must conform to this schema:\n```json\n{schema_str}\n```"
+            ));
         }
     }
 
@@ -961,6 +981,40 @@ async fn handle_task_completed(
     if let Some(ref result_data) = payload.result_data {
         if let Some(obj) = step_results.as_object_mut() {
             obj.insert(step_def.output.clone(), result_data.clone());
+        }
+    }
+
+    // Validate step output against schema if defined
+    if let Some(ref schema) = step_def.output_schema {
+        if let Some(ref result_data) = payload.result_data {
+            if let Some(required) = schema.get("required").and_then(|r| r.as_array()) {
+                let valid = if let Some(obj) = result_data.as_object() {
+                    required.iter().all(|f| {
+                        f.as_str().map_or(true, |name| obj.contains_key(name))
+                    })
+                } else if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(
+                    result_data.as_str().unwrap_or("")
+                ) {
+                    if let Some(obj) = parsed.as_object() {
+                        required.iter().all(|f| {
+                            f.as_str().map_or(true, |name| obj.contains_key(name))
+                        })
+                    } else {
+                        true // Not an object, skip validation
+                    }
+                } else {
+                    true // Can't parse, skip validation
+                };
+
+                if !valid {
+                    warn!(
+                        step = %step_def.name,
+                        workflow_run_id = %workflow_run_id,
+                        "step output failed schema validation"
+                    );
+                    // Could retry here, but for now just log the warning
+                }
+            }
         }
     }
 
@@ -2201,6 +2255,79 @@ async fn check_scheduled_tasks(state: &AppState) -> Result<u64, BroodlinkError> 
 }
 
 // ---------------------------------------------------------------------------
+// Task timeout / deadlock detection loop
+// ---------------------------------------------------------------------------
+
+/// Background loop that detects timed-out tasks and resets them for re-assignment.
+async fn task_timeout_loop(state: Arc<AppState>, mut shutdown_rx: watch::Receiver<bool>) {
+    let timeout_minutes = state.config.collaboration.task_claim_timeout_minutes;
+    info!(timeout_minutes, "task timeout detection loop started");
+
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
+        match detect_timed_out_tasks(&state, timeout_minutes).await {
+            Ok(count) if count > 0 => {
+                info!(count, "reassigned timed-out tasks");
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "task timeout check failed"),
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+            _ = shutdown_rx.changed() => break,
+        }
+    }
+    info!("task timeout loop stopped");
+}
+
+async fn detect_timed_out_tasks(
+    state: &AppState,
+    timeout_minutes: u32,
+) -> Result<u32, BroodlinkError> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "UPDATE task_queue SET status = 'pending', assigned_agent = NULL, updated_at = NOW()
+         WHERE status IN ('claimed', 'in_progress')
+         AND claimed_at IS NOT NULL
+         AND claimed_at < NOW() - make_interval(mins => $1::int)
+         RETURNING id",
+    )
+    .bind(timeout_minutes as i32)
+    .fetch_all(&state.pg)
+    .await?;
+
+    let mut count = 0u32;
+    for (task_id,) in &rows {
+        // Log timeout event
+        let _ = sqlx::query(
+            "INSERT INTO service_events (service, event_type, severity, details, created_at)
+             VALUES ('coordinator', 'task_timeout', 'warning', $1, NOW())",
+        )
+        .bind(serde_json::json!({"task_id": task_id}))
+        .execute(&state.pg)
+        .await;
+
+        // Re-publish task_available
+        let subject = format!(
+            "{}.{}.coordinator.task_available",
+            state.config.nats.subject_prefix, state.config.broodlink.env,
+        );
+        let payload = serde_json::json!({"task_id": task_id});
+        if let Ok(bytes) = serde_json::to_vec(&payload) {
+            let _ = state.nats.publish(subject, bytes.into()).await;
+        }
+
+        info!(task_id = %task_id, "task timed out, reset to pending");
+        count += 1;
+    }
+
+    Ok(count)
+}
+
+// ---------------------------------------------------------------------------
 // Initialization
 // ---------------------------------------------------------------------------
 
@@ -2368,6 +2495,13 @@ async fn main() {
         scheduled_task_loop(sched_state, sched_shutdown).await;
     });
 
+    // Spawn the task timeout / deadlock detection loop
+    let timeout_state = Arc::clone(&state);
+    let timeout_shutdown = shutdown_rx.clone();
+    let timeout_handle = tokio::spawn(async move {
+        task_timeout_loop(timeout_state, timeout_shutdown).await;
+    });
+
     // Wait for shutdown signal
     shutdown_signal().await;
 
@@ -2399,6 +2533,9 @@ async fn main() {
         }
         if let Err(e) = sched_handle.await {
             warn!(error = %e, "scheduled task loop panicked");
+        }
+        if let Err(e) = timeout_handle.await {
+            warn!(error = %e, "task timeout loop panicked");
         }
     })
     .await

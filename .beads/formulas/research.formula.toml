@@ -29,6 +29,20 @@ tools = ["store_memory", "log_decision"]
 prompt = "Produce a comprehensive research report based on the analysis. Store key findings as memories."
 input = "analysis"
 output = "report"
+examples = """
+GOOD OUTPUT:
+# Research Report: [Topic]
+## Executive Summary
+[2-3 sentence overview]
+## Key Findings
+1. [Finding with source citation]
+2. [Finding with source citation]
+## Gaps and Open Questions
+- [What remains unknown]
+
+BAD OUTPUT:
+"Here's what I found about the topic." (too vague, no structure, no citations)
+"""
 
 [formula.parameters]
 topic = { type = "string", required = true, description = "The research topic" }

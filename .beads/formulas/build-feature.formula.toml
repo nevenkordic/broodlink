@@ -29,6 +29,7 @@ tools = ["store_memory", "complete_task", "log_work"]
 prompt = "Write and run tests for the implementation. Report any issues found."
 input = "implementation"
 output = "test_results"
+group = 1
 
 [[steps]]
 name = "document"
@@ -37,6 +38,7 @@ tools = ["store_memory"]
 prompt = "Document the new feature, including usage examples and any configuration needed."
 input = "implementation"
 output = "documentation"
+group = 1
 
 [formula.parameters]
 feature_name = { type = "string", required = true, description = "Name of the feature" }

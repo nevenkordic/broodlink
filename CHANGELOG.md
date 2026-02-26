@@ -5,6 +5,69 @@ All notable changes to Broodlink are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.8.0] - 2026-02-26
+
+### Added
+
+- **Model Upgrade — qwen3:30b-a3b MoE**: Switched primary chat model from
+  qwen3:32b (dense, ~25 tok/s) to qwen3:30b-a3b (MoE, 3B active params,
+  ~95 tok/s on M4 Max). 3x faster inference at equivalent quality. ~18GB VRAM.
+- **Confidence Scoring**: Every LLM response includes `[CONFIDENCE: N/5]`
+  (1=guessing to 5=certain). Tag is parsed internally and stripped before
+  delivery to the user. Enables automatic quality gating.
+- **Verify-then-Respond**: When confidence < 3 and `verifier_model` is
+  configured, the response is sent to deepseek-r1:14b for fact-checking
+  against user query and memory context. Verifier returns VERIFIED or
+  CORRECTED with a replacement response. Low temperature (0.1), short
+  timeout, no tools.
+- **Dynamic System Prompts**: Per-agent `system_prompt` field in config.toml
+  `[agents.*]` sections. a2a-gateway loads system prompt from config at
+  runtime instead of using hardcoded strings. Fallback to sensible default
+  if not configured.
+- **Semantic Search Metadata Filters**: `agent_id`, `date_from`, and
+  `date_to` parameters on the `semantic_search` tool. Builds Qdrant
+  `filter.must` conditions for targeted retrieval.
+- **Hybrid Search Rerank Default**: `hybrid_search` rerank parameter now
+  defaults to `config.memory_search.reranker_enabled` instead of hardcoded
+  `false`.
+- **Content Chunking**: Embedding worker splits long memories (> `chunk_max_tokens`)
+  into overlapping word-based windows before embedding. Each chunk stored as a
+  separate Qdrant point with deterministic UUID (XOR-derived from base ID).
+  Original `memory_id` preserved in all chunk payloads for dedup at search time.
+- **FormulaStep Extensions**: Three new optional fields on `FormulaStep`:
+  `examples` (few-shot examples appended to prompt), `system_prompt`
+  (step-level override), `output_schema` (JSON schema for output validation).
+  All backward-compatible via `serde(default)`.
+- **Deadlock Detection**: Coordinator `task_timeout_loop` (60s interval) finds
+  tasks claimed longer than `task_claim_timeout_minutes` (default 30), resets
+  them to pending, re-publishes `task_available` to NATS, and logs the event.
+- **A2A Task Dispatch**: a2a-gateway subscribes to NATS
+  `{prefix}.{env}.agent.a2a-gateway.task` for coordinator-dispatched tasks.
+  `handle_dispatched_task()` performs LLM inference and completes the task
+  via bridge. Respects Ollama semaphore to prevent overload.
+- **Formula Examples**: Few-shot `examples` added to `synthesize_report`
+  (research), `produce_review` (daily-review), and `document_learnings`
+  (knowledge-gap) formula steps. `build-feature` formula: `test` and
+  `document` steps marked `group = 1` for parallel execution.
+- New config fields: `[chat].verifier_model`, `[chat].verifier_timeout_seconds`,
+  `[agents.*].system_prompt`, `[collaboration].task_claim_timeout_minutes`,
+  `[memory_search].chunk_max_tokens`, `[memory_search].chunk_overlap_tokens`.
+- 10 new unit tests in a2a-gateway (dispatch payload parsing, confidence
+  scoring, strip confidence tag, strip think tags). 271 workspace total.
+
+### Fixed
+
+- **Think Tag Leakage in Chat**: qwen3:30b-a3b MoE with `think:false` dumps
+  chain-of-thought directly into `message.content` — sometimes with only a
+  closing `</think>` tag, sometimes with no tags at all (when `num_predict`
+  is hit mid-thought). Fixed by switching all Ollama API calls to
+  `think:true`, which properly separates thinking into `message.thinking`
+  field. `strip_think_tags()` retained as safety net, now handles orphaned
+  `</think>` without opening tag.
+- **Qdrant Chunk ID Validation**: Chunk point IDs were generated as
+  `{uuid}-chunk-{i}` which Qdrant rejected (not a valid UUID). Fixed with
+  deterministic UUID generation via byte XOR on the base ID.
+
 ## [Unreleased]
 
 ### Added
@@ -317,6 +380,7 @@ Initial public release.
 - Bootstrap script for one-shot setup.
 - 129 unit tests, E2E test suite, integration test suites.
 
+[0.8.0]: https://github.com/broodlink/broodlink/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/broodlink/broodlink/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/broodlink/broodlink/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/broodlink/broodlink/compare/v0.4.0...v0.5.0

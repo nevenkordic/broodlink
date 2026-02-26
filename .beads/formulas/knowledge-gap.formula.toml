@@ -29,6 +29,19 @@ tools = ["store_memory", "semantic_search"]
 prompt = "Research and fill the top {{max_gaps}} priority knowledge gaps. Store new memories for each."
 input = "priorities"
 output = "filled"
+examples = """
+GOOD OUTPUT:
+## Knowledge Gap: [Topic]
+### What We Know
+- [Fact with source]
+### What We Don't Know
+- [Specific question]
+### Recommended Actions
+1. [Research action with estimated effort]
+
+BAD OUTPUT:
+"We should learn more about this." (no specifics, no actionable steps)
+"""
 
 [formula.parameters]
 max_gaps = { type = "integer", required = false, description = "Maximum number of gaps to fill", default = 5 }

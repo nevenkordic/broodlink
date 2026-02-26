@@ -120,8 +120,9 @@ kg_cleanup_interval_hours = 24                     # run cleanup every N hours
 kg_min_mention_count = 3                           # protect entities with >= N mentions from TTL pruning
 
 [collaboration]
-max_sub_tasks      = 10
-workspace_ttl_hours = 24
+max_sub_tasks              = 10
+workspace_ttl_hours        = 24
+task_claim_timeout_minutes = 30
 
 [dlq]
 auto_retry_enabled  = true
@@ -147,8 +148,10 @@ max_retries           = 3
 
 [chat]
 enabled = true
-chat_model = "qwen3:32b"
+chat_model = "qwen3:30b-a3b"
 chat_fallback_model = "qwen3:1.7b"
+verifier_model = "deepseek-r1:14b"
+verifier_timeout_seconds = 60
 max_context_messages = 10
 session_timeout_hours = 24
 reply_timeout_seconds = 300
@@ -187,6 +190,7 @@ skills             = [
     "report-writing", "task-decomposition", "formula-authoring",
     "code-review", "architectural-planning", "decision-making",
 ]
+system_prompt = "You are a strategic architect and planner. Focus on high-level design, trade-offs, and system-wide decisions. Be thorough in reasoning. Cite evidence from memory when making recommendations. If uncertain, say so."
 
 [agents.qwen3]
 agent_id           = "qwen3"
@@ -199,6 +203,7 @@ skills             = [
     "semantic-search", "knowledge-graph-query", "knowledge-extraction",
     "web-research", "codebase-analysis", "document-summarization",
 ]
+system_prompt = "You are a diligent research worker. Focus on thorough information gathering, semantic search, and document summarization. Be methodical, cite your sources, and flag gaps in available data."
 
 [agents.a2a-gateway]
 agent_id           = "a2a-gateway"
@@ -212,6 +217,7 @@ skills             = [
     "health-monitoring", "formula-execution",
     "incident-response", "notification-dispatch",
 ]
+system_prompt = "You are Broodlink, a helpful and concise AI assistant. Use memory context to personalize responses. When unsure, say so honestly rather than guessing."
 
 [agents.claude-code]
 agent_id           = "claude-code"
@@ -225,6 +231,7 @@ skills             = [
     "migration-authoring", "ci-cd-management",
     "schedule-task",
 ]
+system_prompt = "You are a software engineering specialist. Write clean, tested, maintainable code. Follow existing project conventions. Explain trade-offs when multiple approaches exist."
 
 # ---------------------------------------------------------------------------
 # Skill definitions: name → description (shared across agents)

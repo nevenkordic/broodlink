@@ -252,6 +252,8 @@ pub struct AgentConfig {
     pub preferred_formulas: Vec<String>,
     #[serde(default)]
     pub skills: Vec<String>,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
 }
 
 // --- v0.2.0 config structs ---
@@ -545,6 +547,11 @@ pub struct MemorySearchConfig {
     pub kg_cleanup_interval_hours: u32,
     #[serde(default = "default_kg_min_mention_count")]
     pub kg_min_mention_count: u32,
+    // v0.8.0: Content chunking
+    #[serde(default = "default_chunk_max_tokens")]
+    pub chunk_max_tokens: usize,
+    #[serde(default = "default_chunk_overlap_tokens")]
+    pub chunk_overlap_tokens: usize,
 }
 
 impl Default for MemorySearchConfig {
@@ -563,6 +570,8 @@ impl Default for MemorySearchConfig {
             kg_edge_decay_rate: default_kg_edge_decay_rate(),
             kg_cleanup_interval_hours: default_kg_cleanup_interval_hours(),
             kg_min_mention_count: default_kg_min_mention_count(),
+            chunk_max_tokens: default_chunk_max_tokens(),
+            chunk_overlap_tokens: default_chunk_overlap_tokens(),
         }
     }
 }
@@ -727,6 +736,8 @@ pub struct CollaborationConfig {
     pub max_sub_tasks: u32,
     #[serde(default = "default_workspace_ttl_hours")]
     pub workspace_ttl_hours: u32,
+    #[serde(default = "default_task_claim_timeout_minutes")]
+    pub task_claim_timeout_minutes: u32,
 }
 
 impl Default for CollaborationConfig {
@@ -734,6 +745,7 @@ impl Default for CollaborationConfig {
         Self {
             max_sub_tasks: default_max_sub_tasks(),
             workspace_ttl_hours: default_workspace_ttl_hours(),
+            task_claim_timeout_minutes: default_task_claim_timeout_minutes(),
         }
     }
 }
@@ -744,6 +756,10 @@ fn default_max_sub_tasks() -> u32 {
 
 fn default_workspace_ttl_hours() -> u32 {
     24
+}
+
+fn default_task_claim_timeout_minutes() -> u32 {
+    30
 }
 
 // --- v0.6.0: Webhook gateway ---
@@ -824,6 +840,11 @@ pub struct ChatConfig {
     pub memory_max_results: u32,
     #[serde(default)]
     pub tools: ChatToolsConfig,
+    // v0.8.0: Verification
+    #[serde(default)]
+    pub verifier_model: String,
+    #[serde(default = "default_verifier_timeout_seconds")]
+    pub verifier_timeout_seconds: u64,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -871,8 +892,14 @@ impl Default for ChatConfig {
             memory_enabled: default_chat_memory_enabled(),
             memory_max_results: default_chat_memory_max_results(),
             tools: ChatToolsConfig::default(),
+            verifier_model: String::new(),
+            verifier_timeout_seconds: default_verifier_timeout_seconds(),
         }
     }
+}
+
+fn default_verifier_timeout_seconds() -> u64 {
+    60
 }
 
 fn default_chat_enabled() -> bool {
@@ -988,6 +1015,14 @@ fn default_kg_cleanup_interval_hours() -> u32 {
 
 fn default_kg_min_mention_count() -> u32 {
     3
+}
+
+fn default_chunk_max_tokens() -> usize {
+    500
+}
+
+fn default_chunk_overlap_tokens() -> usize {
+    50
 }
 
 // --- Heartbeat config ---

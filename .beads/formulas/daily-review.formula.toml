@@ -29,6 +29,21 @@ tools = ["store_memory", "log_decision"]
 prompt = "Generate a daily summary report. Store it as a memory and log any decisions about priorities."
 input = ["metrics", "blockers"]
 output = "summary"
+examples = """
+GOOD OUTPUT:
+## Daily Review — [Date]
+### Metrics
+- Tasks completed: N
+- Tasks failed: N (root causes: ...)
+- Agent uptime: ...
+### Blockers
+1. [Specific blocker with suggested resolution]
+### Action Items
+- [ ] [Actionable item with owner]
+
+BAD OUTPUT:
+"Everything looks fine today." (no metrics, no specifics)
+"""
 
 [formula.parameters]
 date = { type = "string", required = false, description = "Date to review (defaults to today)", default = "today" }

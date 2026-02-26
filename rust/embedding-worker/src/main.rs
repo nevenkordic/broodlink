@@ -437,6 +437,30 @@ async fn fetch_pending_batch(state: &AppState) -> Result<Vec<OutboxRow>, Broodli
 }
 
 // ---------------------------------------------------------------------------
+// Content chunking for long texts
+// ---------------------------------------------------------------------------
+
+/// Split content into overlapping chunks for embedding.
+fn chunk_content(text: &str, max_tokens: usize, overlap: usize) -> Vec<String> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() <= max_tokens {
+        return vec![text.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < words.len() {
+        let end = (start + max_tokens).min(words.len());
+        chunks.push(words[start..end].join(" "));
+        if end >= words.len() {
+            break;
+        }
+        start = end.saturating_sub(overlap);
+    }
+    chunks
+}
+
+// ---------------------------------------------------------------------------
 // Process a single outbox row end-to-end
 // ---------------------------------------------------------------------------
 
@@ -492,24 +516,70 @@ async fn process_outbox_row(state: &AppState, row: &OutboxRow) -> Result<(), Bro
     // For "embed" operations: full pipeline (embed + qdrant + kg extract)
     // For "kg_extract" operations: skip embedding, only do kg extraction
     if row.operation == "embed" {
-        // Step 1: Get embedding from Ollama (with circuit breaker)
-        let embedding = match get_embedding(state, content).await {
-            Ok(vec) => vec,
-            Err(e) => {
+        let chunks = chunk_content(
+            content,
+            state.config.memory_search.chunk_max_tokens,
+            state.config.memory_search.chunk_overlap_tokens,
+        );
+
+        let now_str = chrono::Utc::now().to_rfc3339();
+        let qdrant_id = Uuid::new_v4().to_string();
+
+        if chunks.len() <= 1 {
+            // Original single-embedding path
+            let embedding = match get_embedding(state, content).await {
+                Ok(vec) => vec,
+                Err(e) => {
+                    return handle_failure(state, row, &e.to_string()).await;
+                }
+            };
+
+            if let Err(e) = upsert_qdrant(
+                state, &qdrant_id, &embedding, topic, agent_name, memory_id, &now_str,
+            )
+            .await
+            {
                 return handle_failure(state, row, &e.to_string()).await;
             }
-        };
-
-        // Step 2: Upsert into Qdrant (with circuit breaker)
-        let qdrant_id = Uuid::new_v4().to_string();
-        let now_str = chrono::Utc::now().to_rfc3339();
-
-        if let Err(e) = upsert_qdrant(
-            state, &qdrant_id, &embedding, topic, agent_name, memory_id, &now_str,
-        )
-        .await
-        {
-            return handle_failure(state, row, &e.to_string()).await;
+        } else {
+            // Multi-chunk path
+            info!(
+                outbox_id = %row.id,
+                chunks = chunks.len(),
+                "splitting content into chunks for embedding"
+            );
+            for (i, chunk) in chunks.iter().enumerate() {
+                // Generate a deterministic UUID for each chunk by modifying the
+                // base qdrant_id bytes with the chunk index.  This keeps the
+                // chunk point IDs stable across re-embeds for the same memory.
+                let chunk_qdrant_id = {
+                    let mut bytes = Uuid::parse_str(&qdrant_id)
+                        .unwrap_or_else(|_| Uuid::new_v4())
+                        .into_bytes();
+                    // XOR the last two bytes with the chunk index to make it unique
+                    bytes[14] ^= (i as u8).wrapping_add(1);
+                    bytes[15] ^= (i as u8).wrapping_add(0xAB);
+                    // Set version 4 + variant bits so it's still a valid UUID
+                    bytes[6] = (bytes[6] & 0x0F) | 0x40; // version 4
+                    bytes[8] = (bytes[8] & 0x3F) | 0x80; // variant 1
+                    Uuid::from_bytes(bytes).to_string()
+                };
+                let chunk_topic = format!("{topic} [part {}/{}]", i + 1, chunks.len());
+                match get_embedding(state, chunk).await {
+                    Ok(embedding) => {
+                        if let Err(e) = upsert_qdrant(
+                            state, &chunk_qdrant_id, &embedding, &chunk_topic, agent_name, memory_id, &now_str,
+                        )
+                        .await
+                        {
+                            warn!(chunk = i, error = %e, "failed to upsert chunk, skipping");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(chunk = i, error = %e, "failed to embed chunk, skipping");
+                    }
+                }
+            }
         }
 
         // Step 3: Update agent_memory in Dolt with embedding reference

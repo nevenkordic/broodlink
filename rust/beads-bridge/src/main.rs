@@ -690,6 +690,9 @@ static TOOL_REGISTRY: std::sync::LazyLock<Vec<serde_json::Value>> = std::sync::L
             tool_def("semantic_search", "Search memory using semantic vector similarity via Qdrant.", serde_json::json!({
                 "query": p_str("Natural language search query"),
                 "limit": p_int("Number of results (default 5)"),
+                "agent_id": p_str("Optional: filter by agent ID"),
+                "date_from": p_str("Optional: ISO date, return results after this date"),
+                "date_to": p_str("Optional: ISO date, return results before this date"),
             }), &["query"]),
             tool_def("hybrid_search", "Search memory using hybrid BM25 + semantic vector fusion with temporal decay and optional reranking.", serde_json::json!({
                 "query": p_str("Natural language search query"),
@@ -2066,6 +2069,9 @@ async fn tool_semantic_search(
 
     let query = param_str(params, "query")?;
     let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(5));
+    let agent_filter = param_str_opt(params, "agent_id");
+    let date_from = param_str_opt(params, "date_from");
+    let date_to = param_str_opt(params, "date_to");
 
     // Step 1: get embedding from Ollama
     let ollama_url = format!("{}/api/embeddings", state.config.ollama.url);
@@ -2109,7 +2115,29 @@ async fn tool_semantic_search(
         "{}/collections/{}/points/search",
         state.config.qdrant.url, state.config.qdrant.collection,
     );
-    let qdrant_body = serde_json::json!({
+
+    // Build Qdrant filter conditions
+    let mut must_conditions: Vec<serde_json::Value> = Vec::new();
+    if let Some(ref aid) = agent_filter {
+        must_conditions.push(serde_json::json!({
+            "key": "agent_id",
+            "match": {"value": aid}
+        }));
+    }
+    if let Some(ref from) = date_from {
+        must_conditions.push(serde_json::json!({
+            "key": "created_at",
+            "range": {"gte": from}
+        }));
+    }
+    if let Some(ref to) = date_to {
+        must_conditions.push(serde_json::json!({
+            "key": "created_at",
+            "range": {"lte": to}
+        }));
+    }
+
+    let mut qdrant_body = serde_json::json!({
         "vector": {
             "name": "default",
             "vector": embedding,
@@ -2117,6 +2145,9 @@ async fn tool_semantic_search(
         "limit": limit,
         "with_payload": true,
     });
+    if !must_conditions.is_empty() {
+        qdrant_body["filter"] = serde_json::json!({"must": must_conditions});
+    }
 
     let qdrant_resp = client
         .post(&qdrant_url)
@@ -2422,7 +2453,8 @@ async fn tool_hybrid_search(
     let semantic_weight = param_f64_opt(params, "semantic_weight").unwrap_or(0.6);
     let keyword_weight = param_f64_opt(params, "keyword_weight").unwrap_or(0.4);
     let decay_enabled = param_bool_opt(params, "decay").unwrap_or(true);
-    let rerank = param_bool_opt(params, "rerank").unwrap_or(false);
+    let rerank = param_bool_opt(params, "rerank")
+        .unwrap_or(state.config.memory_search.reranker_enabled);
 
     let lambda = state.config.memory_search.decay_lambda;
     let max_content_len = state.config.memory_search.max_content_length;
