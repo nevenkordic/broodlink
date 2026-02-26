@@ -116,6 +116,9 @@ struct TaskDispatchPayload {
     formula_name: Option<String>,
     convoy_id: Option<String>,
     assigned_by: String,
+    // v0.9.0: Model domain hint for smart routing
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_hint: Option<String>,
 }
 
 /// Payload received on the `workflow_start` subject.
@@ -213,6 +216,7 @@ struct ScoreBreakdown {
     availability: f64,
     cost: f64,
     recency: f64,
+    domain: f64,
 }
 
 /// Payload published when a routing decision is made.
@@ -358,6 +362,8 @@ fn compute_score(
     formula_name: Option<&str>,
     weights: &broodlink_config::RoutingWeights,
     new_agent_bonus: f64,
+    task_domain: Option<&str>,
+    agent_domains: &[String],
 ) -> (f64, ScoreBreakdown) {
     // Capability match: when a formula is specified, agents declaring that
     // capability in their JSON get 1.0; otherwise 0.5. When no formula is
@@ -388,11 +394,30 @@ fn compute_score(
     let cost = cost_tier_score(&agent.cost_tier);
     let recency = recency_score(agent.last_seen.as_deref());
 
+    // v0.9.0: Domain match score
+    let domain = match task_domain {
+        Some(td) => {
+            if agent_domains.is_empty() {
+                if td == "general" {
+                    1.0
+                } else {
+                    0.2
+                }
+            } else if agent_domains.iter().any(|d| d == td) {
+                1.0
+            } else {
+                0.2
+            }
+        }
+        None => 1.0,
+    };
+
     let score = capability * weights.capability
         + success_rate * weights.success_rate
         + availability * weights.availability
         + cost * weights.cost
-        + recency * weights.recency;
+        + recency * weights.recency
+        + domain * weights.domain;
 
     let breakdown = ScoreBreakdown {
         capability,
@@ -400,6 +425,7 @@ fn compute_score(
         availability,
         cost,
         recency,
+        domain,
     };
 
     (score, breakdown)
@@ -412,13 +438,26 @@ fn rank_agents(
     formula_name: Option<&str>,
     weights: &broodlink_config::RoutingWeights,
     new_agent_bonus: f64,
+    task_domain: Option<&str>,
+    agent_domain_map: &HashMap<String, Vec<String>>,
 ) -> Vec<ScoredAgent> {
     let mut scored: Vec<ScoredAgent> = agents
         .into_iter()
         .map(|agent| {
             let m = metrics.get(&agent.agent_id);
-            let (score, breakdown) =
-                compute_score(&agent, m, formula_name, weights, new_agent_bonus);
+            let domains = agent_domain_map
+                .get(&agent.agent_id)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let (score, breakdown) = compute_score(
+                &agent,
+                m,
+                formula_name,
+                weights,
+                new_agent_bonus,
+                task_domain,
+                domains,
+            );
             ScoredAgent {
                 agent,
                 score,
@@ -434,6 +473,82 @@ fn rank_agents(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     scored
+}
+
+// ---------------------------------------------------------------------------
+// v0.9.0: Model domain classification
+// ---------------------------------------------------------------------------
+
+/// Determine the model domain hint for a task dispatch.
+/// Checks formula name first, then falls back to keyword classification.
+fn determine_model_hint(
+    formula_name: Option<&str>,
+    description: Option<&str>,
+    config: &Config,
+) -> Option<String> {
+    // 1. Check formula metadata model_domain (from TOML file)
+    if let Some(name) = formula_name {
+        let path = format!("{}/{}.formula.toml", config.beads.formulas_dir, name);
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if let Ok(ff) = toml::from_str::<FormulaFile>(&contents) {
+                if let Some(domain) = &ff.formula.model_domain {
+                    return Some(domain.clone());
+                }
+            }
+        }
+    }
+
+    // 2. If code model isn't configured, no hint needed
+    if config.chat.chat_code_model.is_empty() {
+        return None;
+    }
+
+    // 3. Fall back to keyword classification of description
+    if let Some(desc) = description {
+        if classify_task_domain(desc) == "code" {
+            return Some("code".to_string());
+        }
+    }
+
+    None
+}
+
+/// Lightweight task description classifier (mirrors a2a-gateway's classify_model_domain).
+fn classify_task_domain(text: &str) -> &'static str {
+    let lower = text.to_lowercase();
+
+    if lower.contains("```") || lower.contains("~~~") {
+        return "code";
+    }
+
+    const CODE_SIGNALS: &[&str] = &[
+        ".rs",
+        ".py",
+        ".ts",
+        ".js",
+        ".go",
+        ".java",
+        "implement",
+        "refactor",
+        "debug",
+        "compile",
+        "unit test",
+        "integration test",
+        "code review",
+        "function",
+        "struct ",
+        "class ",
+        "migration",
+        "api endpoint",
+        "pull request",
+        "codebase",
+    ];
+    let hits = CODE_SIGNALS.iter().filter(|s| lower.contains(*s)).count();
+    if hits >= 2 {
+        return "code";
+    }
+
+    "general"
 }
 
 // ---------------------------------------------------------------------------
@@ -989,16 +1104,16 @@ async fn handle_task_completed(
         if let Some(ref result_data) = payload.result_data {
             if let Some(required) = schema.get("required").and_then(|r| r.as_array()) {
                 let valid = if let Some(obj) = result_data.as_object() {
-                    required.iter().all(|f| {
-                        f.as_str().map_or(true, |name| obj.contains_key(name))
-                    })
-                } else if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(
-                    result_data.as_str().unwrap_or("")
-                ) {
+                    required
+                        .iter()
+                        .all(|f| f.as_str().map_or(true, |name| obj.contains_key(name)))
+                } else if let Ok(parsed) =
+                    serde_json::from_str::<serde_json::Value>(result_data.as_str().unwrap_or(""))
+                {
                     if let Some(obj) = parsed.as_object() {
-                        required.iter().all(|f| {
-                            f.as_str().map_or(true, |name| obj.contains_key(name))
-                        })
+                        required
+                            .iter()
+                            .all(|f| f.as_str().map_or(true, |name| obj.contains_key(name)))
                     } else {
                         true // Not an object, skip validation
                     }
@@ -1640,6 +1755,16 @@ async fn handle_task_available(
     let formula_name = task.formula_name.as_deref();
     let routing_config = &state.config.routing;
 
+    // v0.9.0: Determine model domain for smart routing
+    let task_domain =
+        determine_model_hint(formula_name, task.description.as_deref(), &state.config);
+    let agent_domain_map: HashMap<String, Vec<String>> = state
+        .config
+        .agents
+        .iter()
+        .map(|(id, cfg)| (id.clone(), cfg.model_domains.clone()))
+        .collect();
+
     // 3. Outer retry loop: re-query agents on full exhaustion
     let mut claimed = false;
     let mut claiming_agent = String::new();
@@ -1699,6 +1824,8 @@ async fn handle_task_available(
             formula_name,
             &routing_config.weights,
             routing_config.new_agent_bonus,
+            task_domain.as_deref(),
+            &agent_domain_map,
         );
         candidates_evaluated = scored.len();
 
@@ -1803,6 +1930,7 @@ async fn handle_task_available(
             availability: 0.0,
             cost: 0.0,
             recency: 0.0,
+            domain: 0.0,
         }),
         candidates_evaluated,
         attempt: outer_attempt + 1,
@@ -1847,6 +1975,7 @@ async fn handle_task_available(
         formula_name: task.formula_name,
         convoy_id: task.convoy_id,
         assigned_by: SERVICE_NAME.to_string(),
+        model_hint: task_domain.clone(),
     };
 
     if let Ok(bytes) = serde_json::to_vec(&dispatch_payload) {
@@ -2599,6 +2728,7 @@ mod tests {
             availability: 0.20,
             cost: 0.15,
             recency: 0.05,
+            domain: 0.0,
         }
     }
 
@@ -2682,6 +2812,7 @@ mod tests {
             formula_name: None,
             convoy_id: None,
             assigned_by: "coordinator".to_string(),
+            model_hint: None,
         };
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["task_id"], "task-42");
@@ -2752,7 +2883,7 @@ mod tests {
     fn test_compute_score_no_metrics_uses_bonus() {
         let agent = make_agent("a1", "low");
         let weights = default_weights();
-        let (score, breakdown) = compute_score(&agent, None, None, &weights, 0.8);
+        let (score, breakdown) = compute_score(&agent, None, None, &weights, 0.8, None, &[]);
 
         // success_rate should use new_agent_bonus = 0.8
         assert!((breakdown.success_rate - 0.8).abs() < f64::EPSILON);
@@ -2771,7 +2902,8 @@ mod tests {
             current_load: 2,
         };
         let weights = default_weights();
-        let (score, breakdown) = compute_score(&agent, Some(&metrics), None, &weights, 1.0);
+        let (score, breakdown) =
+            compute_score(&agent, Some(&metrics), None, &weights, 1.0, None, &[]);
 
         assert!((breakdown.success_rate - 0.9).abs() < f64::EPSILON);
         // availability: 1.0 - (2/5) = 0.6
@@ -2789,7 +2921,7 @@ mod tests {
             current_load: 3,
         };
         let weights = default_weights();
-        let (_, breakdown) = compute_score(&agent, Some(&metrics), None, &weights, 1.0);
+        let (_, breakdown) = compute_score(&agent, Some(&metrics), None, &weights, 1.0, None, &[]);
 
         // availability: 1.0 - (3/3) = 0.0
         assert!(
@@ -2821,7 +2953,7 @@ mod tests {
         );
 
         let weights = default_weights();
-        let ranked = rank_agents(agents, &metrics, None, &weights, 1.0);
+        let ranked = rank_agents(agents, &metrics, None, &weights, 1.0, None, &HashMap::new());
 
         assert_eq!(ranked.len(), 2);
         assert_eq!(
@@ -2844,7 +2976,15 @@ mod tests {
         let metrics = HashMap::new(); // no metrics = new_agent_bonus
 
         let weights = default_weights();
-        let ranked = rank_agents(agents, &metrics, Some("review_code"), &weights, 1.0);
+        let ranked = rank_agents(
+            agents,
+            &metrics,
+            Some("review_code"),
+            &weights,
+            1.0,
+            None,
+            &HashMap::new(),
+        );
 
         // Agent with matching capability should rank higher
         assert_eq!(ranked[0].agent.agent_id, "a-cap");
@@ -2865,6 +3005,7 @@ mod tests {
                 availability: 0.8,
                 cost: 0.6,
                 recency: 0.5,
+                domain: 1.0,
             },
             candidates_evaluated: 3,
             attempt: 1,
@@ -2874,6 +3015,62 @@ mod tests {
         assert_eq!(json["agent_id"], "agent-1");
         assert_eq!(json["candidates_evaluated"], 3);
         assert!(json["breakdown"]["capability"].is_number());
+    }
+
+    // ----- v0.9.0: Domain routing tests -----
+
+    #[test]
+    fn test_compute_score_domain_match() {
+        let agent = make_agent("a1", "low");
+        let weights = default_weights();
+        // Override domain weight for testing
+        let mut w = weights;
+        w.domain = 0.15;
+        let agent_domains = vec!["code".to_string(), "general".to_string()];
+        let (_, bd) = compute_score(&agent, None, None, &w, 1.0, Some("code"), &agent_domains);
+        assert!(
+            (bd.domain - 1.0).abs() < f64::EPSILON,
+            "matching domain should score 1.0"
+        );
+    }
+
+    #[test]
+    fn test_compute_score_domain_no_match() {
+        let agent = make_agent("a1", "low");
+        let mut w = default_weights();
+        w.domain = 0.15;
+        let (_, bd) = compute_score(&agent, None, None, &w, 1.0, Some("code"), &[]);
+        assert!(
+            bd.domain < 0.5,
+            "no declared domains + code task should score low"
+        );
+    }
+
+    #[test]
+    fn test_compute_score_no_domain_constraint() {
+        let agent = make_agent("a1", "low");
+        let w = default_weights();
+        let (_, bd) = compute_score(&agent, None, None, &w, 1.0, None, &[]);
+        assert!(
+            (bd.domain - 1.0).abs() < f64::EPSILON,
+            "no domain constraint = 1.0 for all"
+        );
+    }
+
+    #[test]
+    fn test_classify_task_domain_code() {
+        assert_eq!(
+            classify_task_domain("implement a struct with unit tests"),
+            "code"
+        );
+    }
+
+    #[test]
+    fn test_classify_task_domain_general() {
+        assert_eq!(
+            classify_task_domain("summarize the quarterly report"),
+            "general"
+        );
     }
 
     // ----- Workflow orchestration tests -----

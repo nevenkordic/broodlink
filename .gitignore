@@ -29,6 +29,7 @@ __pycache__/
 *.log
 *.pid
 bin/
+scratch/
 
 # OS
 .DS_Store

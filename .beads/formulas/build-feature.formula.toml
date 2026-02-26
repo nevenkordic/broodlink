@@ -6,6 +6,7 @@
 name = "build-feature"
 version = "1.0.0"
 description = "End-to-end feature development: plan, implement, test, document"
+model_domain = "code"
 
 [[steps]]
 name = "plan"

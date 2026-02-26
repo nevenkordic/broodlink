@@ -74,11 +74,12 @@ burst                         = 10
 new_agent_bonus = 1.0
 
 [routing.weights]
-capability   = 0.35
+capability   = 0.30
 success_rate = 0.25
-availability = 0.20
-cost         = 0.15
+availability = 0.15
+cost         = 0.10
 recency      = 0.05
+domain       = 0.15
 
 [telemetry]
 enabled       = true
@@ -152,6 +153,8 @@ chat_model = "qwen3:30b-a3b"
 chat_fallback_model = "qwen3:1.7b"
 verifier_model = "deepseek-r1:14b"
 verifier_timeout_seconds = 60
+chat_code_model = "qwen3-coder-next"
+chat_vision_model = "gemma3:27b"
 max_context_messages = 10
 session_timeout_hours = 24
 reply_timeout_seconds = 300
@@ -168,6 +171,14 @@ max_tool_rounds = 3
 search_result_count = 5
 tool_context_messages = 10
 search_cache_ttl_secs = 300
+file_tools_enabled = true
+allowed_read_dirs  = ["~/broodlink", "~/Documents", "~/Desktop"]
+allowed_write_dirs = ["~/broodlink/scratch", "~/Desktop"]
+max_read_size_bytes = 10485760
+max_write_size_bytes = 1048576
+write_approval_timeout_secs = 120
+pdf_tools_enabled = true
+max_pdf_pages = 100
 
 [notifications]
 enabled = true
@@ -185,6 +196,7 @@ role               = "strategist"
 transport          = "mcp"
 cost_tier          = "high"
 preferred_formulas = ["research", "build-feature"]
+model_domains      = ["general", "code"]
 skills             = [
     "memory-recall", "memory-store", "task-execution", "self-reporting",
     "report-writing", "task-decomposition", "formula-authoring",
@@ -198,6 +210,7 @@ role               = "worker"
 transport          = "pymysql"
 cost_tier          = "low"
 preferred_formulas = ["daily-review", "knowledge-gap"]
+model_domains      = ["general"]
 skills             = [
     "memory-recall", "memory-store", "task-execution", "self-reporting",
     "semantic-search", "knowledge-graph-query", "knowledge-extraction",
@@ -211,6 +224,7 @@ role               = "worker"
 transport          = "mcp"
 cost_tier          = "low"
 preferred_formulas = []
+model_domains      = ["general", "code"]
 skills             = [
     "memory-recall", "memory-store", "task-execution", "self-reporting",
     "conversational-gateway", "model-failover", "webhook-dispatch",
@@ -225,6 +239,7 @@ role               = "strategist"
 transport          = "mcp"
 cost_tier          = "high"
 preferred_formulas = ["build-feature"]
+model_domains      = ["general", "code"]
 skills             = [
     "memory-recall", "memory-store", "task-execution", "self-reporting",
     "code-generation", "debugging", "testing",

@@ -254,6 +254,9 @@ pub struct AgentConfig {
     pub skills: Vec<String>,
     #[serde(default)]
     pub system_prompt: Option<String>,
+    // v0.9.0: Model domains this agent supports — e.g. ["general", "code"]
+    #[serde(default)]
+    pub model_domains: Vec<String>,
 }
 
 // --- v0.2.0 config structs ---
@@ -385,6 +388,9 @@ pub struct RoutingWeights {
     pub cost: f64,
     #[serde(default = "default_recency_weight")]
     pub recency: f64,
+    // v0.9.0: Domain match weight (code vs general)
+    #[serde(default = "default_domain_weight")]
+    pub domain: f64,
 }
 
 impl Default for RoutingWeights {
@@ -395,6 +401,7 @@ impl Default for RoutingWeights {
             availability: default_availability_weight(),
             cost: default_cost_weight(),
             recency: default_recency_weight(),
+            domain: default_domain_weight(),
         }
     }
 }
@@ -417,6 +424,10 @@ fn default_cost_weight() -> f64 {
 
 fn default_recency_weight() -> f64 {
     0.05
+}
+
+fn default_domain_weight() -> f64 {
+    0.0
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -845,6 +856,12 @@ pub struct ChatConfig {
     pub verifier_model: String,
     #[serde(default = "default_verifier_timeout_seconds")]
     pub verifier_timeout_seconds: u64,
+    // v0.9.0: Dedicated code model for programming tasks
+    #[serde(default)]
+    pub chat_code_model: String,
+    // v0.10.0: Vision model for image analysis
+    #[serde(default)]
+    pub chat_vision_model: String,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -861,6 +878,23 @@ pub struct ChatToolsConfig {
     pub tool_context_messages: u32,
     #[serde(default = "default_chat_search_cache_ttl")]
     pub search_cache_ttl_secs: u64,
+    // v0.10.0: File I/O tools
+    #[serde(default)]
+    pub file_tools_enabled: bool,
+    #[serde(default)]
+    pub allowed_read_dirs: Vec<String>,
+    #[serde(default)]
+    pub allowed_write_dirs: Vec<String>,
+    #[serde(default = "default_max_read_size")]
+    pub max_read_size_bytes: u64,
+    #[serde(default = "default_max_write_size")]
+    pub max_write_size_bytes: u64,
+    #[serde(default = "default_write_approval_timeout")]
+    pub write_approval_timeout_secs: u64,
+    #[serde(default)]
+    pub pdf_tools_enabled: bool,
+    #[serde(default = "default_max_pdf_pages")]
+    pub max_pdf_pages: u32,
 }
 
 impl Default for ChatToolsConfig {
@@ -872,6 +906,14 @@ impl Default for ChatToolsConfig {
             search_result_count: default_chat_search_result_count(),
             tool_context_messages: default_chat_tool_context_messages(),
             search_cache_ttl_secs: default_chat_search_cache_ttl(),
+            file_tools_enabled: false,
+            allowed_read_dirs: Vec::new(),
+            allowed_write_dirs: Vec::new(),
+            max_read_size_bytes: default_max_read_size(),
+            max_write_size_bytes: default_max_write_size(),
+            write_approval_timeout_secs: default_write_approval_timeout(),
+            pdf_tools_enabled: false,
+            max_pdf_pages: default_max_pdf_pages(),
         }
     }
 }
@@ -894,8 +936,23 @@ impl Default for ChatConfig {
             tools: ChatToolsConfig::default(),
             verifier_model: String::new(),
             verifier_timeout_seconds: default_verifier_timeout_seconds(),
+            chat_code_model: String::new(),
+            chat_vision_model: String::new(),
         }
     }
+}
+
+fn default_max_read_size() -> u64 {
+    10_485_760
+}
+fn default_max_write_size() -> u64 {
+    1_048_576
+}
+fn default_write_approval_timeout() -> u64 {
+    120
+}
+fn default_max_pdf_pages() -> u32 {
+    100
 }
 
 fn default_verifier_timeout_seconds() -> u64 {
@@ -1130,6 +1187,14 @@ impl Config {
         }
         if let Some(ref p) = cfg.tls.ca_path {
             cfg.tls.ca_path = Some(expand_tilde(p));
+        }
+
+        // v0.10.0: Expand tilde in file tool paths
+        for dir in &mut cfg.chat.tools.allowed_read_dirs {
+            *dir = expand_tilde(dir);
+        }
+        for dir in &mut cfg.chat.tools.allowed_write_dirs {
+            *dir = expand_tilde(dir);
         }
 
         cfg.validate()?;
@@ -1395,6 +1460,7 @@ api_key_name = "STATUS_API_KEY"
         assert!((cfg.routing.weights.availability - 0.20).abs() < f64::EPSILON);
         assert!((cfg.routing.weights.cost - 0.15).abs() < f64::EPSILON);
         assert!((cfg.routing.weights.recency - 0.05).abs() < f64::EPSILON);
+        assert!((cfg.routing.weights.domain - 0.0).abs() < f64::EPSILON);
         assert_eq!(cfg.routing.max_concurrent_default, 5);
         assert!((cfg.routing.new_agent_bonus - 1.0).abs() < f64::EPSILON);
 

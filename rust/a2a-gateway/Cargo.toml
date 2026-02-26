@@ -25,6 +25,7 @@ tokio-stream = { workspace = true }
 axum-server = { workspace = true }
 async-nats = { workspace = true }
 broodlink-runtime = { path = "../../crates/broodlink-runtime" }
+broodlink-fs = { path = "../../crates/broodlink-fs" }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 base64 = "0.22"

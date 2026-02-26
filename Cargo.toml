@@ -6,6 +6,7 @@ members = [
   "crates/broodlink-telemetry",
   "crates/broodlink-runtime",
   "crates/broodlink-formulas",
+  "crates/broodlink-fs",
   "rust/beads-bridge",
   "rust/coordinator",
   "rust/heartbeat",
@@ -55,6 +56,8 @@ tokio-stream        = "0.1"
 toml                = "0.8"
 hmac                = "0.12"
 sha2                = "0.10"
+pdf-extract         = "0.7"
+base64              = "0.22"
 
 [profile.release]
 strip = true

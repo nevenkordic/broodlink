@@ -41,6 +41,9 @@ pub struct FormulaMetadata {
     /// Parameters in TOML dict form: `{ param_name = { type, required, ... } }`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parameters: Option<BTreeMap<String, FormulaParam>>,
+    /// v0.9.0: Default model domain for all steps — "code", "general", etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_domain: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -70,6 +73,9 @@ pub struct FormulaStep {
     pub system_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<serde_json::Value>,
+    /// v0.9.0: Model domain hint — "code", "general", or None (auto-detect)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_domain: Option<String>,
 }
 
 /// A step's input can be a single key or multiple keys.
@@ -420,12 +426,18 @@ fn jsonb_to_formula_file(
         }
     });
 
+    let model_domain = formula_section
+        .and_then(|f| f.get("model_domain"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
     Ok(FormulaFile {
         formula: FormulaMetadata {
             name: name.to_string(),
             version,
             description,
             parameters,
+            model_domain,
         },
         steps,
         on_failure,

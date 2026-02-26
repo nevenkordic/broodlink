@@ -1118,6 +1118,17 @@ static TOOL_REGISTRY: std::sync::LazyLock<Vec<serde_json::Value>> = std::sync::L
                 "enabled": p_bool("Enable/disable formula (optional)"),
                 "tags": p_str("New tags as JSON array string (optional)"),
             }), &["name"]),
+            // --- File I/O (v0.10.0) ---
+            tool_def("read_file", "Read a text file from disk within allowed directories.", serde_json::json!({
+                "path": p_str("Absolute path to the file"),
+            }), &["path"]),
+            tool_def("write_file", "Write content to a file within allowed directories.", serde_json::json!({
+                "path": p_str("Absolute path to the file"),
+                "content": p_str("Content to write"),
+            }), &["path", "content"]),
+            tool_def("read_pdf", "Extract text from a PDF file within allowed directories.", serde_json::json!({
+                "path": p_str("Absolute path to the PDF file"),
+            }), &["path"]),
         ]
     },
 );
@@ -1515,6 +1526,11 @@ async fn tool_dispatch(
         "get_formula" => tool_get_formula(&state, params).await,
         "create_formula" => tool_create_formula(&state, params).await,
         "update_formula" => tool_update_formula(&state, params).await,
+
+        // --- File I/O (v0.10.0) ---
+        "read_file" => tool_read_file(&state, params).await,
+        "write_file" => tool_write_file(&state, params).await,
+        "read_pdf" => tool_read_pdf(&state, params).await,
 
         "ping" => Ok(serde_json::json!({ "pong": true })),
 
@@ -2453,8 +2469,8 @@ async fn tool_hybrid_search(
     let semantic_weight = param_f64_opt(params, "semantic_weight").unwrap_or(0.6);
     let keyword_weight = param_f64_opt(params, "keyword_weight").unwrap_or(0.4);
     let decay_enabled = param_bool_opt(params, "decay").unwrap_or(true);
-    let rerank = param_bool_opt(params, "rerank")
-        .unwrap_or(state.config.memory_search.reranker_enabled);
+    let rerank =
+        param_bool_opt(params, "rerank").unwrap_or(state.config.memory_search.reranker_enabled);
 
     let lambda = state.config.memory_search.decay_lambda;
     let max_content_len = state.config.memory_search.max_content_length;
@@ -6400,6 +6416,118 @@ async fn tool_update_formula(
     }))
 }
 
+// ---------------------------------------------------------------------------
+// File I/O tools (v0.10.0)
+// ---------------------------------------------------------------------------
+
+async fn tool_read_file(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let path = param_str(params, "path")?;
+    let tool_cfg = &state.config.chat.tools;
+
+    if !tool_cfg.file_tools_enabled {
+        return Err(BroodlinkError::Validation {
+            field: "path".to_string(),
+            message: "file tools are disabled".to_string(),
+        });
+    }
+
+    let canonical = broodlink_fs::validate_read_path(
+        path,
+        &tool_cfg.allowed_read_dirs,
+        tool_cfg.max_read_size_bytes,
+    )
+    .map_err(|e| BroodlinkError::Validation {
+        field: "path".to_string(),
+        message: e,
+    })?;
+
+    let content = broodlink_fs::read_file_safe(&canonical, tool_cfg.max_read_size_bytes)
+        .map_err(|e| BroodlinkError::Internal(e))?;
+
+    Ok(serde_json::json!({
+        "path": canonical.display().to_string(),
+        "content": content,
+        "size_bytes": content.len(),
+    }))
+}
+
+async fn tool_write_file(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let path = param_str(params, "path")?;
+    let content = param_str(params, "content")?;
+    let tool_cfg = &state.config.chat.tools;
+
+    if !tool_cfg.file_tools_enabled {
+        return Err(BroodlinkError::Validation {
+            field: "path".to_string(),
+            message: "file tools are disabled".to_string(),
+        });
+    }
+
+    let canonical = broodlink_fs::validate_write_path(
+        path,
+        &tool_cfg.allowed_write_dirs,
+        content.len() as u64,
+        tool_cfg.max_write_size_bytes,
+    )
+    .map_err(|e| BroodlinkError::Validation {
+        field: "path".to_string(),
+        message: e,
+    })?;
+
+    broodlink_fs::write_file_safe(
+        &canonical,
+        content.as_bytes(),
+        tool_cfg.max_write_size_bytes,
+    )
+    .map_err(|e| BroodlinkError::Internal(e))?;
+
+    Ok(serde_json::json!({
+        "path": canonical.display().to_string(),
+        "status": "written",
+        "size_bytes": content.len(),
+    }))
+}
+
+async fn tool_read_pdf(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let path = param_str(params, "path")?;
+    let tool_cfg = &state.config.chat.tools;
+
+    if !tool_cfg.pdf_tools_enabled {
+        return Err(BroodlinkError::Validation {
+            field: "path".to_string(),
+            message: "PDF tools are disabled".to_string(),
+        });
+    }
+
+    let canonical = broodlink_fs::validate_read_path(
+        path,
+        &tool_cfg.allowed_read_dirs,
+        tool_cfg.max_read_size_bytes,
+    )
+    .map_err(|e| BroodlinkError::Validation {
+        field: "path".to_string(),
+        message: e,
+    })?;
+
+    let content = broodlink_fs::read_pdf_safe(&canonical, tool_cfg.max_pdf_pages)
+        .map_err(|e| BroodlinkError::Internal(e))?;
+
+    Ok(serde_json::json!({
+        "path": canonical.display().to_string(),
+        "content": content,
+        "size_bytes": content.len(),
+    }))
+}
+
 async fn check_guardrails(
     state: &AppState,
     agent_id: &str,
@@ -8367,8 +8495,8 @@ mod tests {
         // Must match the number of match arms in tool_dispatch (excluding the _ fallback)
         assert_eq!(
             TOOL_REGISTRY.len(),
-            90,
-            "tool registry should have 90 tools"
+            93,
+            "tool registry should have 93 tools"
         );
     }
 
@@ -9297,6 +9425,53 @@ mod tests {
         assert!(
             names.contains(&"update_formula"),
             "registry missing update_formula"
+        );
+        // v0.10.0 file tools
+        assert!(names.contains(&"read_file"), "registry missing read_file");
+        assert!(names.contains(&"write_file"), "registry missing write_file");
+        assert!(names.contains(&"read_pdf"), "registry missing read_pdf");
+    }
+
+    #[test]
+    fn test_file_tool_schemas() {
+        let names: Vec<&str> = TOOL_REGISTRY
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+
+        // read_file: requires path
+        let idx = names.iter().position(|n| *n == "read_file").unwrap();
+        let rf = &TOOL_REGISTRY[idx]["function"];
+        let required = rf["parameters"]["required"].as_array().unwrap();
+        assert!(required.iter().any(|v| v == "path"));
+
+        // write_file: requires path + content
+        let idx = names.iter().position(|n| *n == "write_file").unwrap();
+        let wf = &TOOL_REGISTRY[idx]["function"];
+        let required = wf["parameters"]["required"].as_array().unwrap();
+        assert!(required.iter().any(|v| v == "path"));
+        assert!(required.iter().any(|v| v == "content"));
+
+        // read_pdf: requires path
+        let idx = names.iter().position(|n| *n == "read_pdf").unwrap();
+        let rp = &TOOL_REGISTRY[idx]["function"];
+        let required = rp["parameters"]["required"].as_array().unwrap();
+        assert!(required.iter().any(|v| v == "path"));
+    }
+
+    #[test]
+    fn test_file_tools_not_readonly() {
+        assert!(
+            !is_readonly_tool("read_file"),
+            "read_file should NOT be readonly"
+        );
+        assert!(
+            !is_readonly_tool("write_file"),
+            "write_file should NOT be readonly"
+        );
+        assert!(
+            !is_readonly_tool("read_pdf"),
+            "read_pdf should NOT be readonly"
         );
     }
 

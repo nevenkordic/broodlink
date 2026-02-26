@@ -568,7 +568,13 @@ async fn process_outbox_row(state: &AppState, row: &OutboxRow) -> Result<(), Bro
                 match get_embedding(state, chunk).await {
                     Ok(embedding) => {
                         if let Err(e) = upsert_qdrant(
-                            state, &chunk_qdrant_id, &embedding, &chunk_topic, agent_name, memory_id, &now_str,
+                            state,
+                            &chunk_qdrant_id,
+                            &embedding,
+                            &chunk_topic,
+                            agent_name,
+                            memory_id,
+                            &now_str,
                         )
                         .await
                         {

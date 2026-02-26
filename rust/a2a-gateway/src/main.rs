@@ -163,6 +163,33 @@ struct AppState {
     primary_model_degraded: AtomicBool,
     /// When the primary model entered degraded mode. Used to periodically retry.
     degraded_since: tokio::sync::RwLock<Option<std::time::Instant>>,
+    // v0.9.0: Code model degraded tracking (mirrors primary model pattern)
+    code_model_degraded: AtomicBool,
+    code_model_degraded_since: tokio::sync::RwLock<Option<std::time::Instant>>,
+    // v0.10.0: Pending write approvals — approval_id → (path, content, oneshot::Sender)
+    pending_writes: tokio::sync::RwLock<HashMap<String, PendingWriteEntry>>,
+}
+
+/// v0.10.0: Pending write approval waiting for user confirmation.
+#[allow(dead_code)]
+struct PendingWriteEntry {
+    path: std::path::PathBuf,
+    content: String,
+    sender: tokio::sync::oneshot::Sender<bool>,
+}
+
+/// v0.10.0: Parameters for `call_ollama_chat` — avoids growing the function signature.
+struct ChatParams<'a> {
+    model_override: Option<&'a str>,
+    images: Option<Vec<String>>,
+    chat_ctx: Option<ChatContext>,
+}
+
+/// v0.10.0: Identifies the chat platform + conversation for write approval routing.
+#[derive(Clone)]
+struct ChatContext {
+    platform: String,
+    chat_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -337,6 +364,9 @@ async fn async_main() {
         inflight_chats: tokio::sync::RwLock::new(HashMap::new()),
         primary_model_degraded: AtomicBool::new(false),
         degraded_since: tokio::sync::RwLock::new(None),
+        code_model_degraded: AtomicBool::new(false),
+        code_model_degraded_since: tokio::sync::RwLock::new(None),
+        pending_writes: tokio::sync::RwLock::new(HashMap::new()),
     });
 
     // Spawn chat reply delivery loop
@@ -351,7 +381,7 @@ async fn async_main() {
     {
         let st = Arc::clone(&state);
         tokio::spawn(async move {
-            telegram_polling_loop(&st).await;
+            telegram_polling_loop(st.clone()).await;
         });
     }
 
@@ -573,6 +603,12 @@ async fn async_main() {
                                 continue;
                             }
 
+                            // v0.9.0: Extract model_hint from coordinator dispatch
+                            let model_hint = payload
+                                .get("model_hint")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+
                             // Use description if available, fall back to title
                             let prompt = if description.is_empty() {
                                 title
@@ -585,7 +621,8 @@ async fn async_main() {
 
                             let st_inner = Arc::clone(&st_dispatch);
                             tokio::spawn(async move {
-                                handle_dispatched_task(&st_inner, &task_id, &prompt).await;
+                                handle_dispatched_task(&st_inner, &task_id, &prompt, model_hint)
+                                    .await;
                             });
                         }
                     }
@@ -1365,6 +1402,8 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
         &chat_cfg.chat_model
     };
 
+    let code_model_degraded = state.code_model_degraded.load(Ordering::Relaxed);
+
     axum::Json(serde_json::json!({
         "status": status,
         "service": SERVICE_NAME,
@@ -1374,7 +1413,9 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
             "bridge": bridge_ok,
         },
         "model_degraded": model_degraded,
+        "code_model_degraded": code_model_degraded,
         "chat_model": chat_cfg.chat_model,
+        "chat_code_model": chat_cfg.chat_code_model,
         "active_model": active_model,
         "degraded_seconds": degraded_secs,
     }))
@@ -2119,8 +2160,32 @@ async fn webhook_telegram_handler(
         }
     };
 
+    // v0.10.0: Handle callback queries (write approval inline buttons)
+    if let Some(callback) = payload.get("callback_query") {
+        handle_write_callback(&state, callback).await;
+        return (StatusCode::OK, "").into_response();
+    }
+
     let message = payload.get("message").unwrap_or(&payload);
-    let text = message.get("text").and_then(|t| t.as_str()).unwrap_or("");
+    let raw_text = message.get("text").and_then(|t| t.as_str()).unwrap_or("");
+    // v0.10.0: Photos use caption instead of text
+    let caption = message
+        .get("caption")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    let text = if raw_text.is_empty() {
+        caption
+    } else {
+        raw_text
+    };
+    // v0.10.0: Extract photo file_id (Telegram sends array of sizes, take largest)
+    let photo_file_id = message
+        .get("photo")
+        .and_then(|p| p.as_array())
+        .and_then(|arr| arr.last())
+        .and_then(|p| p.get("file_id"))
+        .and_then(|f| f.as_str());
+    let has_photo = photo_file_id.is_some();
     let user_name = message
         .get("from")
         .and_then(|f| f.get("first_name"))
@@ -2208,8 +2273,8 @@ async fn webhook_telegram_handler(
         }
     }
 
-    // Conversational message (non-command)
-    if state.config.chat.enabled && !text.is_empty() {
+    // Conversational message (non-command) — also proceed for photos without text
+    if state.config.chat.enabled && (!text.is_empty() || has_photo) {
         let chat_id_str = chat_id.to_string();
         let user_id_str = user_id_val.to_string();
 
@@ -2235,13 +2300,26 @@ async fn webhook_telegram_handler(
             }
         }
 
+        // For photo-only messages, provide a default prompt
+        let chat_text = if text.is_empty() && has_photo {
+            "What's in this image?"
+        } else {
+            text
+        };
+
+        // Acquire the Ollama semaphore BEFORE creating the task so the
+        // inline path always holds it when the NATS dispatch arrives.
+        let permit = state.ollama_semaphore.acquire().await;
+        let is_busy = permit.is_err();
+        let _permit = permit.ok();
+
         let session_id = handle_chat_message(
             &state,
             "telegram",
             &chat_id_str,
             &user_id_str,
             user_name,
-            text,
+            chat_text,
             thread_id.as_deref(),
             None,
         )
@@ -2255,25 +2333,45 @@ async fn webhook_telegram_handler(
         };
 
         // Generate LLM reply with typing indicator refresh
-        let is_busy;
-        let llm_reply = match state.ollama_semaphore.try_acquire() {
-            Ok(_permit) => {
-                is_busy = false;
-                send_telegram_typing(&state, &chat_id_str).await;
-                tokio::select! {
-                    r = call_ollama_chat(&state, &history) => r,
-                    _ = async {
-                        loop {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
-                            send_telegram_typing(&state, &chat_id_str).await;
-                        }
-                    } => unreachable!(),
+        let llm_reply = if !is_busy {
+            send_telegram_typing(&state, &chat_id_str).await;
+
+            // v0.10.0: Download photo if present
+            let images = if let Some(file_id) = photo_file_id {
+                match download_telegram_file(&state, file_id).await {
+                    Ok(bytes) => {
+                        use base64::Engine;
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        Some(vec![b64])
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "failed to download telegram photo");
+                        None
+                    }
                 }
+            } else {
+                None
+            };
+
+            let chat_params = ChatParams {
+                model_override: None,
+                images,
+                chat_ctx: Some(ChatContext {
+                    platform: "telegram".to_string(),
+                    chat_id: chat_id_str.clone(),
+                }),
+            };
+            tokio::select! {
+                r = call_ollama_chat(&state, &history, &chat_params) => r,
+                _ = async {
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
+                        send_telegram_typing(&state, &chat_id_str).await;
+                    }
+                } => unreachable!(),
             }
-            Err(_) => {
-                is_busy = true;
-                state.config.a2a.busy_message.clone()
-            }
+        } else {
+            state.config.a2a.busy_message.clone()
         };
 
         // Remove from in-flight
@@ -2317,9 +2415,34 @@ async fn webhook_telegram_handler(
 
 /// Process a single Telegram update object.  Returns an optional reply text.
 async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -> Option<String> {
+    // v0.10.0: Handle callback queries (write approval buttons)
+    if let Some(callback) = update.get("callback_query") {
+        handle_write_callback(state, callback).await;
+        return None;
+    }
+
     let message = update.get("message")?;
-    let text = message.get("text").and_then(|t| t.as_str()).unwrap_or("");
-    if text.is_empty() {
+    let raw_text = message.get("text").and_then(|t| t.as_str()).unwrap_or("");
+    // v0.10.0: Photos use caption instead of text
+    let caption = message
+        .get("caption")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    let text = if raw_text.is_empty() {
+        caption
+    } else {
+        raw_text
+    };
+    // v0.10.0: Extract photo file_id (Telegram sends array of sizes, take largest)
+    let photo_file_id = message
+        .get("photo")
+        .and_then(|p| p.as_array())
+        .and_then(|arr| arr.last())
+        .and_then(|p| p.get("file_id"))
+        .and_then(|f| f.as_str());
+    let has_photo = photo_file_id.is_some();
+
+    if text.is_empty() && !has_photo {
         return None;
     }
 
@@ -2368,13 +2491,14 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
         }
     }
 
-    // Conversational message
-    if state.config.chat.enabled {
+    // Conversational message — also proceed for photos without text
+    if state.config.chat.enabled && (!text.is_empty() || has_photo) {
         let chat_id_str = chat_id.to_string();
         let user_id_str = user_id_val.to_string();
 
         // Dedup: skip if same message is already in-flight (before DB/bridge work)
-        let dedup_key = chat_dedup_key("telegram", &chat_id_str, text);
+        let dedup_text = if text.is_empty() { "[photo]" } else { text };
+        let dedup_key = chat_dedup_key("telegram", &chat_id_str, dedup_text);
         let dedup_window = std::time::Duration::from_secs(state.config.a2a.dedup_window_secs);
         {
             let mut guard = state.inflight_chats.write().await;
@@ -2390,13 +2514,28 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
             }
         }
 
+        // For photo-only messages, provide a default prompt
+        let chat_text = if text.is_empty() && has_photo {
+            "What's in this image?"
+        } else {
+            text
+        };
+
+        // Acquire the Ollama semaphore BEFORE creating the task so the
+        // inline path always holds it when the NATS dispatch arrives.
+        // This prevents the race where dispatch wins and the response
+        // is lost (handle_task_completion_for_chat can't find task in Postgres).
+        let permit = state.ollama_semaphore.acquire().await;
+        let is_busy = permit.is_err();
+        let _permit = permit.ok();
+
         let session_id = handle_chat_message(
             state,
             "telegram",
             &chat_id_str,
             &user_id_str,
             user_name,
-            text,
+            chat_text,
             thread_id.as_deref(),
             None,
         )
@@ -2410,25 +2549,45 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
         };
 
         // Generate LLM reply with typing indicator refresh
-        let is_busy;
-        let reply = match state.ollama_semaphore.try_acquire() {
-            Ok(_permit) => {
-                is_busy = false;
-                send_telegram_typing(state, &chat_id_str).await;
-                tokio::select! {
-                    r = call_ollama_chat(state, &history) => r,
-                    _ = async {
-                        loop {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
-                            send_telegram_typing(state, &chat_id_str).await;
-                        }
-                    } => unreachable!(),
+        let reply = if !is_busy {
+            send_telegram_typing(state, &chat_id_str).await;
+
+            // v0.10.0: Download photo if present
+            let images = if let Some(file_id) = photo_file_id {
+                match download_telegram_file(state, file_id).await {
+                    Ok(bytes) => {
+                        use base64::Engine;
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        Some(vec![b64])
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "failed to download telegram photo");
+                        None
+                    }
                 }
+            } else {
+                None
+            };
+
+            let chat_params = ChatParams {
+                model_override: None,
+                images,
+                chat_ctx: Some(ChatContext {
+                    platform: "telegram".to_string(),
+                    chat_id: chat_id_str.clone(),
+                }),
+            };
+            tokio::select! {
+                r = call_ollama_chat(state, &history, &chat_params) => r,
+                _ = async {
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
+                        send_telegram_typing(state, &chat_id_str).await;
+                    }
+                } => unreachable!(),
             }
-            Err(_) => {
-                is_busy = true;
-                state.config.a2a.busy_message.clone()
-            }
+        } else {
+            state.config.a2a.busy_message.clone()
         };
 
         // Remove from in-flight
@@ -2460,7 +2619,7 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
 // Telegram long-polling loop (no public URL required)
 // ---------------------------------------------------------------------------
 
-async fn telegram_polling_loop(state: &AppState) {
+async fn telegram_polling_loop(state: Arc<AppState>) {
     info!("Telegram polling loop started");
 
     // Restore offset from DB to avoid duplicate processing on restart
@@ -2480,7 +2639,7 @@ async fn telegram_polling_loop(state: &AppState) {
     }
 
     loop {
-        let (token_opt, _, _, _) = get_telegram_creds(state).await;
+        let (token_opt, _, _, _) = get_telegram_creds(&state).await;
         let token = match token_opt {
             Some(t) if !t.is_empty() => t,
             _ => {
@@ -2536,7 +2695,7 @@ async fn telegram_polling_loop(state: &AppState) {
         };
 
         // Re-fetch credentials before processing (may have changed during 30s poll)
-        let (_, _, allowed_users, auth_code) = get_telegram_creds(state).await;
+        let (_, _, allowed_users, auth_code) = get_telegram_creds(&state).await;
 
         let mut offset_changed = false;
         for update in updates {
@@ -2546,6 +2705,12 @@ async fn telegram_polling_loop(state: &AppState) {
                     offset = uid + 1;
                     offset_changed = true;
                 }
+            }
+
+            // v0.10.0: Handle callback queries in polling mode
+            if let Some(callback) = update.get("callback_query") {
+                handle_write_callback(&state, callback).await;
+                continue;
             }
 
             // Auth gate: check access code or allow list
@@ -2576,7 +2741,7 @@ async fn telegram_polling_loop(state: &AppState) {
                             user_id = sender_id,
                             "auth code accepted"
                         );
-                        if let Err(e) = add_telegram_allowed_user(state, sender_id).await {
+                        if let Err(e) = add_telegram_allowed_user(&state, sender_id).await {
                             warn!(error = %e, "failed to persist allowed user");
                         }
                         let sender_name = update
@@ -2587,7 +2752,7 @@ async fn telegram_polling_loop(state: &AppState) {
                             .unwrap_or("there");
                         if msg_chat_id != 0 {
                             let _ = deliver_telegram(
-                                state,
+                                &state,
                                 &msg_chat_id.to_string(),
                                 None,
                                 &format!("Authenticated! Welcome, {sender_name}."),
@@ -2600,7 +2765,7 @@ async fn telegram_polling_loop(state: &AppState) {
                     warn!(user_id = sender_id, "telegram user not authenticated");
                     if msg_chat_id != 0 {
                         let _ = deliver_telegram(
-                            state,
+                            &state,
                             &msg_chat_id.to_string(),
                             None,
                             "Send the access code to use this bot.",
@@ -2619,28 +2784,33 @@ async fn telegram_polling_loop(state: &AppState) {
                 }
             }
 
-            if let Some(reply) = process_telegram_update(state, update).await {
-                // Send reply back
-                let chat_id = update
-                    .get("message")
-                    .and_then(|m| m.get("chat"))
-                    .and_then(|c| c.get("id"))
-                    .and_then(|id| id.as_i64())
-                    .unwrap_or(0);
+            // Spawn message processing so the polling loop can continue
+            // (needed for write approval: callback arrives in a future poll)
+            let update_owned = update.clone();
+            let state_ref = Arc::clone(&state);
+            tokio::spawn(async move {
+                if let Some(reply) = process_telegram_update(&state_ref, &update_owned).await {
+                    let chat_id = update_owned
+                        .get("message")
+                        .and_then(|m| m.get("chat"))
+                        .and_then(|c| c.get("id"))
+                        .and_then(|id| id.as_i64())
+                        .unwrap_or(0);
 
-                if chat_id != 0 {
-                    info!(
-                        chat_id = chat_id,
-                        reply_len = reply.len(),
-                        "sending Telegram reply"
-                    );
-                    if let Err(e) =
-                        deliver_telegram(state, &chat_id.to_string(), None, &reply).await
-                    {
-                        warn!(error = %e, chat_id = chat_id, "failed to send polling reply");
+                    if chat_id != 0 {
+                        info!(
+                            chat_id = chat_id,
+                            reply_len = reply.len(),
+                            "sending Telegram reply"
+                        );
+                        if let Err(e) =
+                            deliver_telegram(&state_ref, &chat_id.to_string(), None, &reply).await
+                        {
+                            warn!(error = %e, chat_id = chat_id, "failed to send polling reply");
+                        }
                     }
                 }
-            }
+            });
         }
 
         // Persist offset to DB so restarts don't re-process messages
@@ -3049,15 +3219,27 @@ async fn handle_task_completion_for_chat(
 // Dispatched task handler — performs LLM inference for coordinator-assigned tasks
 // ---------------------------------------------------------------------------
 
-async fn handle_dispatched_task(state: &AppState, task_id: &str, description: &str) {
-    info!(task_id = task_id, "handling dispatched task");
+async fn handle_dispatched_task(
+    state: &AppState,
+    task_id: &str,
+    description: &str,
+    model_hint: Option<String>,
+) {
+    info!(task_id = task_id, model_hint = ?model_hint, "handling dispatched task");
 
     // Build a minimal conversation: the task description as a user message
     let history = vec![("user".to_string(), description.to_string())];
 
     // Acquire the Ollama semaphore to respect concurrency limits
     let reply = match state.ollama_semaphore.try_acquire() {
-        Ok(_permit) => call_ollama_chat(state, &history).await,
+        Ok(_permit) => {
+            let chat_params = ChatParams {
+                model_override: model_hint.as_deref(),
+                images: None,
+                chat_ctx: None,
+            };
+            call_ollama_chat(state, &history, &chat_params).await
+        }
         Err(_) => {
             warn!(task_id = task_id, "Ollama busy, failing dispatched task");
             let _ = bridge_call(
@@ -3070,7 +3252,11 @@ async fn handle_dispatched_task(state: &AppState, task_id: &str, description: &s
         }
     };
 
-    info!(task_id = task_id, result_len = reply.len(), "dispatched task inference complete");
+    info!(
+        task_id = task_id,
+        result_len = reply.len(),
+        "dispatched task inference complete"
+    );
 
     // Complete the task via beads-bridge (publishes task_completed to NATS automatically)
     if let Err(e) = bridge_call(
@@ -3104,6 +3290,54 @@ async fn send_telegram_typing(state: &AppState, chat_id: &str) {
         .json(&serde_json::json!({"chat_id": chat_id, "action": "typing"}))
         .send()
         .await;
+}
+
+/// v0.10.0: Download a Telegram file by file_id and return raw bytes.
+async fn download_telegram_file(state: &AppState, file_id: &str) -> Result<Vec<u8>, String> {
+    let (token_opt, _, _, _) = get_telegram_creds(state).await;
+    let token = token_opt
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| "no telegram token".to_string())?;
+
+    // Step 1: Get file path from Telegram
+    let url = format!(
+        "https://api.telegram.org/bot{}/getFile?file_id={}",
+        token, file_id
+    );
+    let resp: serde_json::Value = state
+        .http_client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("getFile request failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("getFile parse failed: {e}"))?;
+
+    let file_path = resp
+        .get("result")
+        .and_then(|r| r.get("file_path"))
+        .and_then(|p| p.as_str())
+        .ok_or_else(|| "no file_path in getFile response".to_string())?;
+
+    // Step 2: Download file bytes
+    let download_url = format!("https://api.telegram.org/file/bot{}/{}", token, file_path);
+    let bytes = state
+        .http_client
+        .get(&download_url)
+        .send()
+        .await
+        .map_err(|e| format!("file download failed: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("file read failed: {e}"))?;
+
+    // Enforce 20MB limit (Telegram API limit)
+    if bytes.len() > 20_971_520 {
+        return Err("file too large (max 20MB)".to_string());
+    }
+
+    Ok(bytes.to_vec())
 }
 
 // ---------------------------------------------------------------------------
@@ -3282,11 +3516,13 @@ async fn handle_ollama_recovery(
 
     // Step 3: Retry the primary model (single attempt, no tools — keep it simple)
     info!(model = %primary_model, "retrying primary model after recovery");
+    // Vision models (gemma3) don't support thinking
+    let is_vision_model = primary_model == state.config.chat.chat_vision_model;
     let retry_payload = serde_json::json!({
         "model": primary_model,
         "messages": messages,
         "stream": false,
-        "think": true,
+        "think": !is_vision_model,
         "options": {
             "temperature": 0.7,
             "num_predict": 512,
@@ -3303,8 +3539,31 @@ async fn handle_ollama_recovery(
             {
                 let cleaned = strip_think_tags(content.trim());
                 if !cleaned.is_empty() {
-                    // Primary recovered — clear degraded flag if it was set
-                    if state.primary_model_degraded.swap(false, Ordering::Relaxed) {
+                    // Model recovered — clear the appropriate degraded flag
+                    let is_code = !state.config.chat.chat_code_model.is_empty()
+                        && primary_model == state.config.chat.chat_code_model;
+                    if is_code {
+                        if state.code_model_degraded.swap(false, Ordering::Relaxed) {
+                            let degraded_secs = {
+                                let mut ds = state.code_model_degraded_since.write().await;
+                                let secs = ds.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                                *ds = None;
+                                secs
+                            };
+                            info!(model = %primary_model, "code model recovered — leaving degraded mode");
+                            log_service_event(
+                                &state.pg,
+                                "a2a-gateway",
+                                "code_model_degraded_recover",
+                                "info",
+                                serde_json::json!({
+                                    "model": primary_model,
+                                    "degraded_seconds": degraded_secs,
+                                }),
+                            )
+                            .await;
+                        }
+                    } else if state.primary_model_degraded.swap(false, Ordering::Relaxed) {
                         let degraded_secs = {
                             let mut ds = state.degraded_since.write().await;
                             let secs = ds.map(|t| t.elapsed().as_secs()).unwrap_or(0);
@@ -3345,8 +3604,32 @@ async fn handle_ollama_recovery(
         }
     }
 
-    // Step 4: Enter degraded mode — skip primary on subsequent requests
-    if !state.primary_model_degraded.swap(true, Ordering::Relaxed) {
+    // Step 4: Enter degraded mode — skip the failed model on subsequent requests.
+    // v0.9.0: Detect if the failed model is the code model vs the primary general model.
+    let is_code_model = !state.config.chat.chat_code_model.is_empty()
+        && primary_model == state.config.chat.chat_code_model;
+
+    if is_code_model {
+        if !state.code_model_degraded.swap(true, Ordering::Relaxed) {
+            *state.code_model_degraded_since.write().await = Some(std::time::Instant::now());
+            warn!(
+                model = %primary_model,
+                "code model entering degraded mode — code tasks will use general model for {}s",
+                DEGRADED_RETRY_INTERVAL.as_secs()
+            );
+            log_service_event(
+                &state.pg,
+                "a2a-gateway",
+                "code_model_degraded_enter",
+                "warning",
+                serde_json::json!({
+                    "model": primary_model,
+                    "error": _error_msg,
+                }),
+            )
+            .await;
+        }
+    } else if !state.primary_model_degraded.swap(true, Ordering::Relaxed) {
         *state.degraded_since.write().await = Some(std::time::Instant::now());
         warn!(
             model = %primary_model,
@@ -3511,6 +3794,355 @@ fn strip_confidence_tag(text: &str) -> String {
     text.to_string()
 }
 
+/// v0.9.0: Classify text into a model domain using fast keyword/pattern matching.
+/// Returns "code" for programming-related content, "general" otherwise.
+/// Zero LLM overhead — pure string matching.
+// ---------------------------------------------------------------------------
+// v0.10.0: Write approval + vision helpers
+// ---------------------------------------------------------------------------
+
+/// Request user approval for a file write via the chat platform.
+/// Blocks until the user approves, rejects, or the timeout expires.
+async fn request_write_approval(
+    state: &AppState,
+    chat_ctx: Option<&ChatContext>,
+    path: &std::path::Path,
+    content: &str,
+) -> String {
+    let ctx = match chat_ctx {
+        Some(c) => c,
+        None => return "Write approval requires a chat context (Telegram/Slack).".to_string(),
+    };
+
+    let approval_id = Uuid::new_v4().to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+
+    let preview = if content.len() > 500 {
+        format!("{}...\n({} bytes total)", &content[..500], content.len())
+    } else {
+        content.to_string()
+    };
+
+    // Store pending write
+    {
+        let entry = PendingWriteEntry {
+            path: path.to_path_buf(),
+            content: content.to_string(),
+            sender: tx,
+        };
+        let mut guard = state.pending_writes.write().await;
+        guard.insert(approval_id.clone(), entry);
+    }
+
+    // Send approval request to user
+    let msg = format!(
+        "AI wants to write to:\n`{}`\n\nPreview:\n```\n{}\n```",
+        path.display(),
+        preview,
+    );
+
+    match ctx.platform.as_str() {
+        "telegram" => {
+            send_telegram_inline_keyboard(state, &ctx.chat_id, &msg, &approval_id).await;
+        }
+        _ => {
+            // For platforms without inline buttons, auto-reject
+            let mut guard = state.pending_writes.write().await;
+            guard.remove(&approval_id);
+            return "Write approval not supported on this platform.".to_string();
+        }
+    }
+
+    // Wait for user decision with timeout
+    let timeout_secs = state.config.chat.tools.write_approval_timeout_secs;
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(true)) => {
+            // Approved — execute write
+            match broodlink_fs::write_file_safe(
+                path,
+                content.as_bytes(),
+                state.config.chat.tools.max_write_size_bytes,
+            ) {
+                Ok(()) => {
+                    info!(path = %path.display(), "file write approved and completed");
+                    format!("File written successfully: {}", path.display())
+                }
+                Err(e) => format!("Write failed: {e}"),
+            }
+        }
+        Ok(Ok(false)) | Ok(Err(_)) => "Write rejected by user.".to_string(),
+        Err(_) => {
+            // Timeout — clean up
+            let mut guard = state.pending_writes.write().await;
+            guard.remove(&approval_id);
+            "Write approval timed out.".to_string()
+        }
+    }
+}
+
+/// Send a Telegram message with Approve/Reject inline buttons.
+async fn send_telegram_inline_keyboard(
+    state: &AppState,
+    chat_id: &str,
+    text: &str,
+    approval_id: &str,
+) {
+    let (tg_token, _, _, _) = get_telegram_creds(state).await;
+    let token = match tg_token {
+        Some(t) if !t.is_empty() => t,
+        _ => return,
+    };
+
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+    let payload = serde_json::json!({
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown",
+        "reply_markup": {
+            "inline_keyboard": [[
+                {"text": "Approve", "callback_data": format!("write_approve:{approval_id}")},
+                {"text": "Reject", "callback_data": format!("write_reject:{approval_id}")},
+            ]]
+        }
+    });
+
+    if let Err(e) = state.http_client.post(&url).json(&payload).send().await {
+        warn!(error = %e, "failed to send write approval message");
+    }
+}
+
+/// Handle a Telegram callback query (inline button press) for write approval.
+async fn handle_write_callback(state: &AppState, callback: &serde_json::Value) {
+    let data = callback.get("data").and_then(|d| d.as_str()).unwrap_or("");
+    let callback_id = callback.get("id").and_then(|id| id.as_str()).unwrap_or("");
+
+    let (approved, approval_id) = if let Some(id) = data.strip_prefix("write_approve:") {
+        (true, id)
+    } else if let Some(id) = data.strip_prefix("write_reject:") {
+        (false, id)
+    } else {
+        return;
+    };
+
+    // Resolve the pending write
+    let sender = {
+        let mut guard = state.pending_writes.write().await;
+        guard.remove(approval_id).map(|entry| entry.sender)
+    };
+
+    if let Some(tx) = sender {
+        let _ = tx.send(approved);
+        info!(
+            approval_id = approval_id,
+            approved = approved,
+            "write approval resolved"
+        );
+    }
+
+    // Answer the callback query (removes loading indicator)
+    let (tg_token, _, _, _) = get_telegram_creds(state).await;
+    if let Some(token) = tg_token.filter(|t| !t.is_empty()) {
+        let url = format!("https://api.telegram.org/bot{}/answerCallbackQuery", token);
+        let text = if approved {
+            "Write approved"
+        } else {
+            "Write rejected"
+        };
+        let _ = state
+            .http_client
+            .post(&url)
+            .json(&serde_json::json!({
+                "callback_query_id": callback_id,
+                "text": text,
+            }))
+            .send()
+            .await;
+    }
+}
+
+/// Call the vision model to describe a base64-encoded image.
+async fn call_vision_describe(state: &AppState, image_b64: &str, prompt: &str) -> String {
+    let vision_model = &state.config.chat.chat_vision_model;
+    if vision_model.is_empty() {
+        return "No vision model configured.".to_string();
+    }
+
+    let url = format!("{}/api/chat", state.config.ollama.url);
+    let payload = serde_json::json!({
+        "model": vision_model,
+        "messages": [{
+            "role": "user",
+            "content": prompt,
+            "images": [image_b64],
+        }],
+        "stream": false,
+        "options": {
+            "temperature": 0.3,
+            "num_predict": 1024,
+            "num_ctx": state.config.ollama.num_ctx,
+        }
+    });
+
+    let timeout = std::time::Duration::from_secs(state.config.ollama.timeout_seconds);
+    match state
+        .ollama_client
+        .post(&url)
+        .json(&payload)
+        .timeout(timeout)
+        .send()
+        .await
+    {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(body) => {
+                if let Some(error) = body.get("error").and_then(|e| e.as_str()) {
+                    warn!(error = error, "vision model error");
+                    return format!("Vision model error: {error}");
+                }
+                body.get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("No description generated.")
+                    .to_string()
+            }
+            Err(e) => format!("Vision parse error: {e}"),
+        },
+        Err(e) => format!("Vision request failed: {e}"),
+    }
+}
+
+fn classify_model_domain(text: &str) -> &'static str {
+    let lower = text.to_lowercase();
+
+    // Signal 1: Code blocks (highest precision single indicator)
+    if lower.contains("```") || lower.contains("~~~") {
+        return "code";
+    }
+
+    // Signal 2: File extensions in context
+    const CODE_EXTENSIONS: &[&str] = &[
+        ".rs",
+        ".py",
+        ".ts",
+        ".js",
+        ".tsx",
+        ".jsx",
+        ".go",
+        ".java",
+        ".cpp",
+        ".rb",
+        ".sh",
+        ".sql",
+        ".toml",
+        ".yaml",
+        ".yml",
+        ".json",
+        ".html",
+        ".css",
+        ".dockerfile",
+        ".proto",
+        ".swift",
+        ".kt",
+        ".scala",
+        ".zig",
+        ".lua",
+        ".ex",
+    ];
+    // .c and .h need special handling: trailing space OR end-of-string to avoid
+    // false positives on .css, .class, .config, .html, .help, etc.
+    if lower.contains(".c ")
+        || lower.ends_with(".c")
+        || lower.contains(".h ")
+        || lower.ends_with(".h")
+    {
+        return "code";
+    }
+    for ext in CODE_EXTENSIONS {
+        if lower.contains(ext) {
+            return "code";
+        }
+    }
+
+    // Signal 3: Error patterns (compiler output, stack traces)
+    const ERROR_PATTERNS: &[&str] = &[
+        "error[e",
+        "syntaxerror",
+        "typeerror",
+        "referenceerror",
+        "traceback",
+        "segmentation fault",
+        "panic!",
+        "unwrap()",
+        "stack trace",
+        "no such file or directory",
+    ];
+    for pat in ERROR_PATTERNS {
+        if lower.contains(pat) {
+            return "code";
+        }
+    }
+
+    // Signal 4: Programming keywords (require 2+ to avoid false positives)
+    const CODE_KEYWORDS: &[&str] = &[
+        "function",
+        "fn ",
+        "impl ",
+        "struct ",
+        "enum ",
+        "trait ",
+        "class ",
+        "def ",
+        "async fn",
+        "return ",
+        "import ",
+        "export ",
+        "const ",
+        "pub ",
+        "mod ",
+        "crate",
+        "compile",
+        "runtime",
+        "linker",
+        "debug",
+        "api endpoint",
+        "http request",
+        "rest api",
+        "graphql",
+        "database schema",
+        "migration",
+        "query",
+        "docker",
+        "kubernetes",
+        "ci/cd",
+        "pipeline",
+        "unit test",
+        "integration test",
+        "test case",
+        "refactor",
+        "implement",
+        "codebase",
+        "repository",
+        "dependency",
+        "cargo",
+        "npm install",
+        "pip install",
+        "pull request",
+        "code review",
+        "linter",
+        "formatter",
+    ];
+    let hits = CODE_KEYWORDS
+        .iter()
+        .filter(|kw| lower.contains(*kw))
+        .count();
+    if hits >= 2 {
+        return "code";
+    }
+
+    "general"
+}
+
 /// Use a fast verifier model to fact-check low-confidence responses.
 async fn verify_response(
     client: &reqwest::Client,
@@ -3558,7 +4190,8 @@ async fn verify_response(
         .ok()?;
 
     let body: serde_json::Value = resp.json().await.ok()?;
-    let content = body.get("message")
+    let content = body
+        .get("message")
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())?;
 
@@ -3572,7 +4205,12 @@ async fn verify_response(
     }
 }
 
-async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> String {
+async fn call_ollama_chat(
+    state: &AppState,
+    history: &[(String, String)],
+    params: &ChatParams<'_>,
+) -> String {
+    let model_override = params.model_override;
     let ollama_url = &state.config.ollama.url;
     let timeout_secs = state.config.ollama.timeout_seconds;
     let url = format!("{ollama_url}/api/chat");
@@ -3594,9 +4232,14 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
     );
 
     // Dynamic system prompt — prefer config over hardcoded default
-    let base_prompt = state.config.agents.get("a2a-gateway")
+    let base_prompt = state
+        .config
+        .agents
+        .get("a2a-gateway")
         .and_then(|a| a.system_prompt.as_deref())
-        .unwrap_or("You are Broodlink, an AI assistant. Keep responses concise and conversational.");
+        .unwrap_or(
+            "You are Broodlink, an AI assistant. Keep responses concise and conversational.",
+        );
     let mut system_prompt = String::from(base_prompt);
     if tools_available {
         system_prompt.push_str(
@@ -3615,6 +4258,33 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
              about themselves, their preferences, or things they explicitly ask you to remember. \
              Call remember with a short topic and the content to store. \
              Do NOT remember every message — only save noteworthy personal facts or explicit requests.",
+        );
+    }
+    if tool_cfg.file_tools_enabled {
+        system_prompt.push_str(
+            " You have file tools: read_file, write_file, view_image. \
+             You MUST call read_file when the user asks to read, show, or look at a text file. \
+             You MUST call write_file when the user asks to write, save, create, or modify a file — the user will be prompted to approve. \
+             You MUST call view_image to analyze image files on disk (png, jpg, gif, webp). \
+             ALWAYS use the tool instead of just describing what you would do.",
+        );
+        // Tell the model which directories are accessible
+        if !tool_cfg.allowed_read_dirs.is_empty() {
+            system_prompt.push_str(&format!(
+                " Readable directories: {}.",
+                tool_cfg.allowed_read_dirs.join(", ")
+            ));
+        }
+        if !tool_cfg.allowed_write_dirs.is_empty() {
+            system_prompt.push_str(&format!(
+                " Writable directories: {}.",
+                tool_cfg.allowed_write_dirs.join(", ")
+            ));
+        }
+    }
+    if tool_cfg.pdf_tools_enabled {
+        system_prompt.push_str(
+            " You MUST call read_pdf when the user asks to read or extract text from a PDF document.",
         );
     }
     system_prompt.push_str(" If you don't know something and can't look it up, say so honestly.");
@@ -3692,6 +4362,83 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
             }
         }));
     }
+    // v0.10.0: File I/O tools
+    if tool_cfg.file_tools_enabled {
+        tools_vec.push(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read the text contents of a file from disk. Only files within allowed directories can be read.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["path"],
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute path to the file to read"
+                        }
+                    }
+                }
+            }
+        }));
+        tools_vec.push(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Write content to a file on disk. The user will be asked to approve before the write happens.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["path", "content"],
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute path to the file to write"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "The text content to write to the file"
+                        }
+                    }
+                }
+            }
+        }));
+        tools_vec.push(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "view_image",
+                "description": "Analyze an image file from disk and describe what it shows.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["path"],
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute path to an image file (png, jpg, gif, webp)"
+                        }
+                    }
+                }
+            }
+        }));
+    }
+    if tool_cfg.pdf_tools_enabled {
+        tools_vec.push(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_pdf",
+                "description": "Extract text content from a PDF file.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["path"],
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute path to the PDF file"
+                        }
+                    }
+                }
+            }
+        }));
+    }
     let tools_def = if tools_vec.is_empty() {
         None
     } else {
@@ -3722,8 +4469,86 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
         }));
     }
 
+    // v0.10.0: Attach images to the last user message for vision models
+    if let Some(ref imgs) = params.images {
+        if let Some(last_user) = messages
+            .iter_mut()
+            .rev()
+            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        {
+            last_user["images"] = serde_json::json!(imgs);
+        }
+    }
+
     let max_rounds = tool_cfg.max_tool_rounds;
-    let model = &chat_cfg.chat_model;
+
+    // v0.9.0: Smart model selection
+    // Priority: explicit override > auto-classification > config default
+    let resolved_model = match model_override {
+        Some(m) if !m.is_empty() => {
+            // Map domain hints to actual model names
+            let actual = match m {
+                "code" if !chat_cfg.chat_code_model.is_empty() => chat_cfg.chat_code_model.clone(),
+                "general" => chat_cfg.chat_model.clone(),
+                _ => {
+                    // Treat as literal model name or unknown domain — default to general
+                    if m.contains(':') || m.contains('/') {
+                        m.to_string()
+                    } else {
+                        chat_cfg.chat_model.clone()
+                    }
+                }
+            };
+            info!(override_hint = %m, model = %actual, "using model override");
+            actual
+        }
+        _ => {
+            let code_model = &chat_cfg.chat_code_model;
+            if !code_model.is_empty() {
+                let last_user_text = history
+                    .iter()
+                    .rev()
+                    .find(|(role, _)| role == "user")
+                    .map(|(_, content)| content.as_str())
+                    .unwrap_or("");
+                let domain = classify_model_domain(last_user_text);
+                if domain == "code" {
+                    info!(domain = "code", model = %code_model, "auto-classified as code task");
+                    code_model.clone()
+                } else {
+                    chat_cfg.chat_model.clone()
+                }
+            } else {
+                chat_cfg.chat_model.clone()
+            }
+        }
+    };
+
+    // v0.9.0: If code model is degraded, fall back to general model
+    let resolved_model = if resolved_model == chat_cfg.chat_code_model
+        && state.code_model_degraded.load(Ordering::Relaxed)
+    {
+        info!(model = %resolved_model, "code model degraded, falling back to general model");
+        chat_cfg.chat_model.clone()
+    } else {
+        resolved_model
+    };
+
+    // v0.10.0: Override model to vision when images are present
+    let resolved_model = if params.images.is_some() && !chat_cfg.chat_vision_model.is_empty() {
+        info!(
+            "images present, using vision model: {}",
+            chat_cfg.chat_vision_model
+        );
+        chat_cfg.chat_vision_model.clone()
+    } else if params.images.is_some() {
+        // Images but no vision model — return early with error
+        return "Image analysis not available. No vision model configured.".to_string();
+    } else {
+        resolved_model
+    };
+
+    let model = &resolved_model;
     let fallback = &chat_cfg.chat_fallback_model;
 
     // Degraded mode: skip primary model if it recently failed with OOM.
@@ -3780,17 +4605,22 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
     }
 
     for round in 0..=max_rounds {
-        // Include tools only on rounds where the model can still call them
-        let include_tools = round < max_rounds && tools_def.is_some();
-
+        // Include tools only on rounds where the model can still call them.
+        // Vision models (gemma3) don't support tools or thinking.
+        let is_vision = params.images.is_some();
+        let include_tools = !is_vision && round < max_rounds && tools_def.is_some();
+        let use_think = !is_vision;
+        // Tool calls need more output budget: thinking tokens eat into num_predict,
+        // and the tool-call JSON itself can be 50-100+ tokens.
+        let predict_limit = if include_tools { 2048 } else { 512 };
         let mut payload = serde_json::json!({
             "model": model,
             "messages": messages,
             "stream": false,
-            "think": true,
+            "think": use_think,
             "options": {
                 "temperature": 0.7,
-                "num_predict": 512,
+                "num_predict": predict_limit,
                 "num_ctx": state.config.ollama.num_ctx,
             }
         });
@@ -3983,6 +4813,161 @@ async fn call_ollama_chat(state: &AppState, history: &[(String, String)]) -> Str
                                     Err(e) => {
                                         warn!(error = %e, topic = %topic, "remember tool failed");
                                         format!("Failed to remember: {e}")
+                                    }
+                                }
+                            }
+                        }
+                        // v0.10.0: File I/O tools
+                        "read_file" => {
+                            let parsed = args_raw
+                                .and_then(|a| {
+                                    if let Some(s) = a.as_str() {
+                                        serde_json::from_str::<serde_json::Value>(s).ok()
+                                    } else {
+                                        Some(a.clone())
+                                    }
+                                })
+                                .unwrap_or_default();
+                            let path = parsed.get("path").and_then(|p| p.as_str()).unwrap_or("");
+
+                            if path.is_empty() {
+                                "Error: path is required.".to_string()
+                            } else {
+                                match broodlink_fs::validate_read_path(
+                                    path,
+                                    &tool_cfg.allowed_read_dirs,
+                                    tool_cfg.max_read_size_bytes,
+                                ) {
+                                    Ok(canonical) => {
+                                        match broodlink_fs::read_file_safe(
+                                            &canonical,
+                                            tool_cfg.max_read_size_bytes,
+                                        ) {
+                                            Ok(content) => content,
+                                            Err(e) => format!("Error reading file: {e}"),
+                                        }
+                                    }
+                                    Err(e) => format!("Access denied: {e}"),
+                                }
+                            }
+                        }
+                        "write_file" => {
+                            let parsed = args_raw
+                                .and_then(|a| {
+                                    if let Some(s) = a.as_str() {
+                                        serde_json::from_str::<serde_json::Value>(s).ok()
+                                    } else {
+                                        Some(a.clone())
+                                    }
+                                })
+                                .unwrap_or_default();
+                            let path = parsed
+                                .get("path")
+                                .and_then(|p| p.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let content = parsed
+                                .get("content")
+                                .and_then(|c| c.as_str())
+                                .unwrap_or("")
+                                .to_string();
+
+                            if path.is_empty() || content.is_empty() {
+                                "Error: path and content are required.".to_string()
+                            } else {
+                                match broodlink_fs::validate_write_path(
+                                    &path,
+                                    &tool_cfg.allowed_write_dirs,
+                                    content.len() as u64,
+                                    tool_cfg.max_write_size_bytes,
+                                ) {
+                                    Ok(canonical) => {
+                                        request_write_approval(
+                                            state,
+                                            params.chat_ctx.as_ref(),
+                                            &canonical,
+                                            &content,
+                                        )
+                                        .await
+                                    }
+                                    Err(e) => format!("Access denied: {e}"),
+                                }
+                            }
+                        }
+                        "read_pdf" => {
+                            let parsed = args_raw
+                                .and_then(|a| {
+                                    if let Some(s) = a.as_str() {
+                                        serde_json::from_str::<serde_json::Value>(s).ok()
+                                    } else {
+                                        Some(a.clone())
+                                    }
+                                })
+                                .unwrap_or_default();
+                            let path = parsed.get("path").and_then(|p| p.as_str()).unwrap_or("");
+
+                            if path.is_empty() {
+                                "Error: path is required.".to_string()
+                            } else {
+                                match broodlink_fs::validate_read_path(
+                                    path,
+                                    &tool_cfg.allowed_read_dirs,
+                                    tool_cfg.max_read_size_bytes,
+                                ) {
+                                    Ok(canonical) => {
+                                        match broodlink_fs::read_pdf_safe(
+                                            &canonical,
+                                            tool_cfg.max_pdf_pages,
+                                        ) {
+                                            Ok(text) => text,
+                                            Err(e) => format!("Error reading PDF: {e}"),
+                                        }
+                                    }
+                                    Err(e) => format!("Access denied: {e}"),
+                                }
+                            }
+                        }
+                        "view_image" => {
+                            let parsed = args_raw
+                                .and_then(|a| {
+                                    if let Some(s) = a.as_str() {
+                                        serde_json::from_str::<serde_json::Value>(s).ok()
+                                    } else {
+                                        Some(a.clone())
+                                    }
+                                })
+                                .unwrap_or_default();
+                            let path = parsed.get("path").and_then(|p| p.as_str()).unwrap_or("");
+
+                            if path.is_empty() {
+                                "Error: path is required.".to_string()
+                            } else {
+                                let vision_model = &chat_cfg.chat_vision_model;
+                                if vision_model.is_empty() {
+                                    "Image analysis not available. No vision model configured."
+                                        .to_string()
+                                } else {
+                                    match broodlink_fs::validate_read_path(
+                                        path,
+                                        &tool_cfg.allowed_read_dirs,
+                                        tool_cfg.max_read_size_bytes,
+                                    ) {
+                                        Ok(canonical) => match std::fs::read(&canonical) {
+                                            Ok(bytes) => {
+                                                use base64::Engine;
+                                                let encoded =
+                                                    base64::engine::general_purpose::STANDARD
+                                                        .encode(&bytes);
+                                                call_vision_describe(
+                                                    state,
+                                                    &encoded,
+                                                    "Describe this image in detail.",
+                                                )
+                                                .await
+                                            }
+                                            Err(e) => format!("Error reading image: {e}"),
+                                        },
+                                        Err(e) => format!("Access denied: {e}"),
                                     }
                                 }
                             }
@@ -4830,7 +5815,10 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
-        assert!(task_id.is_empty(), "missing task_id should yield empty string");
+        assert!(
+            task_id.is_empty(),
+            "missing task_id should yield empty string"
+        );
 
         // Missing both title and description should be skipped
         let payload2: serde_json::Value = serde_json::json!({
@@ -4851,7 +5839,10 @@ mod tests {
         } else {
             description
         };
-        assert!(prompt.is_empty(), "no title or description should yield empty prompt");
+        assert!(
+            prompt.is_empty(),
+            "no title or description should yield empty prompt"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4862,7 +5853,10 @@ mod tests {
     fn test_parse_confidence_present() {
         assert_eq!(parse_confidence("Some answer [CONFIDENCE: 5/5]"), Some(5));
         assert_eq!(parse_confidence("Result [CONFIDENCE: 1/5]"), Some(1));
-        assert_eq!(parse_confidence("Text [CONFIDENCE: 3/5] more text"), Some(3));
+        assert_eq!(
+            parse_confidence("Text [CONFIDENCE: 3/5] more text"),
+            Some(3)
+        );
     }
 
     #[test]
@@ -4878,10 +5872,7 @@ mod tests {
             strip_confidence_tag("Answer text [CONFIDENCE: 4/5]"),
             "Answer text"
         );
-        assert_eq!(
-            strip_confidence_tag("No tag here"),
-            "No tag here"
-        );
+        assert_eq!(strip_confidence_tag("No tag here"), "No tag here");
         assert_eq!(
             strip_confidence_tag("Before [CONFIDENCE: 2/5] after"),
             "Before after"
@@ -4917,11 +5908,100 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Model domain classifier tests (v0.9.0)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_code_block() {
+        assert_eq!(
+            classify_model_domain("Fix this:\n```rust\nfn main() {}\n```"),
+            "code"
+        );
+    }
+
+    #[test]
+    fn test_classify_code_block_tilde() {
+        assert_eq!(classify_model_domain("~~~\nsome code\n~~~"), "code");
+    }
+
+    #[test]
+    fn test_classify_file_extension_rs() {
+        assert_eq!(classify_model_domain("Check the error in main.rs"), "code");
+    }
+
+    #[test]
+    fn test_classify_file_extension_py() {
+        assert_eq!(
+            classify_model_domain("Update script.py to handle the edge case"),
+            "code"
+        );
+    }
+
+    #[test]
+    fn test_classify_error_pattern_rust() {
+        assert_eq!(
+            classify_model_domain("error[E0308]: mismatched types"),
+            "code"
+        );
+    }
+
+    #[test]
+    fn test_classify_error_pattern_python() {
+        assert_eq!(
+            classify_model_domain("Traceback (most recent call last):"),
+            "code"
+        );
+    }
+
+    #[test]
+    fn test_classify_multiple_keywords() {
+        assert_eq!(
+            classify_model_domain("implement a function that handles the API endpoint"),
+            "code"
+        );
+    }
+
+    #[test]
+    fn test_classify_general_chat() {
+        assert_eq!(
+            classify_model_domain("What's the weather like today?"),
+            "general"
+        );
+    }
+
+    #[test]
+    fn test_classify_general_knowledge() {
+        assert_eq!(
+            classify_model_domain("Tell me about the Roman Empire"),
+            "general"
+        );
+    }
+
+    #[test]
+    fn test_classify_single_keyword_not_code() {
+        // "return" alone should not trigger code classification
+        assert_eq!(
+            classify_model_domain("I want to return this product"),
+            "general"
+        );
+    }
+
+    #[test]
+    fn test_classify_empty_string() {
+        assert_eq!(classify_model_domain(""), "general");
+    }
+
+    #[test]
+    fn test_classify_formula_context() {
+        assert_eq!(
+            classify_model_domain("implement the feature, then write unit test cases"),
+            "code"
+        );
+    }
+
     #[test]
     fn test_strip_think_tags_unclosed() {
-        assert_eq!(
-            strip_think_tags("before <think>thinking forever"),
-            "before"
-        );
+        assert_eq!(strip_think_tags("before <think>thinking forever"), "before");
     }
 }
