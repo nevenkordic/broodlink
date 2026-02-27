@@ -1,3 +1,3 @@
 ---
-title: "Agent Onboarding"
+title: "Add Agent"
 ---

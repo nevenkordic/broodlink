@@ -1,23 +1,23 @@
 {{ define "main" }}
-<h2>Chat Sessions</h2>
-<p class="page-desc">Live conversational agent sessions across Slack, Teams, and Telegram.</p>
+<h2>Conversations</h2>
+<p class="page-desc">Live chats between users and agents across Slack, Teams, and Telegram.</p>
 
-<div class="metric-bar" aria-label="Chat metrics">
-  <div class="metric" data-tooltip="Currently active chat sessions">
-    <span class="metric-value" id="chat-active-sessions">—</span>
-    <span class="metric-label">Active Sessions</span>
+<div class="card-grid" aria-label="Chat metrics">
+  <div class="card metric-card">
+    <div class="value" id="chat-active-sessions">—</div>
+    <div class="label" data-tooltip="Currently active chat sessions">Active Sessions</div>
   </div>
-  <div class="metric" data-tooltip="Messages received and sent today">
-    <span class="metric-value" id="chat-messages-today">—</span>
-    <span class="metric-label">Messages Today</span>
+  <div class="card metric-card">
+    <div class="value" id="chat-messages-today">—</div>
+    <div class="label" data-tooltip="Messages received and sent today">Messages Today</div>
   </div>
-  <div class="metric" data-tooltip="Replies waiting to be delivered">
-    <span class="metric-value" id="chat-pending-replies">—</span>
-    <span class="metric-label">Pending Replies</span>
+  <div class="card metric-card">
+    <div class="value" id="chat-pending-replies">—</div>
+    <div class="label" data-tooltip="Replies waiting to be delivered">Pending Replies</div>
   </div>
-  <div class="metric" data-tooltip="Connected chat platforms">
-    <span class="metric-value" id="chat-platforms">—</span>
-    <span class="metric-label">Platforms</span>
+  <div class="card metric-card">
+    <div class="value" id="chat-platforms">—</div>
+    <div class="label" data-tooltip="Connected chat platforms">Platforms</div>
   </div>
 </div>
 

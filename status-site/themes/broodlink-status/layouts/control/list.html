@@ -1,6 +1,6 @@
 {{ define "main" }}
-<h2>Control Panel</h2>
-<p class="page-desc">Manage agents, budgets, tasks, workflows, guardrails, webhooks, and the dead-letter queue.</p>
+<h2>Settings</h2>
+<p class="page-desc">Manage budgets, workflows, webhooks, users, and system configuration.</p>
 
 <!-- Summary Metrics -->
 <section aria-labelledby="ctrl-metrics-heading">
@@ -48,19 +48,21 @@
   <div class="ctrl-section-header">
     <h3>Agent Roster</h3>
   </div>
-  <table>
-    <thead>
-      <tr>
-        <th scope="col">Agent</th>
-        <th scope="col">Role</th>
-        <th scope="col">Cost Tier</th>
-        <th scope="col">Transport</th>
-        <th scope="col">Status</th>
-        <th scope="col">Actions</th>
-      </tr>
-    </thead>
-    <tbody id="ctrl-agents-tbody" aria-live="polite"></tbody>
-  </table>
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Agent</th>
+          <th scope="col">Role</th>
+          <th scope="col">Cost Tier</th>
+          <th scope="col">Transport</th>
+          <th scope="col">Status</th>
+          <th scope="col">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="ctrl-agents-tbody" aria-live="polite"></tbody>
+    </table>
+  </div>
 </section>
 
 <!-- Budgets Tab -->
@@ -76,19 +78,21 @@
   <div class="ctrl-section-header">
     <h3>Active Tasks</h3>
   </div>
-  <table>
-    <thead>
-      <tr>
-        <th scope="col">ID</th>
-        <th scope="col">Title</th>
-        <th scope="col">Status</th>
-        <th scope="col">Agent</th>
-        <th scope="col">Created</th>
-        <th scope="col">Actions</th>
-      </tr>
-    </thead>
-    <tbody id="ctrl-tasks-tbody" aria-live="polite"></tbody>
-  </table>
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">ID</th>
+          <th scope="col">Title</th>
+          <th scope="col">Status</th>
+          <th scope="col">Agent</th>
+          <th scope="col">Created</th>
+          <th scope="col">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="ctrl-tasks-tbody" aria-live="polite"></tbody>
+    </table>
+  </div>
 </section>
 
 <!-- Workflows Tab -->
@@ -96,19 +100,21 @@
   <div class="ctrl-section-header">
     <h3>Workflow Runs</h3>
   </div>
-  <table>
-    <thead>
-      <tr>
-        <th scope="col">ID</th>
-        <th scope="col">Formula</th>
-        <th scope="col">Status</th>
-        <th scope="col">Progress</th>
-        <th scope="col">Started By</th>
-        <th scope="col">Created</th>
-      </tr>
-    </thead>
-    <tbody id="ctrl-workflows-tbody" aria-live="polite"></tbody>
-  </table>
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">ID</th>
+          <th scope="col">Formula</th>
+          <th scope="col">Status</th>
+          <th scope="col">Progress</th>
+          <th scope="col">Started By</th>
+          <th scope="col">Created</th>
+        </tr>
+      </thead>
+      <tbody id="ctrl-workflows-tbody" aria-live="polite"></tbody>
+    </table>
+  </div>
 </section>
 
 <!-- Guardrails Tab -->
@@ -116,31 +122,35 @@
   <div class="ctrl-section-header">
     <h3>Guardrail Policies</h3>
   </div>
-  <table>
-    <thead>
-      <tr>
-        <th scope="col">Name</th>
-        <th scope="col">Type</th>
-        <th scope="col">Status</th>
-        <th scope="col">Violations</th>
-      </tr>
-    </thead>
-    <tbody id="ctrl-guardrails-tbody" aria-live="polite"></tbody>
-  </table>
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Name</th>
+          <th scope="col">Type</th>
+          <th scope="col">Status</th>
+          <th scope="col">Violations</th>
+        </tr>
+      </thead>
+      <tbody id="ctrl-guardrails-tbody" aria-live="polite"></tbody>
+    </table>
+  </div>
   <div class="ctrl-section-header" style="margin-top:2rem">
     <h3>Recent Violations</h3>
   </div>
-  <table>
-    <thead>
-      <tr>
-        <th scope="col">Agent</th>
-        <th scope="col">Policy</th>
-        <th scope="col">Tool</th>
-        <th scope="col">Time</th>
-      </tr>
-    </thead>
-    <tbody id="ctrl-violations-tbody" aria-live="polite"></tbody>
-  </table>
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Agent</th>
+          <th scope="col">Policy</th>
+          <th scope="col">Tool</th>
+          <th scope="col">Time</th>
+        </tr>
+      </thead>
+      <tbody id="ctrl-violations-tbody" aria-live="polite"></tbody>
+    </table>
+  </div>
 </section>
 
 <!-- Webhooks Tab -->
@@ -152,34 +162,38 @@
       Add Endpoint
     </button>
   </div>
-  <table>
-    <thead>
-      <tr>
-        <th scope="col">Name</th>
-        <th scope="col">Platform</th>
-        <th scope="col">URL</th>
-        <th scope="col">Events</th>
-        <th scope="col">Status</th>
-        <th scope="col">Actions</th>
-      </tr>
-    </thead>
-    <tbody id="ctrl-webhooks-tbody" aria-live="polite"></tbody>
-  </table>
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Name</th>
+          <th scope="col">Platform</th>
+          <th scope="col">URL</th>
+          <th scope="col">Events</th>
+          <th scope="col">Status</th>
+          <th scope="col">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="ctrl-webhooks-tbody" aria-live="polite"></tbody>
+    </table>
+  </div>
   <div class="ctrl-section-header" style="margin-top:2rem">
     <h3>Recent Deliveries</h3>
   </div>
-  <table>
-    <thead>
-      <tr>
-        <th scope="col">ID</th>
-        <th scope="col">Direction</th>
-        <th scope="col">Event</th>
-        <th scope="col">Status</th>
-        <th scope="col">Time</th>
-      </tr>
-    </thead>
-    <tbody id="ctrl-webhook-log-tbody" aria-live="polite"></tbody>
-  </table>
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">ID</th>
+          <th scope="col">Direction</th>
+          <th scope="col">Event</th>
+          <th scope="col">Status</th>
+          <th scope="col">Time</th>
+        </tr>
+      </thead>
+      <tbody id="ctrl-webhook-log-tbody" aria-live="polite"></tbody>
+    </table>
+  </div>
 </section>
 
 <!-- DLQ Tab -->
@@ -187,19 +201,21 @@
   <div class="ctrl-section-header">
     <h3>Dead-Letter Queue</h3>
   </div>
-  <table>
-    <thead>
-      <tr>
-        <th scope="col">ID</th>
-        <th scope="col">Task</th>
-        <th scope="col">Reason</th>
-        <th scope="col">Retries</th>
-        <th scope="col">Created</th>
-        <th scope="col">Actions</th>
-      </tr>
-    </thead>
-    <tbody id="ctrl-dlq-tbody" aria-live="polite"></tbody>
-  </table>
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">ID</th>
+          <th scope="col">Task</th>
+          <th scope="col">Reason</th>
+          <th scope="col">Retries</th>
+          <th scope="col">Created</th>
+          <th scope="col">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="ctrl-dlq-tbody" aria-live="polite"></tbody>
+    </table>
+  </div>
 </section>
 
 <!-- Chat Tab -->
@@ -207,20 +223,22 @@
   <div class="ctrl-section-header">
     <h3>Chat Sessions</h3>
   </div>
-  <table>
-    <thead>
-      <tr>
-        <th scope="col">Platform</th>
-        <th scope="col">User</th>
-        <th scope="col">Messages</th>
-        <th scope="col">Agent</th>
-        <th scope="col">Last Message</th>
-        <th scope="col">Status</th>
-        <th scope="col">Actions</th>
-      </tr>
-    </thead>
-    <tbody id="ctrl-chat-tbody" aria-live="polite"></tbody>
-  </table>
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Platform</th>
+          <th scope="col">User</th>
+          <th scope="col">Messages</th>
+          <th scope="col">Agent</th>
+          <th scope="col">Last Message</th>
+          <th scope="col">Status</th>
+          <th scope="col">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="ctrl-chat-tbody" aria-live="polite"></tbody>
+    </table>
+  </div>
 </section>
 
 <!-- Formulas Tab -->
@@ -232,20 +250,22 @@
       Create Formula
     </button>
   </div>
-  <table>
-    <thead>
-      <tr>
-        <th scope="col">Name</th>
-        <th scope="col">Description</th>
-        <th scope="col">Version</th>
-        <th scope="col">Usage</th>
-        <th scope="col">System</th>
-        <th scope="col">Status</th>
-        <th scope="col">Actions</th>
-      </tr>
-    </thead>
-    <tbody id="ctrl-formulas-tbody" aria-live="polite"></tbody>
-  </table>
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Name</th>
+          <th scope="col">Description</th>
+          <th scope="col">Version</th>
+          <th scope="col">Usage</th>
+          <th scope="col">System</th>
+          <th scope="col">Status</th>
+          <th scope="col">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="ctrl-formulas-tbody" aria-live="polite"></tbody>
+    </table>
+  </div>
 </section>
 
 <!-- Users Tab (admin only) -->
@@ -257,19 +277,21 @@
       Create User
     </button>
   </div>
-  <table>
-    <thead>
-      <tr>
-        <th scope="col">Username</th>
-        <th scope="col">Role</th>
-        <th scope="col">Status</th>
-        <th scope="col">Last Login</th>
-        <th scope="col">Created</th>
-        <th scope="col">Actions</th>
-      </tr>
-    </thead>
-    <tbody id="ctrl-users-tbody" aria-live="polite"></tbody>
-  </table>
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Username</th>
+          <th scope="col">Role</th>
+          <th scope="col">Status</th>
+          <th scope="col">Last Login</th>
+          <th scope="col">Created</th>
+          <th scope="col">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="ctrl-users-tbody" aria-live="polite"></tbody>
+    </table>
+  </div>
 </section>
 
 <!-- Services Tab -->
@@ -277,35 +299,39 @@
   <div class="ctrl-section-header">
     <h3>Service Health</h3>
   </div>
-  <table>
-    <thead>
-      <tr>
-        <th scope="col">Service</th>
-        <th scope="col">Port</th>
-        <th scope="col">Status</th>
-        <th scope="col">Model</th>
-        <th scope="col">Latency</th>
-        <th scope="col">Checked</th>
-      </tr>
-    </thead>
-    <tbody id="ctrl-services-tbody" aria-live="polite"></tbody>
-  </table>
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Service</th>
+          <th scope="col">Port</th>
+          <th scope="col">Status</th>
+          <th scope="col">Model</th>
+          <th scope="col">Latency</th>
+          <th scope="col">Checked</th>
+        </tr>
+      </thead>
+      <tbody id="ctrl-services-tbody" aria-live="polite"></tbody>
+    </table>
+  </div>
 
   <div class="ctrl-section-header" style="margin-top:2rem">
     <h3>Recent Events</h3>
   </div>
-  <table>
-    <thead>
-      <tr>
-        <th scope="col">Time</th>
-        <th scope="col">Service</th>
-        <th scope="col">Event</th>
-        <th scope="col">Severity</th>
-        <th scope="col">Details</th>
-      </tr>
-    </thead>
-    <tbody id="ctrl-service-events-tbody" aria-live="polite"></tbody>
-  </table>
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Time</th>
+          <th scope="col">Service</th>
+          <th scope="col">Event</th>
+          <th scope="col">Severity</th>
+          <th scope="col">Details</th>
+        </tr>
+      </thead>
+      <tbody id="ctrl-service-events-tbody" aria-live="polite"></tbody>
+    </table>
+  </div>
 </section>
 
 <!-- Telegram Bot Tab -->
@@ -318,9 +344,31 @@
   </div>
 </section>
 
+<!-- v0.12.0: Visual Formula Editor Overlay -->
+<div id="fe-overlay" class="fe-overlay">
+  <div class="fe-toolbar">
+    <span id="fe-title" class="fe-toolbar-title">Formula Editor</span>
+    <button class="btn btn-sm" onclick="FormulaEditor.addStep()">+ Add Step</button>
+    <button class="btn btn-sm" onclick="FormulaEditor.save()">Save</button>
+    <button class="btn btn-sm" onclick="FormulaEditor.clone()">Clone</button>
+    <button class="btn btn-sm" onclick="FormulaEditor.close()">Close</button>
+  </div>
+  <div class="fe-body">
+    <div class="fe-canvas">
+      <svg id="fe-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+    </div>
+    <div id="fe-props" class="fe-props">
+      <p style="color:var(--text-muted)">Select a node to edit its properties.</p>
+    </div>
+  </div>
+  <div id="fe-validation" class="fe-validation">Ready</div>
+</div>
+
 {{ end }}
 
 {{ define "scripts" }}
+<link rel="stylesheet" href="/css/formula-editor.css">
 <script src="/js/auth.js"></script>
 <script src="/js/control.js"></script>
+<script src="/js/formula-editor.js"></script>
 {{ end }}

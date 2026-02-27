@@ -912,6 +912,17 @@ pub struct ChatConfig {
     pub streaming_edit_interval_ms: u64,
     #[serde(default = "default_streaming_min_tokens")]
     pub streaming_min_tokens: usize,
+    // v0.12.0: Multi-modal attachment storage
+    #[serde(default = "default_attachments_dir")]
+    pub attachments_dir: String,
+    #[serde(default = "default_chat_transcription_model")]
+    pub chat_transcription_model: String,
+    #[serde(default = "default_transcription_url")]
+    pub transcription_url: String,
+    #[serde(default = "default_max_attachment_bytes")]
+    pub max_attachment_bytes: u64,
+    #[serde(default)]
+    pub voice_transcription_enabled: bool,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -991,6 +1002,11 @@ impl Default for ChatConfig {
             streaming_enabled: default_streaming_enabled(),
             streaming_edit_interval_ms: default_streaming_edit_interval_ms(),
             streaming_min_tokens: default_streaming_min_tokens(),
+            attachments_dir: default_attachments_dir(),
+            chat_transcription_model: default_chat_transcription_model(),
+            transcription_url: default_transcription_url(),
+            max_attachment_bytes: default_max_attachment_bytes(),
+            voice_transcription_enabled: false,
         }
     }
 }
@@ -1020,6 +1036,19 @@ fn default_streaming_edit_interval_ms() -> u64 {
 }
 fn default_streaming_min_tokens() -> usize {
     30
+}
+
+fn default_attachments_dir() -> String {
+    "~/.broodlink/attachments".to_string()
+}
+fn default_chat_transcription_model() -> String {
+    "whisper-large-v3-turbo".to_string()
+}
+fn default_transcription_url() -> String {
+    "http://localhost:8180".to_string()
+}
+fn default_max_attachment_bytes() -> u64 {
+    20_971_520
 }
 
 fn default_chat_enabled() -> bool {
@@ -1576,6 +1605,41 @@ api_key_name = "STATUS_API_KEY"
         assert!((cfg.memory_search.kg_entity_similarity_threshold - 0.85).abs() < f64::EPSILON);
         assert_eq!(cfg.memory_search.kg_max_hops, 3);
         assert_eq!(cfg.memory_search.kg_extraction_timeout_seconds, 120);
+
+        std::env::remove_var("BROODLINK_CONFIG");
+    }
+
+    #[test]
+    fn test_v012_multimodal_config_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, valid_toml()).unwrap();
+
+        std::env::set_var("BROODLINK_CONFIG", config_path.to_str().unwrap());
+
+        let cfg = Config::load().unwrap();
+
+        // v0.12.0: Multi-modal attachment config defaults
+        assert_eq!(
+            cfg.chat.attachments_dir, "~/.broodlink/attachments",
+            "attachments_dir default should be ~/.broodlink/attachments"
+        );
+        assert_eq!(
+            cfg.chat.chat_transcription_model, "whisper-large-v3-turbo",
+            "chat_transcription_model must default to whisper-large-v3-turbo (not empty string)"
+        );
+        assert_eq!(
+            cfg.chat.transcription_url, "http://localhost:8180",
+            "transcription_url default"
+        );
+        assert_eq!(
+            cfg.chat.max_attachment_bytes, 20_971_520,
+            "max_attachment_bytes default should be 20MB"
+        );
+        assert!(
+            !cfg.chat.voice_transcription_enabled,
+            "voice_transcription_enabled should default to false"
+        );
 
         std::env::remove_var("BROODLINK_CONFIG");
     }

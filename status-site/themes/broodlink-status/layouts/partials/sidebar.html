@@ -6,22 +6,29 @@
   </h1>
   <nav>
     <ul>
-      <li><a href="/" {{ if eq .RelPermalink "/" }}aria-current="page"{{ end }}>Dashboard</a></li>
+      <li class="sidebar-group-label" aria-hidden="true">Overview</li>
+      <li><a href="/" {{ if eq .RelPermalink "/" }}aria-current="page"{{ end }}>Overview</a></li>
+      <li><a href="/chat/" {{ if hasPrefix .RelPermalink "/chat" }}aria-current="page"{{ end }}>Conversations</a></li>
       <li><a href="/agents/" {{ if hasPrefix .RelPermalink "/agents" }}aria-current="page"{{ end }}>Agents</a></li>
-      <li><a href="/decisions/" {{ if hasPrefix .RelPermalink "/decisions" }}aria-current="page"{{ end }}>Decisions</a></li>
-      <li><a href="/memory/" {{ if hasPrefix .RelPermalink "/memory" }}aria-current="page"{{ end }}>Memory</a></li>
-      <li><a href="/knowledge-graph/" {{ if hasPrefix .RelPermalink "/knowledge-graph" }}aria-current="page"{{ end }}>Knowledge Graph</a></li>
-      <li><a href="/commits/" {{ if hasPrefix .RelPermalink "/commits" }}aria-current="page"{{ end }}>Commits</a></li>
-      <li><a href="/audit/" {{ if hasPrefix .RelPermalink "/audit" }}aria-current="page"{{ end }}>Audit Log</a></li>
-      <li><a href="/beads/" {{ if hasPrefix .RelPermalink "/beads" }}aria-current="page"{{ end }}>Beads</a></li>
+
+      <li class="sidebar-group-label" aria-hidden="true">Work</li>
+      <li><a href="/beads/" {{ if hasPrefix .RelPermalink "/beads" }}aria-current="page"{{ end }}>Tasks &amp; Issues</a></li>
+      <li><a href="/delegations/" {{ if hasPrefix .RelPermalink "/delegations" }}aria-current="page"{{ end }}>Handoffs</a></li>
+      <li><a href="/verification/" {{ if hasPrefix .RelPermalink "/verification" }}aria-current="page"{{ end }}>Quality</a></li>
       <li><a href="/approvals/" {{ if hasPrefix .RelPermalink "/approvals" }}aria-current="page"{{ end }}>Approvals</a></li>
-      <li><a href="/delegations/" {{ if hasPrefix .RelPermalink "/delegations" }}aria-current="page"{{ end }}>Delegations</a></li>
-      <li><a href="/guardrails/" {{ if hasPrefix .RelPermalink "/guardrails" }}aria-current="page"{{ end }}>Guardrails</a></li>
-      <li><a href="/a2a/" {{ if hasPrefix .RelPermalink "/a2a" }}aria-current="page"{{ end }}>A2A</a></li>
-      <li><a href="/chat/" {{ if hasPrefix .RelPermalink "/chat" }}aria-current="page"{{ end }}>Chat</a></li>
-      <li><a href="/verification/" {{ if hasPrefix .RelPermalink "/verification" }}aria-current="page"{{ end }}>Verification</a></li>
-      <li><a href="/onboarding/" {{ if hasPrefix .RelPermalink "/onboarding" }}aria-current="page"{{ end }}>Onboarding</a></li>
-      <li><a href="/control/" {{ if hasPrefix .RelPermalink "/control" }}aria-current="page"{{ end }}>Control Panel</a></li>
+
+      <li class="sidebar-group-label" aria-hidden="true">Knowledge</li>
+      <li><a href="/memory/" {{ if hasPrefix .RelPermalink "/memory" }}aria-current="page"{{ end }}>Memory</a></li>
+      <li><a href="/knowledge-graph/" {{ if hasPrefix .RelPermalink "/knowledge-graph" }}aria-current="page"{{ end }}>Connections</a></li>
+      <li><a href="/decisions/" {{ if hasPrefix .RelPermalink "/decisions" }}aria-current="page"{{ end }}>Decisions</a></li>
+
+      <li class="sidebar-group-label" aria-hidden="true">System</li>
+      <li><a href="/guardrails/" {{ if hasPrefix .RelPermalink "/guardrails" }}aria-current="page"{{ end }}>Safety Rules</a></li>
+      <li><a href="/audit/" {{ if hasPrefix .RelPermalink "/audit" }}aria-current="page"{{ end }}>Activity Log</a></li>
+      <li><a href="/a2a/" {{ if hasPrefix .RelPermalink "/a2a" }}aria-current="page"{{ end }}>External Agents</a></li>
+      <li><a href="/onboarding/" {{ if hasPrefix .RelPermalink "/onboarding" }}aria-current="page"{{ end }}>Add Agent</a></li>
+      <li><a href="/commits/" {{ if hasPrefix .RelPermalink "/commits" }}aria-current="page"{{ end }}>Version History</a></li>
+      <li><a href="/control/" {{ if hasPrefix .RelPermalink "/control" }}aria-current="page"{{ end }}>Settings</a></li>
     </ul>
   </nav>
   <div>v{{ .Site.Params.version }}</div>

@@ -1,3 +1,3 @@
 ---
-title: "Knowledge Graph"
+title: "Connections"
 ---

@@ -1,27 +1,46 @@
 {{ define "main" }}
-<h2>Audit Log</h2>
-<p class="page-desc">Every tool call made by every agent, with parameters, result, and timing.</p>
+<h2>Activity Log</h2>
+<p class="page-desc">Every tool call, every agent, every result — the full record.</p>
+
+<div class="card-grid" id="audit-metrics">
+  <div class="card metric-card">
+    <div class="value" id="audit-total">--</div>
+    <div class="label">Total Entries</div>
+  </div>
+  <div class="card metric-card">
+    <div class="value" id="audit-success-rate">--</div>
+    <div class="label">Success Rate</div>
+  </div>
+  <div class="card metric-card">
+    <div class="value" id="audit-agents">--</div>
+    <div class="label">Unique Agents</div>
+  </div>
+</div>
+
 <div class="filter-bar">
   <label for="audit-agent-filter">Agent</label>
   <input type="text" id="audit-agent-filter" placeholder="Filter by agent…">
   <label for="audit-operation-filter">Operation</label>
   <input type="text" id="audit-operation-filter" placeholder="Filter by operation…">
 </div>
-<table>
-  <caption>System audit trail</caption>
-  <thead>
-    <tr>
-      <th scope="col">ID</th>
-      <th scope="col">Agent</th>
-      <th scope="col">Operation</th>
-      <th scope="col" data-tooltip="ok, error, or timeout">Result</th>
-      <th scope="col">Time</th>
-    </tr>
-  </thead>
-  <tbody id="audit-tbody" aria-live="polite">
-    <!-- Populated by JS -->
-  </tbody>
-</table>
+
+<div class="table-container">
+  <table>
+    <caption>System audit trail</caption>
+    <thead>
+      <tr>
+        <th scope="col">ID</th>
+        <th scope="col">Agent</th>
+        <th scope="col">Operation</th>
+        <th scope="col" data-tooltip="ok, error, or timeout">Result</th>
+        <th scope="col">Time</th>
+      </tr>
+    </thead>
+    <tbody id="audit-tbody" aria-live="polite">
+      <!-- Populated by JS -->
+    </tbody>
+  </table>
+</div>
 {{ end }}
 
 {{ define "scripts" }}

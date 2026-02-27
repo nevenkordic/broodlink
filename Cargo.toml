@@ -35,7 +35,7 @@ config           = "0.14"
 uuid             = { version = "1", features = ["v4"] }
 sqlx             = { version = "0.8", features = ["mysql", "postgres", "runtime-tokio-rustls", "chrono", "json", "uuid"], default-features = false }
 async-nats       = "0.35"
-reqwest          = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+reqwest          = { version = "0.11", features = ["json", "rustls-tls", "multipart"], default-features = false }
 axum             = { version = "0.7", features = ["json"] }
 tower            = "0.4"
 tower-http       = { version = "0.5", features = ["cors", "trace"] }

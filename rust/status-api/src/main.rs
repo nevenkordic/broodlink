@@ -577,6 +577,19 @@ fn build_router(state: Arc<AppState>) -> Router {
             post(handler_chat_assign),
         )
         .route("/chat/stats", get(handler_chat_stats))
+        // v0.12.0 attachment endpoints
+        .route(
+            "/chat/sessions/:session_id/attachments",
+            get(handler_session_attachments),
+        )
+        .route(
+            "/chat/attachments/:attachment_id/download",
+            get(handler_download_attachment),
+        )
+        .route(
+            "/chat/attachments/:attachment_id/thumbnail",
+            get(handler_attachment_thumbnail),
+        )
         // v0.7.0 formula registry
         .route(
             "/formulas",
@@ -1259,12 +1272,19 @@ async fn handler_verification_analytics(
         .unwrap_or(30)
         .min(90);
 
+    // Group by details->>'outcome' (verified, corrected, timeout, error)
+    // because a2a-gateway writes most events as event_type=verification_completed
+    // with the actual outcome in the JSONB details field.
     let rows: Vec<(String, String, i64)> = sqlx::query_as(
-        "SELECT created_at::date::text AS day, event_type, COUNT(*) \
+        "SELECT created_at::date::text AS day, \
+                COALESCE(details->>'outcome', \
+                         CASE WHEN event_type = 'verification_timeout' THEN 'timeout' \
+                              ELSE 'unknown' END) AS outcome, \
+                COUNT(*) \
          FROM service_events \
          WHERE event_type LIKE 'verification_%' \
            AND created_at >= NOW() - make_interval(days => $1) \
-         GROUP BY day, event_type \
+         GROUP BY day, outcome \
          ORDER BY day",
     )
     .bind(days)
@@ -1275,7 +1295,7 @@ async fn handler_verification_analytics(
     let mut daily: std::collections::BTreeMap<String, serde_json::Value> =
         std::collections::BTreeMap::new();
 
-    for (day, event_type, count) in &rows {
+    for (day, outcome, count) in &rows {
         let entry = daily.entry(day.clone()).or_insert_with(|| {
             serde_json::json!({
                 "date": day,
@@ -1286,9 +1306,11 @@ async fn handler_verification_analytics(
                 "total": 0,
             })
         });
-        let key = event_type
-            .strip_prefix("verification_")
-            .unwrap_or(event_type);
+        // outcome is one of: verified, corrected, timeout, error, unknown
+        let key = match outcome.as_str() {
+            "verified" | "corrected" | "timeout" | "error" => outcome.as_str(),
+            _ => "error", // bucket unknowns into error
+        };
         entry[key] = serde_json::json!(count);
         let total = entry["total"].as_i64().unwrap_or(0) + count;
         entry["total"] = serde_json::json!(total);
@@ -2826,9 +2848,9 @@ async fn handler_upsert_approval_policy(
         serde_json::from_slice(&bytes)
             .map_err(|e| StatusApiError::BadRequest(format!("invalid JSON: {e}")))?
     };
-    if !["pre_dispatch", "pre_completion", "budget", "custom"].contains(&body.gate_type.as_str()) {
+    if !["all", "pre_dispatch", "pre_completion", "budget", "custom"].contains(&body.gate_type.as_str()) {
         return Err(StatusApiError::Internal(
-            "gate_type must be one of: pre_dispatch, pre_completion, budget, custom".to_string(),
+            "gate_type must be one of: all, pre_dispatch, pre_completion, budget, custom".to_string(),
         ));
     }
 
@@ -3503,15 +3525,66 @@ async fn handler_chat_messages(
     .fetch_all(&state.pg)
     .await?;
 
+    // v0.12.0: Fetch attachments for these messages in one query
+    let msg_ids: Vec<i64> = rows.iter().map(|(id, ..)| *id).collect();
+    let att_rows: Vec<(
+        String,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+    )> = if msg_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as(
+            "SELECT id, message_id, attachment_type, mime_type, file_name,
+                    file_size_bytes, thumbnail_path, extracted_text, transcription,
+                    created_at::text
+             FROM chat_attachments
+             WHERE message_id = ANY($1)
+             ORDER BY created_at ASC",
+        )
+        .bind(&msg_ids)
+        .fetch_all(&state.pg)
+        .await
+        .unwrap_or_default()
+    };
+
+    // Group attachments by message_id
+    let mut att_map: std::collections::HashMap<i64, Vec<serde_json::Value>> =
+        std::collections::HashMap::new();
+    for (att_id, msg_id, att_type, mime, fname, fsize, thumb, extracted, transcription, created) in
+        &att_rows
+    {
+        att_map.entry(*msg_id).or_default().push(serde_json::json!({
+            "id": att_id,
+            "attachment_type": att_type,
+            "mime_type": mime,
+            "file_name": fname,
+            "file_size_bytes": fsize,
+            "thumbnail_path": thumb,
+            "extracted_text": extracted,
+            "transcription": transcription,
+            "created_at": created,
+        }));
+    }
+
     let messages: Vec<serde_json::Value> = rows
         .iter()
         .map(|(id, direction, content, task_id, created)| {
+            let attachments = att_map.get(id).cloned().unwrap_or_default();
             serde_json::json!({
                 "id": id,
                 "direction": direction,
                 "content": content,
                 "task_id": task_id,
                 "created_at": created,
+                "attachments": attachments,
             })
         })
         .collect();
@@ -3626,6 +3699,198 @@ async fn handler_chat_assign(
         "session_id": session_id,
         "assigned_agent": agent,
     })))
+}
+
+// ---------------------------------------------------------------------------
+// v0.12.0: Attachment endpoints
+// ---------------------------------------------------------------------------
+
+async fn handler_session_attachments(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    req: Request<axum::body::Body>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Operator)?;
+
+    let limit: i64 = clamp_limit(
+        params
+            .get("limit")
+            .and_then(|l| l.parse().ok())
+            .unwrap_or(50),
+    );
+
+    let rows: Vec<(
+        String,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+    )> = sqlx::query_as(
+        "SELECT id, message_id, attachment_type, mime_type, file_name,
+                file_size_bytes, file_hash, thumbnail_path, extracted_text, transcription,
+                created_at::text
+         FROM chat_attachments
+         WHERE session_id = $1
+         ORDER BY created_at DESC
+         LIMIT $2",
+    )
+    .bind(&session_id)
+    .bind(limit)
+    .fetch_all(&state.pg)
+    .await?;
+
+    let attachments: Vec<serde_json::Value> = rows
+        .iter()
+        .map(
+            |(
+                id,
+                msg_id,
+                att_type,
+                mime,
+                fname,
+                fsize,
+                hash,
+                thumb,
+                extracted,
+                transcription,
+                created,
+            )| {
+                serde_json::json!({
+                    "id": id,
+                    "message_id": msg_id,
+                    "attachment_type": att_type,
+                    "mime_type": mime,
+                    "file_name": fname,
+                    "file_size_bytes": fsize,
+                    "file_hash": hash,
+                    "thumbnail_path": thumb,
+                    "extracted_text": extracted,
+                    "transcription": transcription,
+                    "created_at": created,
+                })
+            },
+        )
+        .collect();
+
+    Ok(ok_response(serde_json::json!({
+        "attachments": attachments,
+        "session_id": session_id,
+        "total": attachments.len(),
+    })))
+}
+
+async fn handler_download_attachment(
+    State(state): State<Arc<AppState>>,
+    Path(attachment_id): Path<String>,
+    req: Request<axum::body::Body>,
+) -> Response {
+    let ctx = match req.extensions().get::<AuthContext>().cloned() {
+        Some(c) => c,
+        None => return (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+    };
+    if require_role(&ctx, UserRole::Operator).is_err() {
+        return (StatusCode::FORBIDDEN, "insufficient role").into_response();
+    }
+
+    let row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT storage_path, mime_type, file_name FROM chat_attachments WHERE id = $1",
+    )
+    .bind(&attachment_id)
+    .fetch_optional(&state.pg)
+    .await
+    .unwrap_or(None);
+
+    let (storage_path, mime_type, file_name) = match row {
+        Some(r) => r,
+        None => return (StatusCode::NOT_FOUND, "attachment not found").into_response(),
+    };
+
+    let attachments_dir = broodlink_fs::expand_tilde(&state.config.chat.attachments_dir);
+    let full_path = std::path::PathBuf::from(&attachments_dir).join(&storage_path);
+
+    // Prevent path traversal
+    if storage_path.contains("..") {
+        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    }
+
+    let bytes = match std::fs::read(&full_path) {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::NOT_FOUND, "file not found on disk").into_response(),
+    };
+
+    let content_type = mime_type.unwrap_or_else(|| "application/octet-stream".to_string());
+    let disposition = if let Some(name) = file_name {
+        format!("attachment; filename=\"{name}\"")
+    } else {
+        "attachment".to_string()
+    };
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CONTENT_DISPOSITION, disposition),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+async fn handler_attachment_thumbnail(
+    State(state): State<Arc<AppState>>,
+    Path(attachment_id): Path<String>,
+    req: Request<axum::body::Body>,
+) -> Response {
+    let ctx = match req.extensions().get::<AuthContext>().cloned() {
+        Some(c) => c,
+        None => return (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+    };
+    if require_role(&ctx, UserRole::Operator).is_err() {
+        return (StatusCode::FORBIDDEN, "insufficient role").into_response();
+    }
+
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT thumbnail_path FROM chat_attachments WHERE id = $1")
+            .bind(&attachment_id)
+            .fetch_optional(&state.pg)
+            .await
+            .unwrap_or(None);
+
+    let thumb_path = match row.and_then(|(p,)| p) {
+        Some(p) => p,
+        None => return (StatusCode::NOT_FOUND, "no thumbnail").into_response(),
+    };
+
+    if thumb_path.contains("..") {
+        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    }
+
+    let attachments_dir = broodlink_fs::expand_tilde(&state.config.chat.attachments_dir);
+    let full_path = std::path::PathBuf::from(&attachments_dir).join(&thumb_path);
+
+    let bytes = match std::fs::read(&full_path) {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::NOT_FOUND, "thumbnail not found").into_response(),
+    };
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "image/jpeg".to_string())],
+        bytes,
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------

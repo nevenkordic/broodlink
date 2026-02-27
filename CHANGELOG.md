@@ -5,6 +5,79 @@ All notable changes to Broodlink are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.12.0] - 2026-02-27
+
+### Added
+
+- **Multi-Modal Chat Attachments**: Slack, Teams, and Telegram file uploads
+  are downloaded, stored to `attachments_dir`, and persisted as chat message
+  attachments. `PendingAttachment` struct carries metadata (type, MIME,
+  filename, bytes, platform file ID) through the message pipeline.
+  `classify_attachment_type()` buckets files into image/audio/video/document.
+  Slack file downloads use bot token auth. Telegram file downloads via
+  `getFile` API. Three new status-api endpoints:
+  `GET /chat/sessions/:id/attachments`,
+  `GET /chat/attachments/:id/download`,
+  `GET /chat/attachments/:id/thumbnail`.
+  `reqwest` multipart feature enabled for future upload support.
+- **Python SDK Overhaul**: CLI rewritten from argparse to Click with
+  subcommand groups: `agent list`, `memory search|store|recall|stats`,
+  `tool call|list`. Backward-compatible `--listen` mode preserved.
+  Package version bumped to 0.12.0. Typed exports for all model classes
+  (`Memory`, `Task`, `Agent`, `Issue`, `Formula`, etc.) via `__all__`.
+- **Dashboard Redesign**: All 15 dashboard pages (everything except
+  Verification) upgraded to consistent design system. Metric cards
+  (`.card-grid > .card.metric-card > .value + .label`) added to Beads,
+  Delegations, Audit, Commits, Approvals, Guardrails, A2A, and Chat.
+  All tables wrapped in `.table-container` for consistent borders.
+  Sidebar reorganised into three sections (Intelligence, Operations,
+  System) with plain-English labels. ~210 lines of new CSS for chat
+  sessions, modal overlay, platform badges, status badges, agent cards,
+  guardrail cards, A2A structured cards, policy editor, and empty states.
+- **A2A Structured Card**: Replaced raw `<pre>` JSON dump with a
+  structured card showing agent name, description, URL, provider, version,
+  and skill tags. Task mappings rendered in a proper table.
+- **Verification Page Enhancements**: Configurable date range filter
+  (7/14/30/60/90 days), error outcome tracking in metrics and charts,
+  improved Chart.js dark-theme defaults, styled error state for failed
+  data loads.
+- **Attachment Storage Module**: New `crates/broodlink-fs/src/attachments.rs`
+  for file persistence with tilde-expanded `attachments_dir`.
+- New config fields: `[chat].attachments_dir`,
+  `[chat].voice_transcription_enabled`, `[chat].chat_transcription_model`,
+  `[chat].transcription_url`, `[chat].max_attachment_bytes`.
+- Migration 030: `chat_attachments` table (message_id FK, type, MIME,
+  filename, file path, thumbnail path, file size, platform file ID).
+- Python SDK: `AsyncBroodlinkClient` / `BroodlinkClient` with namespace
+  accessors (`memory`, `agents`, `tasks`, `kg`), typed models via
+  Pydantic, `NATSHelper`, `BaseAgent` framework, ML utilities. Full
+  test suite under `agents/tests/`.
+
+### Fixed
+
+- **Verification analytics query**: Grouped by `details->>'outcome'`
+  instead of `event_type` prefix stripping, since a2a-gateway writes
+  all verification events as `verification_completed` with the actual
+  outcome (verified/corrected/timeout/error) in the JSONB details field.
+- **Approval "all" gate type**: Added `"all"` to the allowed `gate_type`
+  values in the policy upsert validation.
+- **Chat metric cards unstyled**: Chat page used `.metric-bar` /
+  `.metric-value` / `.metric-label` classes with zero CSS. Replaced with
+  standard `.card-grid > .card.metric-card` pattern.
+- **Memory/Knowledge Graph wrong card classes**: Used `.card-value` /
+  `.card-label` (no CSS) instead of `.value` / `.label`. Fixed to match
+  design system.
+- **Dashboard tables inconsistent**: Bare `<table>` tags (Overview, Beads,
+  Audit, Commits, Knowledge Graph, Onboarding) and `.table-wrap` /
+  `.data-table` classes (Delegations, Approvals, Guardrails, Onboarding)
+  had no CSS. All wrapped in `.table-container`.
+- **Delegations page**: JS generated full table HTML inside empty div.
+  Replaced with pre-defined `<table>` with `<thead>` visible on load;
+  JS fills `<tbody>` only.
+- **`fetchApi()` POST support**: Added optional `opts` parameter to
+  `utils.js` `fetchApi()` for POST/PUT requests, matching the pattern
+  used by the control panel.
+
 ## [0.11.0] - 2026-02-27
 
 ### Added

@@ -1,6 +1,6 @@
 {{ define "main" }}
-<h2>Operations Dashboard</h2>
-<p class="page-desc">Live overview of all agents, tasks, and system health.</p>
+<h2>Overview</h2>
+<p class="page-desc">A live snapshot of your agents, tasks, and system health.</p>
 
 <div id="stale-banner" class="stale-banner" role="alert">
   <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
@@ -54,21 +54,23 @@
 
 <section aria-labelledby="tasks-heading">
   <h3 id="tasks-heading">Task Queue</h3>
-  <table>
-    <caption>Current task queue status</caption>
-    <thead>
-      <tr>
-        <th scope="col">ID</th>
-        <th scope="col">Type</th>
-        <th scope="col">Status</th>
-        <th scope="col">Agent</th>
-        <th scope="col">Created</th>
-      </tr>
-    </thead>
-    <tbody id="tasks-tbody">
-      <!-- Populated by JS -->
-    </tbody>
-  </table>
+  <div class="table-container">
+    <table>
+      <caption>Current task queue status</caption>
+      <thead>
+        <tr>
+          <th scope="col">ID</th>
+          <th scope="col">Type</th>
+          <th scope="col">Status</th>
+          <th scope="col">Agent</th>
+          <th scope="col">Created</th>
+        </tr>
+      </thead>
+      <tbody id="tasks-tbody">
+        <!-- Populated by JS -->
+      </tbody>
+    </table>
+  </div>
 </section>
 {{ end }}
 

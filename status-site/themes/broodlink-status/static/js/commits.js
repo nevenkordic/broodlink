@@ -10,6 +10,17 @@
 
   var BL = window.Broodlink;
 
+  function updateMetrics(commits) {
+    var el;
+    el = document.getElementById('commits-total'); if (el) el.textContent = commits.length;
+    el = document.getElementById('commits-latest');
+    if (el && commits.length > 0) {
+      var latest = commits[0];
+      var date = latest.date || latest.committed_at || latest.created_at || '';
+      el.textContent = date ? BL.formatRelativeTime(date) : '--';
+    }
+  }
+
   function render(commits) {
     if (!commits || commits.length === 0) {
       tbody.innerHTML = '<tr><td colspan="4">No commits found.</td></tr>';
@@ -18,10 +29,10 @@
 
     tbody.innerHTML = commits.map(function (c) {
       var hash = BL.escapeHtml((c.commit_hash || c.hash || '').substring(0, 8));
-      var author = BL.escapeHtml(c.committer || c.author || '—');
-      var message = BL.escapeHtml(c.message || c.commit_message || '—');
+      var author = BL.escapeHtml(c.committer || c.author || '\u2014');
+      var message = BL.escapeHtml(c.message || c.commit_message || '\u2014');
       var date = c.date || c.committed_at || c.created_at || '';
-      var formatted = date ? BL.formatRelativeTime(date) : '—';
+      var formatted = date ? BL.formatRelativeTime(date) : '\u2014';
 
       return '<tr>' +
         '<td><code>' + hash + '</code></td>' +
@@ -34,7 +45,9 @@
 
   function load() {
     BL.fetchApi('/api/v1/commits').then(function (data) {
-      render(data.commits || data);
+      var commits = data.commits || data;
+      updateMetrics(commits);
+      render(commits);
     }).catch(function () {
       tbody.innerHTML = '<tr><td colspan="4">Failed to load commits.</td></tr>';
     });

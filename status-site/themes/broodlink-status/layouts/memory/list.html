@@ -1,11 +1,11 @@
 {{ define "main" }}
-<h2>Memory Store</h2>
-<p class="page-desc">Shared knowledge base across all agents. Memories persist between sessions and are searchable by vector similarity.</p>
+<h2>Memory</h2>
+<p class="page-desc">Everything your agents remember between conversations. Searchable and persistent.</p>
 <section aria-labelledby="memory-overview-heading">
   <h3 id="memory-overview-heading">Overview</h3>
   <div class="card-grid" aria-live="polite">
-    <div class="card"><div class="card-value" id="memory-total">&mdash;</div><div class="card-label">Total Entries</div></div>
-    <div class="card"><div class="card-value" id="memory-updated">&mdash;</div><div class="card-label">Last Updated</div></div>
+    <div class="card metric-card"><div class="value" id="memory-total">&mdash;</div><div class="label">Total Entries</div></div>
+    <div class="card metric-card"><div class="value" id="memory-updated">&mdash;</div><div class="label">Last Updated</div></div>
   </div>
 </section>
 <section aria-labelledby="memory-stats-heading">

@@ -51,7 +51,7 @@
         : '—';
     }
 
-    // Additional statistics in a definition list for accessibility
+    // Additional statistics as metric cards
     if (statsEl) {
       var items = [];
 
@@ -72,21 +72,14 @@
       }
 
       if (items.length > 0) {
-        var html = '<dl class="memory-stats-grid" style="' +
-          'display:grid;grid-template-columns:repeat(auto-fill,minmax(12rem,1fr));gap:1rem;">';
+        var html = '';
         for (var i = 0; i < items.length; i++) {
           html +=
-            '<div class="card" style="text-align:center;">' +
-              '<dt style="font-size:0.75rem;text-transform:uppercase;letter-spacing:0.05em;' +
-                'color:var(--text-secondary);margin-bottom:0.25rem;">' +
-                escapeHtml(items[i].label) +
-              '</dt>' +
-              '<dd style="font-size:1.5rem;font-weight:700;font-family:var(--font-mono);">' +
-                items[i].value +
-              '</dd>' +
+            '<div class="card metric-card">' +
+              '<div class="value">' + items[i].value + '</div>' +
+              '<div class="label">' + escapeHtml(items[i].label) + '</div>' +
             '</div>';
         }
-        html += '</dl>';
         statsEl.innerHTML = html;
       }
     }

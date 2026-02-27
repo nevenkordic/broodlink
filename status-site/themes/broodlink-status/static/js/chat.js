@@ -28,6 +28,46 @@
     }
   }
 
+  function formatFileSize(bytes) {
+    if (!bytes) return '';
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / 1048576).toFixed(1) + ' MB';
+  }
+
+  function renderAttachments(attachments) {
+    if (!attachments || attachments.length === 0) return '';
+    var items = attachments.map(function (att) {
+      var icon = '📎';
+      if (att.attachment_type === 'image') icon = '🖼️';
+      else if (att.attachment_type === 'document') icon = '📄';
+      else if (att.attachment_type === 'voice' || att.attachment_type === 'audio') icon = '🎤';
+      var name = BL.escapeHtml(att.file_name || 'file');
+      var size = formatFileSize(att.file_size_bytes);
+      var thumb = '';
+      if (att.attachment_type === 'image' && att.thumbnail_path) {
+        thumb = '<img class="chat-thumbnail" src="/api/v1/chat/attachments/' + BL.escapeHtml(att.id) + '/thumbnail" alt="thumbnail" loading="lazy">';
+      }
+      var transcription = '';
+      if (att.transcription) {
+        transcription = '<div class="chat-transcription"><em>Transcription:</em> ' + BL.escapeHtml(att.transcription) + '</div>';
+      }
+      if (att.extracted_text) {
+        transcription += '<div class="chat-transcription"><em>Extracted text:</em> ' + BL.escapeHtml(att.extracted_text.substring(0, 500)) + (att.extracted_text.length > 500 ? '…' : '') + '</div>';
+      }
+      return '<div class="chat-attachment chat-attachment-' + BL.escapeHtml(att.attachment_type) + '">' +
+        thumb +
+        '<div class="chat-attachment-info">' +
+          '<span class="chat-attachment-icon">' + icon + '</span>' +
+          '<a href="/api/v1/chat/attachments/' + BL.escapeHtml(att.id) + '/download" class="chat-attachment-name" target="_blank">' + name + '</a>' +
+          (size ? '<span class="chat-attachment-size">' + size + '</span>' : '') +
+        '</div>' +
+        transcription +
+      '</div>';
+    }).join('');
+    return '<div class="chat-attachments">' + items + '</div>';
+  }
+
   function renderSessions(sessions) {
     if (!sessions || sessions.length === 0) {
       sessionsEl.innerHTML = '<p class="empty-state">No chat sessions found.</p>';
@@ -101,9 +141,11 @@
         var cls = m.direction === 'inbound' ? 'chat-msg-inbound' : 'chat-msg-outbound';
         var label = m.direction === 'inbound' ? 'User' : 'Agent';
         var time = m.created_at ? BL.formatRelativeTime(m.created_at) : '';
+        var attHtml = renderAttachments(m.attachments || []);
         return '<div class="chat-msg ' + cls + '">' +
           '<div class="chat-msg-header"><strong>' + label + '</strong> <span class="time">' + time + '</span></div>' +
           '<div class="chat-msg-content">' + BL.escapeHtml(m.content) + '</div>' +
+          attHtml +
         '</div>';
       }).join('');
     }).catch(function () {

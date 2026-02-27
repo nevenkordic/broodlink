@@ -333,6 +333,15 @@ struct PendingWriteEntry {
     sender: tokio::sync::oneshot::Sender<bool>,
 }
 
+/// v0.12.0: Attachment metadata collected from platform messages before storage.
+struct PendingAttachment {
+    attachment_type: String,
+    mime_type: Option<String>,
+    file_name: Option<String>,
+    bytes: Vec<u8>,
+    platform_file_id: Option<String>,
+}
+
 /// v0.10.0: Parameters for `call_ollama_chat` — avoids growing the function signature.
 struct ChatParams<'a> {
     model_override: Option<&'a str>,
@@ -2043,6 +2052,7 @@ async fn webhook_slack_handler(
             &text,
             None,
             response_url.as_deref(),
+            None,
         )
         .await;
 
@@ -2089,24 +2099,77 @@ async fn handle_slack_event(state: &AppState, body: &str) -> Response {
             let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
             // Only handle message events, ignore bot messages
+            // Also handle file_share subtype for Slack file uploads
+            let subtype = event.get("subtype").and_then(|s| s.as_str());
             if event_type == "message"
                 && event.get("bot_id").is_none()
-                && event.get("subtype").is_none()
+                && (subtype.is_none() || subtype == Some("file_share"))
             {
                 let channel = event.get("channel").and_then(|c| c.as_str()).unwrap_or("");
                 let user = event.get("user").and_then(|u| u.as_str()).unwrap_or("");
                 let text = event.get("text").and_then(|t| t.as_str()).unwrap_or("");
                 let thread_ts = event.get("thread_ts").and_then(|t| t.as_str());
 
-                if !text.is_empty() && state.config.chat.enabled {
+                // v0.12.0: Extract files from Slack event
+                let slack_files = event
+                    .get("files")
+                    .and_then(|f| f.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let has_files = !slack_files.is_empty();
+
+                if (!text.is_empty() || has_files) && state.config.chat.enabled {
                     // Check if it's a command first
                     if text.starts_with("/broodlink") || text.starts_with("broodlink ") {
                         // Let the slash command handler deal with it
                     } else {
+                        // v0.12.0: Download Slack files and build PendingAttachments
+                        let mut pending_attachments: Vec<PendingAttachment> = Vec::new();
+                        for file in &slack_files {
+                            let url_private = file.get("url_private").and_then(|u| u.as_str());
+                            let file_name =
+                                file.get("name").and_then(|n| n.as_str()).unwrap_or("file");
+                            let mime = file
+                                .get("mimetype")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("application/octet-stream");
+                            let file_id = file.get("id").and_then(|i| i.as_str());
+
+                            if let Some(url) = url_private {
+                                match download_slack_file(state, url).await {
+                                    Ok(bytes) => {
+                                        pending_attachments.push(PendingAttachment {
+                                            attachment_type: classify_attachment_type(
+                                                mime, file_name,
+                                            )
+                                            .to_string(),
+                                            mime_type: Some(mime.to_string()),
+                                            file_name: Some(file_name.to_string()),
+                                            bytes,
+                                            platform_file_id: file_id.map(|s| s.to_string()),
+                                        });
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            error = %e,
+                                            file_name = %file_name,
+                                            "failed to download slack file"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        let att_slice = if pending_attachments.is_empty() {
+                            None
+                        } else {
+                            Some(pending_attachments.as_slice())
+                        };
+
                         let _ = handle_chat_message(
                             state, "slack", channel, user,
                             user, // display name not available in events API, use user_id
-                            text, thread_ts, None,
+                            text, thread_ts, None, att_slice,
                         )
                         .await;
                     }
@@ -2206,8 +2269,58 @@ async fn webhook_teams_handler(
             })),
         )
             .into_response()
-    } else if state.config.chat.enabled && activity_type == "message" && !text.is_empty() {
-        // Conversational message
+    } else if state.config.chat.enabled && activity_type == "message" {
+        // v0.12.0: Extract Teams attachments (inline images, hosted content)
+        let teams_attachments = payload
+            .get("attachments")
+            .and_then(|a| a.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let has_attachments = !teams_attachments.is_empty();
+
+        if text.is_empty() && !has_attachments {
+            return (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({"type": "message", "text": "Usage: /broodlink <command>. Try 'help'."})),
+            )
+                .into_response();
+        }
+
+        // Download Teams attachments and build PendingAttachments
+        let mut pending_attachments: Vec<PendingAttachment> = Vec::new();
+        for att in &teams_attachments {
+            let content_type = att
+                .get("contentType")
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+            let content_url = att.get("contentUrl").and_then(|u| u.as_str());
+            let name = att.get("name").and_then(|n| n.as_str()).unwrap_or("file");
+
+            if let Some(url) = content_url {
+                match download_teams_file(&state, url).await {
+                    Ok(bytes) => {
+                        pending_attachments.push(PendingAttachment {
+                            attachment_type: classify_attachment_type(content_type, name)
+                                .to_string(),
+                            mime_type: Some(content_type.to_string()),
+                            file_name: Some(name.to_string()),
+                            bytes,
+                            platform_file_id: None,
+                        });
+                    }
+                    Err(e) => {
+                        warn!(error = %e, name = %name, "failed to download teams file");
+                    }
+                }
+            }
+        }
+
+        let att_slice = if pending_attachments.is_empty() {
+            None
+        } else {
+            Some(pending_attachments.as_slice())
+        };
+
         let _ = handle_chat_message(
             &state,
             "teams",
@@ -2217,6 +2330,7 @@ async fn webhook_teams_handler(
             text,
             None,
             service_url,
+            att_slice,
         )
         .await;
 
@@ -2380,6 +2494,31 @@ async fn webhook_telegram_handler(
         .unwrap_or("document");
     let has_document = doc_file_id.is_some();
 
+    // v0.12.0: Extract voice/audio attachments
+    let voice_file_id = message
+        .get("voice")
+        .and_then(|v| v.get("file_id"))
+        .and_then(|f| f.as_str());
+    let audio_file_id = message
+        .get("audio")
+        .and_then(|a| a.get("file_id"))
+        .and_then(|f| f.as_str());
+    let voice_mime = message
+        .get("voice")
+        .and_then(|v| v.get("mime_type"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("audio/ogg");
+    let audio_mime = message
+        .get("audio")
+        .and_then(|a| a.get("mime_type"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("audio/mpeg");
+    let audio_file_name_str = message
+        .get("audio")
+        .and_then(|a| a.get("file_name"))
+        .and_then(|f| f.as_str());
+    let has_voice = voice_file_id.is_some() || audio_file_id.is_some();
+
     let user_name = message
         .get("from")
         .and_then(|f| f.get("first_name"))
@@ -2467,8 +2606,8 @@ async fn webhook_telegram_handler(
         }
     }
 
-    // Conversational message (non-command) — also proceed for photos/documents without text
-    if state.config.chat.enabled && (!text.is_empty() || has_photo || has_document) {
+    // Conversational message (non-command) — also proceed for photos/documents/voice without text
+    if state.config.chat.enabled && (!text.is_empty() || has_photo || has_document || has_voice) {
         let chat_id_str = chat_id.to_string();
         let user_id_str = user_id_val.to_string();
 
@@ -2510,9 +2649,99 @@ async fn webhook_telegram_handler(
             None
         };
 
-        // Build chat text: document content + user caption/message
+        // v0.12.0: Build pending attachments for storage
+        let mut pending_attachments: Vec<PendingAttachment> = Vec::new();
+
+        // Download voice/audio and transcribe if enabled
+        let voice_transcription = if let Some(fid) = voice_file_id {
+            match download_telegram_file(&state, fid).await {
+                Ok(bytes) => {
+                    let transcription = if state.config.chat.voice_transcription_enabled {
+                        transcribe_audio(&state, &bytes, voice_mime).await.ok()
+                    } else {
+                        None
+                    };
+                    pending_attachments.push(PendingAttachment {
+                        attachment_type: "voice".to_string(),
+                        mime_type: Some(voice_mime.to_string()),
+                        file_name: Some("voice.ogg".to_string()),
+                        bytes,
+                        platform_file_id: Some(fid.to_string()),
+                    });
+                    transcription
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to download telegram voice");
+                    None
+                }
+            }
+        } else if let Some(fid) = audio_file_id {
+            match download_telegram_file(&state, fid).await {
+                Ok(bytes) => {
+                    let transcription = if state.config.chat.voice_transcription_enabled {
+                        transcribe_audio(&state, &bytes, audio_mime).await.ok()
+                    } else {
+                        None
+                    };
+                    pending_attachments.push(PendingAttachment {
+                        attachment_type: "audio".to_string(),
+                        mime_type: Some(audio_mime.to_string()),
+                        file_name: audio_file_name_str.map(|s| s.to_string()),
+                        bytes,
+                        platform_file_id: Some(fid.to_string()),
+                    });
+                    transcription
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to download telegram audio");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Add document as pending attachment (bytes already downloaded by extract_telegram_document)
+        if let Some(fid) = doc_file_id {
+            if let Ok(bytes) = download_telegram_file(&state, fid).await {
+                let mime = message
+                    .get("document")
+                    .and_then(|d| d.get("mime_type"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("application/octet-stream");
+                pending_attachments.push(PendingAttachment {
+                    attachment_type: "document".to_string(),
+                    mime_type: Some(mime.to_string()),
+                    file_name: Some(doc_file_name.to_string()),
+                    bytes,
+                    platform_file_id: Some(fid.to_string()),
+                });
+            }
+        }
+
+        // Add photo as pending attachment for persistent storage
+        if let Some(fid) = photo_file_id {
+            if let Ok(bytes) = download_telegram_file(&state, fid).await {
+                pending_attachments.push(PendingAttachment {
+                    attachment_type: "image".to_string(),
+                    mime_type: Some("image/jpeg".to_string()),
+                    file_name: Some("photo.jpg".to_string()),
+                    bytes,
+                    platform_file_id: Some(fid.to_string()),
+                });
+            }
+        }
+
+        // Build chat text: voice transcription > document content > photo prompt > text
         let chat_text_owned;
-        let chat_text = if let Some(ref doc) = doc_content {
+        let chat_text = if let Some(ref transcription) = voice_transcription {
+            if text.is_empty() {
+                transcription.as_str()
+            } else {
+                chat_text_owned = format!("{transcription}\n\n{text}");
+                chat_text_owned.as_str()
+            }
+        } else if let Some(ref doc) = doc_content {
             let user_msg = if text.is_empty() {
                 "Please read and summarize this document."
             } else {
@@ -2522,6 +2751,8 @@ async fn webhook_telegram_handler(
             chat_text_owned.as_str()
         } else if text.is_empty() && has_photo {
             "What's in this image?"
+        } else if text.is_empty() && has_voice && voice_transcription.is_none() {
+            "[Voice message received but transcription is not enabled]"
         } else {
             text
         };
@@ -2533,6 +2764,12 @@ async fn webhook_telegram_handler(
         let pool_url = pool_permit.as_ref().ok().map(|p| p.url.clone());
         let _permit = pool_permit.ok();
 
+        let att_slice = if pending_attachments.is_empty() {
+            None
+        } else {
+            Some(pending_attachments.as_slice())
+        };
+
         let session_id = handle_chat_message(
             &state,
             "telegram",
@@ -2542,6 +2779,7 @@ async fn webhook_telegram_handler(
             chat_text,
             thread_id.as_deref(),
             None,
+            att_slice,
         )
         .await;
 
@@ -2736,7 +2974,32 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
         .unwrap_or("document");
     let has_document = doc_file_id.is_some();
 
-    if text.is_empty() && !has_photo && !has_document {
+    // v0.12.0: Extract voice/audio attachments
+    let voice_file_id = message
+        .get("voice")
+        .and_then(|v| v.get("file_id"))
+        .and_then(|f| f.as_str());
+    let audio_file_id = message
+        .get("audio")
+        .and_then(|a| a.get("file_id"))
+        .and_then(|f| f.as_str());
+    let voice_mime = message
+        .get("voice")
+        .and_then(|v| v.get("mime_type"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("audio/ogg");
+    let audio_mime = message
+        .get("audio")
+        .and_then(|a| a.get("mime_type"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("audio/mpeg");
+    let audio_file_name_str = message
+        .get("audio")
+        .and_then(|a| a.get("file_name"))
+        .and_then(|f| f.as_str());
+    let has_voice = voice_file_id.is_some() || audio_file_id.is_some();
+
+    if text.is_empty() && !has_photo && !has_document && !has_voice {
         return None;
     }
 
@@ -2785,8 +3048,8 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
         }
     }
 
-    // Conversational message — also proceed for photos/documents without text
-    if state.config.chat.enabled && (!text.is_empty() || has_photo || has_document) {
+    // Conversational message — also proceed for photos/documents/voice without text
+    if state.config.chat.enabled && (!text.is_empty() || has_photo || has_document || has_voice) {
         let chat_id_str = chat_id.to_string();
         let user_id_str = user_id_val.to_string();
 
@@ -2794,6 +3057,8 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
         let dedup_text = if text.is_empty() {
             if has_photo {
                 "[photo]"
+            } else if has_voice {
+                "[voice]"
             } else {
                 "[document]"
             }
@@ -2832,9 +3097,99 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
             None
         };
 
-        // Build chat text: document content + user caption/message
+        // v0.12.0: Build pending attachments for storage
+        let mut pending_attachments: Vec<PendingAttachment> = Vec::new();
+
+        // Download voice/audio and transcribe if enabled
+        let voice_transcription = if let Some(fid) = voice_file_id {
+            match download_telegram_file(state, fid).await {
+                Ok(bytes) => {
+                    let transcription = if state.config.chat.voice_transcription_enabled {
+                        transcribe_audio(state, &bytes, voice_mime).await.ok()
+                    } else {
+                        None
+                    };
+                    pending_attachments.push(PendingAttachment {
+                        attachment_type: "voice".to_string(),
+                        mime_type: Some(voice_mime.to_string()),
+                        file_name: Some("voice.ogg".to_string()),
+                        bytes,
+                        platform_file_id: Some(fid.to_string()),
+                    });
+                    transcription
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to download telegram voice");
+                    None
+                }
+            }
+        } else if let Some(fid) = audio_file_id {
+            match download_telegram_file(state, fid).await {
+                Ok(bytes) => {
+                    let transcription = if state.config.chat.voice_transcription_enabled {
+                        transcribe_audio(state, &bytes, audio_mime).await.ok()
+                    } else {
+                        None
+                    };
+                    pending_attachments.push(PendingAttachment {
+                        attachment_type: "audio".to_string(),
+                        mime_type: Some(audio_mime.to_string()),
+                        file_name: audio_file_name_str.map(|s| s.to_string()),
+                        bytes,
+                        platform_file_id: Some(fid.to_string()),
+                    });
+                    transcription
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to download telegram audio");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Add document as pending attachment
+        if let Some(fid) = doc_file_id {
+            if let Ok(bytes) = download_telegram_file(state, fid).await {
+                let mime = message
+                    .get("document")
+                    .and_then(|d| d.get("mime_type"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("application/octet-stream");
+                pending_attachments.push(PendingAttachment {
+                    attachment_type: "document".to_string(),
+                    mime_type: Some(mime.to_string()),
+                    file_name: Some(doc_file_name.to_string()),
+                    bytes,
+                    platform_file_id: Some(fid.to_string()),
+                });
+            }
+        }
+
+        // Add photo as pending attachment for persistent storage
+        if let Some(fid) = photo_file_id {
+            if let Ok(bytes) = download_telegram_file(state, fid).await {
+                pending_attachments.push(PendingAttachment {
+                    attachment_type: "image".to_string(),
+                    mime_type: Some("image/jpeg".to_string()),
+                    file_name: Some("photo.jpg".to_string()),
+                    bytes,
+                    platform_file_id: Some(fid.to_string()),
+                });
+            }
+        }
+
+        // Build chat text: voice transcription > document content > photo prompt > text
         let chat_text_owned;
-        let chat_text = if let Some(ref doc) = doc_content {
+        let chat_text = if let Some(ref transcription) = voice_transcription {
+            if text.is_empty() {
+                transcription.as_str()
+            } else {
+                chat_text_owned = format!("{transcription}\n\n{text}");
+                chat_text_owned.as_str()
+            }
+        } else if let Some(ref doc) = doc_content {
             let user_msg = if text.is_empty() {
                 "Please read and summarize this document."
             } else {
@@ -2844,6 +3199,8 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
             chat_text_owned.as_str()
         } else if text.is_empty() && has_photo {
             "What's in this image?"
+        } else if text.is_empty() && has_voice && voice_transcription.is_none() {
+            "[Voice message received but transcription is not enabled]"
         } else {
             text
         };
@@ -2857,6 +3214,12 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
         let pool_url = pool_permit.as_ref().ok().map(|p| p.url.clone());
         let _permit = pool_permit.ok();
 
+        let att_slice = if pending_attachments.is_empty() {
+            None
+        } else {
+            Some(pending_attachments.as_slice())
+        };
+
         let session_id = handle_chat_message(
             state,
             "telegram",
@@ -2866,6 +3229,7 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
             chat_text,
             thread_id.as_deref(),
             None,
+            att_slice,
         )
         .await;
 
@@ -3222,6 +3586,7 @@ async fn handle_chat_message(
     text: &str,
     thread_id: Option<&str>,
     reply_url: Option<&str>,
+    attachments: Option<&[PendingAttachment]>,
 ) -> Option<String> {
     let chat_cfg = &state.config.chat;
     let session_id = Uuid::new_v4().to_string();
@@ -3260,15 +3625,28 @@ async fn handle_chat_message(
     };
 
     // Insert inbound message
-    if let Err(e) = sqlx::query(
-        "INSERT INTO chat_messages (session_id, direction, content) VALUES ($1, 'inbound', $2)",
+    let message_id: Option<i64> = match sqlx::query_as::<_, (i64,)>(
+        "INSERT INTO chat_messages (session_id, direction, content) VALUES ($1, 'inbound', $2) RETURNING id",
     )
     .bind(&sid)
     .bind(text)
-    .execute(&state.pg)
+    .fetch_one(&state.pg)
     .await
     {
-        error!(error = %e, "failed to insert chat message");
+        Ok((id,)) => Some(id),
+        Err(e) => {
+            error!(error = %e, "failed to insert chat message");
+            None
+        }
+    };
+
+    // v0.12.0: Store attachments if present
+    if let (Some(msg_id), Some(atts)) = (message_id, attachments) {
+        for att in atts {
+            if let Err(e) = store_chat_attachment(state, &sid, msg_id, att).await {
+                warn!(error = %e, "failed to store chat attachment");
+            }
+        }
     }
 
     // If greeting_enabled and this is a brand new session (msg_count == 1), queue greeting
@@ -3699,6 +4077,77 @@ async fn download_telegram_file(state: &AppState, file_id: &str) -> Result<Vec<u
     Ok(bytes.to_vec())
 }
 
+/// Download a file from Slack using the bot token.
+/// Slack files require `Authorization: Bearer <bot_token>` for `url_private`.
+async fn download_slack_file(state: &AppState, url_private: &str) -> Result<Vec<u8>, String> {
+    let token = state
+        .config
+        .webhooks
+        .slack_bot_token
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| "no slack_bot_token configured".to_string())?;
+
+    let resp = state
+        .http_client
+        .get(url_private)
+        .header("Authorization", format!("Bearer {token}"))
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| format!("slack file download failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("slack file download HTTP {}", resp.status()));
+    }
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("slack file read failed: {e}"))?;
+
+    let max = state.config.chat.max_attachment_bytes;
+    if bytes.len() as u64 > max {
+        return Err(format!(
+            "slack file too large ({} bytes, max {max})",
+            bytes.len()
+        ));
+    }
+
+    Ok(bytes.to_vec())
+}
+
+/// Download a file from Teams.
+/// Teams inline images have public URLs; hosted content needs Bot Framework token.
+async fn download_teams_file(state: &AppState, content_url: &str) -> Result<Vec<u8>, String> {
+    let resp = state
+        .http_client
+        .get(content_url)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| format!("teams file download failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("teams file download HTTP {}", resp.status()));
+    }
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("teams file read failed: {e}"))?;
+
+    let max = state.config.chat.max_attachment_bytes;
+    if bytes.len() as u64 > max {
+        return Err(format!(
+            "teams file too large ({} bytes, max {max})",
+            bytes.len()
+        ));
+    }
+
+    Ok(bytes.to_vec())
+}
+
 /// Download a Telegram document attachment and extract its text content.
 ///
 /// Supports PDF, DOCX, and plain text files. Returns the extracted text
@@ -3752,6 +4201,196 @@ async fn extract_telegram_document(
     } else {
         Ok(format!("[Attached file: {file_name}]\n{content}"))
     }
+}
+
+// ---------------------------------------------------------------------------
+// v0.12.0: Attachment storage and transcription
+// ---------------------------------------------------------------------------
+
+/// Classify attachment MIME type into a category string.
+/// Used by Slack/Teams handlers where attachment_type isn't pre-set.
+fn classify_attachment_type(mime: &str, file_name: &str) -> &'static str {
+    if mime.starts_with("image/") {
+        "image"
+    } else if mime.starts_with("audio/") || mime == "application/ogg" {
+        "audio"
+    } else if mime.starts_with("video/") {
+        "video"
+    } else {
+        let ext = file_name.rsplit('.').next().unwrap_or("").to_lowercase();
+        match ext.as_str() {
+            "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "svg" => "image",
+            "mp3" | "wav" | "ogg" | "m4a" | "flac" | "opus" => "audio",
+            "mp4" | "mov" | "avi" | "webm" | "mkv" => "video",
+            _ => "document",
+        }
+    }
+}
+
+/// Store a pending attachment to disk and insert metadata into chat_attachments.
+async fn store_chat_attachment(
+    state: &AppState,
+    session_id: &str,
+    message_id: i64,
+    att: &PendingAttachment,
+) -> Result<(), String> {
+    let chat_cfg = &state.config.chat;
+    let attachments_dir = broodlink_fs::expand_tilde(&chat_cfg.attachments_dir);
+
+    let file_name = att.file_name.as_deref().unwrap_or("attachment.bin");
+    let (storage_path, file_hash) = broodlink_fs::attachments::store_attachment(
+        &attachments_dir,
+        file_name,
+        &att.bytes,
+        chat_cfg.max_attachment_bytes,
+    )?;
+
+    // Extract text for documents
+    let extracted_text = if att.attachment_type == "document" {
+        let ext = file_name.rsplit('.').next().unwrap_or("").to_lowercase();
+        let tool_cfg = &chat_cfg.tools;
+        let max_chars = tool_cfg.max_pdf_pages as usize * 3000;
+        match ext.as_str() {
+            "pdf" => {
+                let tmp = std::env::temp_dir()
+                    .join(format!("broodlink-att-{}.pdf", uuid::Uuid::new_v4()));
+                let _ = std::fs::write(&tmp, &att.bytes);
+                let result = broodlink_fs::read_pdf_safe(&tmp, tool_cfg.max_pdf_pages).ok();
+                let _ = std::fs::remove_file(&tmp);
+                result
+            }
+            "docx" => {
+                let tmp = std::env::temp_dir()
+                    .join(format!("broodlink-att-{}.docx", uuid::Uuid::new_v4()));
+                let _ = std::fs::write(&tmp, &att.bytes);
+                let result = broodlink_fs::read_docx_safe(&tmp, max_chars).ok();
+                let _ = std::fs::remove_file(&tmp);
+                result
+            }
+            "txt" | "md" | "csv" | "json" | "xml" | "html" | "log" | "yaml" | "yml" | "toml"
+            | "ini" | "cfg" | "conf" | "sh" | "py" | "rs" | "js" | "ts" => {
+                Some(String::from_utf8_lossy(&att.bytes).into_owned())
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    // Transcribe audio/voice if enabled
+    let transcription = if (att.attachment_type == "voice" || att.attachment_type == "audio")
+        && chat_cfg.voice_transcription_enabled
+    {
+        match transcribe_audio(
+            state,
+            &att.bytes,
+            att.mime_type.as_deref().unwrap_or("audio/ogg"),
+        )
+        .await
+        {
+            Ok(text) => Some(text),
+            Err(e) => {
+                warn!(error = %e, "voice transcription failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Generate thumbnail for images
+    let thumbnail_path = if att.attachment_type == "image" {
+        broodlink_fs::attachments::generate_thumbnail(&attachments_dir, &storage_path, 200).ok()
+    } else {
+        None
+    };
+
+    let att_id = uuid::Uuid::new_v4().to_string();
+    let metadata = serde_json::json!({});
+
+    sqlx::query(
+        "INSERT INTO chat_attachments (id, message_id, session_id, attachment_type, mime_type,
+         file_name, file_size_bytes, file_hash, storage_path, extracted_text, transcription,
+         thumbnail_path, platform_file_id, metadata)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+    )
+    .bind(&att_id)
+    .bind(message_id)
+    .bind(session_id)
+    .bind(&att.attachment_type)
+    .bind(&att.mime_type)
+    .bind(att.file_name.as_deref())
+    .bind(att.bytes.len() as i64)
+    .bind(&file_hash)
+    .bind(&storage_path)
+    .bind(&extracted_text)
+    .bind(&transcription)
+    .bind(&thumbnail_path)
+    .bind(&att.platform_file_id)
+    .bind(&metadata)
+    .execute(&state.pg)
+    .await
+    .map_err(|e| format!("insert chat_attachment: {e}"))?;
+
+    info!(
+        attachment_id = %att_id,
+        attachment_type = %att.attachment_type,
+        file_name = %file_name,
+        size = att.bytes.len(),
+        "stored chat attachment"
+    );
+
+    Ok(())
+}
+
+/// Transcribe audio bytes using a whisper.cpp-compatible server.
+async fn transcribe_audio(
+    state: &AppState,
+    audio_bytes: &[u8],
+    mime_type: &str,
+) -> Result<String, String> {
+    let chat_cfg = &state.config.chat;
+    let url = format!("{}/v1/audio/transcriptions", chat_cfg.transcription_url);
+
+    let ext = match mime_type {
+        "audio/ogg" | "application/ogg" => "ogg",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/mp4" | "audio/m4a" => "m4a",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/webm" => "webm",
+        _ => "ogg",
+    };
+
+    let part = reqwest::multipart::Part::bytes(audio_bytes.to_vec())
+        .file_name(format!("audio.{ext}"))
+        .mime_str(mime_type)
+        .map_err(|e| format!("mime: {e}"))?;
+
+    let form = reqwest::multipart::Form::new()
+        .part("file", part)
+        .text("model", chat_cfg.chat_transcription_model.clone())
+        .text("response_format", "text");
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .multipart(form)
+        .timeout(std::time::Duration::from_secs(60))
+        .send()
+        .await
+        .map_err(|e| format!("transcription request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("transcription failed ({status}): {body}"));
+    }
+
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("read transcription response: {e}"))?;
+    Ok(text.trim().to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -7017,5 +7656,83 @@ mod tests {
                 .load(Ordering::Relaxed),
             0
         );
+    }
+
+    // ── v0.12.0: Multi-modal regression tests ──────────────────────────
+
+    #[test]
+    fn test_classify_attachment_type_image() {
+        assert_eq!(classify_attachment_type("image/jpeg", "photo.jpg"), "image");
+        assert_eq!(
+            classify_attachment_type("image/png", "screenshot.png"),
+            "image"
+        );
+        assert_eq!(classify_attachment_type("image/gif", "anim.gif"), "image");
+        assert_eq!(classify_attachment_type("image/webp", "file.webp"), "image");
+    }
+
+    #[test]
+    fn test_classify_attachment_type_audio() {
+        assert_eq!(classify_attachment_type("audio/ogg", "voice.ogg"), "audio");
+        assert_eq!(classify_attachment_type("audio/mpeg", "song.mp3"), "audio");
+        assert_eq!(classify_attachment_type("audio/wav", "record.wav"), "audio");
+    }
+
+    #[test]
+    fn test_classify_attachment_type_document() {
+        assert_eq!(
+            classify_attachment_type("application/pdf", "doc.pdf"),
+            "document"
+        );
+        assert_eq!(
+            classify_attachment_type(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "report.docx"
+            ),
+            "document"
+        );
+        assert_eq!(
+            classify_attachment_type("text/plain", "notes.txt"),
+            "document"
+        );
+    }
+
+    #[test]
+    fn test_classify_attachment_type_by_extension() {
+        // When MIME is generic, classify by extension
+        assert_eq!(
+            classify_attachment_type("application/octet-stream", "data.pdf"),
+            "document"
+        );
+        assert_eq!(
+            classify_attachment_type("application/octet-stream", "photo.jpg"),
+            "image"
+        );
+        assert_eq!(
+            classify_attachment_type("application/octet-stream", "voice.ogg"),
+            "audio"
+        );
+    }
+
+    #[test]
+    fn test_classify_attachment_type_unknown() {
+        assert_eq!(
+            classify_attachment_type("application/octet-stream", "data.xyz"),
+            "document"
+        );
+    }
+
+    #[test]
+    fn test_pending_attachment_struct() {
+        let att = PendingAttachment {
+            attachment_type: "image".to_string(),
+            mime_type: Some("image/jpeg".to_string()),
+            file_name: Some("photo.jpg".to_string()),
+            bytes: vec![0xFF, 0xD8, 0xFF],
+            platform_file_id: Some("tg-file-123".to_string()),
+        };
+        assert_eq!(att.attachment_type, "image");
+        assert_eq!(att.bytes.len(), 3);
+        assert_eq!(att.platform_file_id.as_deref(), Some("tg-file-123"));
     }
 }

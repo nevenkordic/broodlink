@@ -565,6 +565,7 @@
         var statusCls = f.enabled ? 'ok' : 'offline';
         var statusLabel = f.enabled ? 'Enabled' : 'Disabled';
         var systemBadge = f.is_system ? '<span class="badge badge-info">system</span>' : '';
+        var editLabel = f.is_system ? 'View' : 'Edit';
         return '<tr>' +
           '<td><strong>' + BL.escapeHtml(f.display_name || f.name) + '</strong><br><code>' + BL.escapeHtml(f.name) + '</code></td>' +
           '<td>' + BL.escapeHtml(f.description || '—') + '</td>' +
@@ -574,7 +575,7 @@
           '<td><span class="badge badge-' + statusCls + '">' + statusLabel + '</span></td>' +
           '<td>' +
             '<button class="btn btn-sm" onclick="Ctrl.toggleFormula(\'' + BL.escapeHtml(f.name) + '\')">' + (f.enabled ? 'Disable' : 'Enable') + '</button> ' +
-            '<button class="btn btn-sm" onclick="Ctrl.viewFormula(\'' + BL.escapeHtml(f.name) + '\')">View</button>' +
+            '<button class="btn btn-sm" onclick="Ctrl.viewFormula(\'' + BL.escapeHtml(f.name) + '\')">' + editLabel + '</button>' +
           '</td>' +
         '</tr>';
       }).join('');
@@ -596,44 +597,24 @@
 
   function viewFormula(name) {
     BL.fetchApi('/api/v1/formulas/' + name).then(function (data) {
-      var defStr = JSON.stringify(data.definition, null, 2);
-      alert('Formula: ' + name + '\n\nDefinition:\n' + defStr);
+      if (window.FormulaEditor) {
+        window.FormulaEditor.open(data);
+      } else {
+        // Fallback if editor JS not loaded
+        var defStr = JSON.stringify(data.definition, null, 2);
+        alert('Formula: ' + name + '\n\nDefinition:\n' + defStr);
+      }
     }).catch(function (e) {
       toast('Failed to load formula: ' + e, 'error');
     });
   }
 
   function createFormula() {
-    var name = prompt('Formula name (slug, e.g. my-workflow):');
-    if (!name) return;
-    var displayName = prompt('Display name:');
-    if (!displayName) return;
-    var description = prompt('Description (optional):') || '';
-
-    var defTemplate = JSON.stringify({
-      formula: { name: name, description: description, version: '1' },
-      parameters: [],
-      steps: [{ name: 'step_1', agent_role: 'worker', tools: [], prompt: 'Describe what to do...', output: 'result' }],
-      on_failure: null
-    }, null, 2);
-
-    var defStr = prompt('Definition JSON (edit as needed):', defTemplate);
-    if (!defStr) return;
-
-    var definition;
-    try { definition = JSON.parse(defStr); }
-    catch (e) { toast('Invalid JSON: ' + e.message, 'error'); return; }
-
-    BL.fetchApi('/api/v1/formulas', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: name, display_name: displayName, description: description, definition: definition })
-    }).then(function () {
-      toast('Formula created: ' + name, 'ok');
-      loadFormulas();
-    }).catch(function (e) {
-      toast('Failed to create formula: ' + e, 'error');
-    });
+    if (window.FormulaEditor) {
+      window.FormulaEditor.openNew();
+    } else {
+      toast('Formula editor not available', 'error');
+    }
   }
 
   // -----------------------------------------------------------------------

@@ -7,9 +7,9 @@
 (function () {
   'use strict';
 
-  var container = document.getElementById('delegations-table');
+  var tbody = document.getElementById('delegations-tbody');
   var filter = document.getElementById('delegation-status-filter');
-  if (!container) return;
+  if (!tbody) return;
 
   var BL = window.Broodlink;
 
@@ -28,24 +28,33 @@
       BL.escapeHtml(status) + '</span>';
   }
 
-  function renderTable(delegations) {
+  function updateMetrics(delegations) {
+    var total = delegations.length;
+    var pending = 0, completed = 0, failed = 0;
+    delegations.forEach(function (d) {
+      if (d.status === 'pending') pending++;
+      else if (d.status === 'completed') completed++;
+      else if (d.status === 'failed') failed++;
+    });
+    var el;
+    el = document.getElementById('deleg-total'); if (el) el.textContent = total;
+    el = document.getElementById('deleg-pending'); if (el) el.textContent = pending;
+    el = document.getElementById('deleg-completed'); if (el) el.textContent = completed;
+    el = document.getElementById('deleg-failed'); if (el) el.textContent = failed;
+  }
+
+  function renderRows(delegations) {
     if (!delegations || delegations.length === 0) {
-      container.innerHTML = '<p>No delegations found.</p>';
+      tbody.innerHTML = '<tr><td colspan="7">No delegations found.</td></tr>';
       return;
     }
 
-    var html = '<table><thead><tr>' +
-      '<th>Title</th><th>From</th><th>To</th><th>Status</th>' +
-      '<th data-tooltip="The originating task that spawned this delegation">Parent Task</th><th>Created</th><th>Updated</th>' +
-      '</tr></thead><tbody>';
-
+    var html = '';
     delegations.forEach(function (d) {
       html += '<tr>' +
-        '<td><strong>' + BL.escapeHtml(d.title) + '</strong>';
-      if (d.description) {
-        html += '<br><small>' + BL.escapeHtml(d.description) + '</small>';
-      }
-      html += '</td>' +
+        '<td><strong>' + BL.escapeHtml(d.title) + '</strong>' +
+        (d.description ? '<br><small>' + BL.escapeHtml(d.description) + '</small>' : '') +
+        '</td>' +
         '<td>' + BL.escapeHtml(d.from_agent) + '</td>' +
         '<td>' + BL.escapeHtml(d.to_agent) + '</td>' +
         '<td>' + statusBadge(d.status) + '</td>' +
@@ -54,27 +63,30 @@
         '<td>' + BL.formatRelativeTime(d.updated_at) + '</td>' +
         '</tr>';
 
-      // Show result if completed
       if (d.result && d.status === 'completed') {
         html += '<tr><td colspan="7" style="padding-left:2rem;opacity:0.8;">' +
           '<code>' + BL.escapeHtml(JSON.stringify(d.result)) + '</code></td></tr>';
       }
     });
 
-    html += '</tbody></table>';
-    container.innerHTML = html;
+    tbody.innerHTML = html;
   }
+
+  var allDelegations = [];
 
   function load() {
     BL.fetchApi('/api/v1/delegations').then(function (data) {
-      var delegations = data.delegations || [];
+      allDelegations = data.delegations || [];
+      updateMetrics(allDelegations);
+
+      var filtered = allDelegations;
       var statusVal = filter ? filter.value : '';
       if (statusVal) {
-        delegations = delegations.filter(function (d) { return d.status === statusVal; });
+        filtered = allDelegations.filter(function (d) { return d.status === statusVal; });
       }
-      renderTable(delegations);
+      renderRows(filtered);
     }).catch(function () {
-      container.innerHTML = '<p>Failed to load delegations.</p>';
+      tbody.innerHTML = '<tr><td colspan="7">Failed to load delegations.</td></tr>';
     });
   }
 

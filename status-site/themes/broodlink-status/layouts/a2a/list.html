@@ -1,15 +1,38 @@
 {{ define "main" }}
-<h2>A2A Gateway</h2>
-<p class="page-desc">Agent-to-Agent gateway for communicating with external AI agents using Google's A2A protocol.</p>
+<h2>External Agents</h2>
+<p class="page-desc">Connect with AI agents outside your system using the A2A protocol.</p>
+
+<div class="card-grid" id="a2a-metrics">
+  <div class="card metric-card">
+    <div class="value" id="a2a-skills">--</div>
+    <div class="label">Skills</div>
+  </div>
+  <div class="card metric-card">
+    <div class="value" id="a2a-tasks-count">--</div>
+    <div class="label">Task Mappings</div>
+  </div>
+</div>
 
 <div class="card" id="a2a-card-section" aria-live="polite">
   <h3>Agent Card</h3>
-  <pre id="a2a-card">Loading...</pre>
+  <div id="a2a-card">Loading...</div>
 </div>
 
 <h3 style="margin-top:1.5rem;">A2A Task Mappings</h3>
-<div id="a2a-tasks" aria-live="polite">
-  <!-- Populated by JS -->
+<div class="table-container">
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">External ID</th>
+        <th scope="col">Internal ID</th>
+        <th scope="col">Source</th>
+        <th scope="col">Created</th>
+      </tr>
+    </thead>
+    <tbody id="a2a-tasks-tbody" aria-live="polite">
+      <!-- Populated by JS -->
+    </tbody>
+  </table>
 </div>
 {{ end }}
 

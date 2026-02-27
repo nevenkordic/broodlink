@@ -349,25 +349,41 @@
   // Load data
   // -----------------------------------------------------------------------
 
+  function updateMetrics(approvals, policies) {
+    var total = approvals.length;
+    var pending = 0, autoApproved = 0;
+    approvals.forEach(function (a) {
+      if (a.status === 'pending') pending++;
+      else if (a.status === 'auto_approved') autoApproved++;
+    });
+    var activePolicies = policies ? policies.filter(function (p) { return p.active; }).length : 0;
+    var el;
+    el = document.getElementById('approval-total'); if (el) el.textContent = total;
+    el = document.getElementById('approval-pending'); if (el) el.textContent = pending;
+    el = document.getElementById('approval-auto'); if (el) el.textContent = autoApproved;
+    el = document.getElementById('approval-policies-count'); if (el) el.textContent = activePolicies;
+  }
+
+  var allApprovals = [];
+  var allPolicies = [];
+
   function load() {
-    BL.fetchApi('/api/v1/approvals').then(function (data) {
-      var approvals = data.approvals || [];
+    Promise.all([
+      BL.fetchApi('/api/v1/approvals').catch(function () { return { approvals: [] }; }),
+      policiesContainer ? BL.fetchApi('/api/v1/approval-policies').catch(function () { return { policies: [] }; }) : Promise.resolve({ policies: [] })
+    ]).then(function (results) {
+      allApprovals = results[0].approvals || [];
+      allPolicies = results[1].policies || [];
+      updateMetrics(allApprovals, allPolicies);
+
+      var filtered = allApprovals;
       var statusVal = filter ? filter.value : '';
       if (statusVal) {
-        approvals = approvals.filter(function (a) { return a.status === statusVal; });
+        filtered = allApprovals.filter(function (a) { return a.status === statusVal; });
       }
-      renderTable(approvals);
-    }).catch(function () {
-      container.innerHTML = '<p>Failed to load approvals.</p>';
+      renderTable(filtered);
+      renderPolicies(allPolicies);
     });
-
-    if (policiesContainer) {
-      BL.fetchApi('/api/v1/approval-policies').then(function (data) {
-        renderPolicies(data.policies || []);
-      }).catch(function () {
-        policiesContainer.innerHTML = '<p>Failed to load policies.</p>';
-      });
-    }
   }
 
   if (filter) {

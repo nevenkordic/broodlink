@@ -1,3 +1,3 @@
 ---
-title: "Commits"
+title: "Version History"
 ---

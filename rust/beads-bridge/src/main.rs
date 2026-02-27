@@ -966,7 +966,7 @@ static TOOL_REGISTRY: std::sync::LazyLock<Vec<serde_json::Value>> = std::sync::L
             }), &["approval_id"]),
             tool_def("set_approval_policy", "Create or update an approval policy for auto-approve rules.", serde_json::json!({
                 "name": p_str("Unique policy name"),
-                "gate_type": p_str("Gate type this policy applies to"),
+                "gate_type": p_str("Gate type this policy applies to: all, pre_dispatch, pre_completion, budget, custom"),
                 "description": p_str("Optional description"),
                 "conditions": p_str("JSON conditions: {severity: [...], agent_ids: [...], tool_names: [...]}"),
                 "auto_approve": p_bool("Whether matching gates are auto-approved"),
@@ -7107,7 +7107,7 @@ async fn check_guardrails(
     if !is_readonly_tool(tool_name) {
         let approval_policies: Vec<(String, String, serde_json::Value)> = sqlx::query_as(
             "SELECT id, name, conditions FROM approval_policies
-             WHERE gate_type = 'pre_dispatch' AND active = true",
+             WHERE gate_type IN ('pre_dispatch', 'all') AND active = true",
         )
         .fetch_all(&state.pg)
         .await
@@ -7388,10 +7388,10 @@ async fn tool_set_approval_policy(
     let gate_type = param_str(params, "gate_type")?;
 
     // Validate gate_type
-    if !["pre_dispatch", "pre_completion", "budget", "custom"].contains(&gate_type) {
+    if !["all", "pre_dispatch", "pre_completion", "budget", "custom"].contains(&gate_type) {
         return Err(BroodlinkError::Validation {
             field: "gate_type".to_string(),
-            message: "must be one of: pre_dispatch, pre_completion, budget, custom".to_string(),
+            message: "must be one of: all, pre_dispatch, pre_completion, budget, custom".to_string(),
         });
     }
 
@@ -7615,9 +7615,10 @@ async fn evaluate_approval_policy(
     confidence: Option<f64>,
 ) -> Result<Option<(String, bool, i32)>, BroodlinkError> {
     // Returns: Option<(policy_id, should_auto_approve, expiry_minutes)>
+    // Match policies with the exact gate_type OR with gate_type = 'all' (wildcard)
     let policies: Vec<(String, serde_json::Value, bool, f64, i32)> = sqlx::query_as(
         "SELECT id, conditions, auto_approve, auto_approve_threshold, expiry_minutes
-         FROM approval_policies WHERE gate_type = $1 AND active = true ORDER BY name",
+         FROM approval_policies WHERE (gate_type = $1 OR gate_type = 'all') AND active = true ORDER BY name",
     )
     .bind(gate_type)
     .fetch_all(pg)

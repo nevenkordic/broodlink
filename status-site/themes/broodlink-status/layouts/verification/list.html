@@ -1,40 +1,64 @@
 {{ define "main" }}
-<h2>Verification Analytics</h2>
-<p class="page-desc">Confidence scoring, verification outcomes, and response quality metrics.</p>
+<h2>Quality</h2>
+<p class="page-desc">How accurate are your agents? Confidence scores, corrections, and trends over time.</p>
 
-<div class="metric-bar" aria-label="Verification summary">
-  <div class="metric" data-tooltip="Total verification events">
-    <span class="metric-value" id="verify-total">--</span>
-    <span class="metric-label">Total</span>
+<div class="filter-bar">
+  <label for="verify-days">Period:</label>
+  <select id="verify-days">
+    <option value="7">Last 7 days</option>
+    <option value="14">Last 14 days</option>
+    <option value="30" selected>Last 30 days</option>
+    <option value="90">Last 90 days</option>
+  </select>
+</div>
+
+<div class="card-grid" id="verify-metrics">
+  <div class="card metric-card">
+    <div class="value" id="verify-total">--</div>
+    <div class="label">Total</div>
   </div>
-  <div class="metric" data-tooltip="Verified without correction">
-    <span class="metric-value" id="verify-verified">--</span>
-    <span class="metric-label">Verified</span>
+  <div class="card metric-card" id="mc-verified">
+    <div class="value" id="verify-verified">--</div>
+    <div class="label">Verified</div>
   </div>
-  <div class="metric" data-tooltip="Corrected by verifier">
-    <span class="metric-value" id="verify-corrected">--</span>
-    <span class="metric-label">Corrected</span>
+  <div class="card metric-card" id="mc-corrected">
+    <div class="value" id="verify-corrected">--</div>
+    <div class="label">Corrected</div>
   </div>
-  <div class="metric" data-tooltip="Timed out during verification">
-    <span class="metric-value" id="verify-timeout">--</span>
-    <span class="metric-label">Timeouts</span>
+  <div class="card metric-card" id="mc-timeout">
+    <div class="value" id="verify-timeout">--</div>
+    <div class="label">Timeouts</div>
+  </div>
+  <div class="card metric-card" id="mc-rate">
+    <div class="value" id="verify-rate">--</div>
+    <div class="label">Accuracy Rate</div>
   </div>
 </div>
 
-<div class="chart-grid">
-  <div class="chart-card">
+<div class="verify-charts">
+  <div class="card verify-chart-card">
     <h3>Daily Verification Outcomes</h3>
-    <canvas id="verify-daily-chart" height="250"></canvas>
+    <div class="verify-chart-wrap">
+      <canvas id="verify-daily-chart"></canvas>
+    </div>
+    <div class="verify-empty-state" id="daily-empty" style="display:none;">
+      <p>No verification events recorded in this period.</p>
+    </div>
   </div>
-  <div class="chart-card">
+  <div class="card verify-chart-card">
     <h3>Confidence Score Distribution</h3>
-    <canvas id="verify-confidence-chart" height="250"></canvas>
+    <div class="verify-chart-wrap">
+      <canvas id="verify-confidence-chart"></canvas>
+    </div>
+    <div class="verify-empty-state" id="conf-empty" style="display:none;">
+      <p>No confidence data available yet.</p>
+    </div>
   </div>
 </div>
 
-<h3>Daily Breakdown</h3>
-<div class="table-wrap">
-  <table id="verify-table" class="data-table">
+<h3 style="margin-top:2rem;">Daily Breakdown</h3>
+<div class="table-container">
+  <table>
     <thead>
       <tr>
         <th>Date</th>
@@ -43,7 +67,7 @@
         <th>Corrected</th>
         <th>Timeout</th>
         <th>Error</th>
-        <th>Avg Duration (ms)</th>
+        <th>Accuracy</th>
       </tr>
     </thead>
     <tbody id="verify-table-body">

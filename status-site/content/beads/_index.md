@@ -1,3 +1,3 @@
 ---
-title: "Beads"
+title: "Tasks & Issues"
 ---

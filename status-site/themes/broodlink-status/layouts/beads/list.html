@@ -1,6 +1,26 @@
 {{ define "main" }}
-<h2>Beads Issues</h2>
-<p class="page-desc">Issue tracker for coordinating work across agents. Issues can be grouped into convoys and driven by workflow formulas.</p>
+<h2>Tasks &amp; Issues</h2>
+<p class="page-desc">Work items being tracked across your agents. Group related tasks and run automated workflows.</p>
+
+<div class="card-grid" id="beads-metrics">
+  <div class="card metric-card">
+    <div class="value" id="beads-total">--</div>
+    <div class="label">Total</div>
+  </div>
+  <div class="card metric-card">
+    <div class="value" id="beads-open">--</div>
+    <div class="label">Open</div>
+  </div>
+  <div class="card metric-card">
+    <div class="value" id="beads-in-progress">--</div>
+    <div class="label">In Progress</div>
+  </div>
+  <div class="card metric-card">
+    <div class="value" id="beads-closed">--</div>
+    <div class="label">Closed</div>
+  </div>
+</div>
+
 <div class="filter-bar">
   <label for="beads-status-filter">Status</label>
   <select id="beads-status-filter">
@@ -10,22 +30,25 @@
     <option value="closed">Closed</option>
   </select>
 </div>
-<table>
-  <caption>Issue tracker</caption>
-  <thead>
-    <tr>
-      <th scope="col" data-tooltip="Unique issue identifier">Bead ID</th>
-      <th scope="col">Title</th>
-      <th scope="col">Status</th>
-      <th scope="col">Assignee</th>
-      <th scope="col" data-tooltip="Group of related issues, like an epic or sprint">Convoy</th>
-      <th scope="col">Updated</th>
-    </tr>
-  </thead>
-  <tbody id="beads-tbody" aria-live="polite">
-    <!-- Populated by JS -->
-  </tbody>
-</table>
+
+<div class="table-container">
+  <table>
+    <caption>Issue tracker</caption>
+    <thead>
+      <tr>
+        <th scope="col" data-tooltip="Unique issue identifier">ID</th>
+        <th scope="col">Title</th>
+        <th scope="col">Status</th>
+        <th scope="col">Assignee</th>
+        <th scope="col" data-tooltip="Group of related issues, like an epic or sprint">Convoy</th>
+        <th scope="col">Updated</th>
+      </tr>
+    </thead>
+    <tbody id="beads-tbody" aria-live="polite">
+      <!-- Populated by JS -->
+    </tbody>
+  </table>
+</div>
 {{ end }}
 
 {{ define "scripts" }}

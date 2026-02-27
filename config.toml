@@ -173,6 +173,11 @@ memory_max_results = 3
 streaming_enabled = true
 streaming_edit_interval_ms = 800
 streaming_min_tokens = 30
+attachments_dir = "~/.broodlink/attachments"
+voice_transcription_enabled = false
+chat_transcription_model = "whisper-large-v3-turbo"
+transcription_url = "http://localhost:8180"
+max_attachment_bytes = 20971520
 
 [chat.tools]
 web_search_enabled = true

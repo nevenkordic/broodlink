@@ -1,3 +1,3 @@
 ---
-title: "A2A"
+title: "External Agents"
 ---

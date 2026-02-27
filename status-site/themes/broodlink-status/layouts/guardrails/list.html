@@ -1,6 +1,22 @@
 {{ define "main" }}
-<h2>Guardrail Policies</h2>
-<p class="page-desc">Safety policies that block or limit specific agent actions. Violations are logged for review.</p>
+<h2>Safety Rules</h2>
+<p class="page-desc">Limits on what agents can do. Violations are caught and logged automatically.</p>
+
+<div class="card-grid" id="guardrail-metrics">
+  <div class="card metric-card">
+    <div class="value" id="guardrail-total">--</div>
+    <div class="label">Total Policies</div>
+  </div>
+  <div class="card metric-card">
+    <div class="value" id="guardrail-enabled">--</div>
+    <div class="label">Enabled</div>
+  </div>
+  <div class="card metric-card">
+    <div class="value" id="guardrail-violations">--</div>
+    <div class="label">Violations</div>
+  </div>
+</div>
+
 <div class="card-grid" id="guardrail-policies" aria-live="polite">
   <!-- Populated by JS -->
 </div>
@@ -12,7 +28,7 @@
     <option value="">All</option>
   </select>
 </div>
-<div class="table-wrap" id="violations-table" aria-live="polite">
+<div class="table-container" id="violations-table" aria-live="polite">
   <!-- Populated by JS -->
 </div>
 {{ end }}

@@ -1,6 +1,26 @@
 {{ define "main" }}
-<h2>Approval Gates</h2>
-<p class="page-desc">Human-in-the-loop gates that pause agent work until approved. Policies can auto-approve based on confidence thresholds.</p>
+<h2>Approvals</h2>
+<p class="page-desc">Work that needs your sign-off before it proceeds. Set up rules to auto-approve low-risk actions.</p>
+
+<div class="card-grid" id="approval-metrics">
+  <div class="card metric-card">
+    <div class="value" id="approval-total">--</div>
+    <div class="label">Total Gates</div>
+  </div>
+  <div class="card metric-card">
+    <div class="value" id="approval-pending">--</div>
+    <div class="label">Pending</div>
+  </div>
+  <div class="card metric-card">
+    <div class="value" id="approval-auto">--</div>
+    <div class="label">Auto-Approved</div>
+  </div>
+  <div class="card metric-card">
+    <div class="value" id="approval-policies-count">--</div>
+    <div class="label">Active Policies</div>
+  </div>
+</div>
+
 <div class="filter-bar" id="approval-filters">
   <label for="approval-status-filter">Status:</label>
   <select id="approval-status-filter">
@@ -12,18 +32,19 @@
     <option value="expired">Expired</option>
   </select>
 </div>
-<div class="table-wrap" id="approvals-table" aria-live="polite">
+<div class="table-container" id="approvals-table" style="max-height:60vh;overflow-y:auto;" aria-live="polite">
   <!-- Populated by JS -->
 </div>
 
-<h2>Approval Policies
-  <button class="btn" id="btn-new-policy" style="margin-left:12px;font-size:0.85em;">+ New Policy</button>
+<h2 style="display:flex;align-items:center;justify-content:space-between;">
+  Approval Policies
+  <button class="btn" id="btn-new-policy" style="font-size:0.85em;">+ New Policy</button>
 </h2>
 
-<div id="policy-editor" style="display:none;margin-bottom:24px;padding:16px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card,#1e1e2e);">
+<div id="policy-editor" class="policy-editor" style="display:none;">
   <h3 id="policy-editor-title">New Approval Policy</h3>
   <form id="policy-form" autocomplete="off">
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+    <div class="policy-form-grid">
       <div>
         <label for="pf-name">Name</label>
         <input type="text" id="pf-name" required placeholder="e.g. auto-approve-low" style="width:100%;">
@@ -31,13 +52,14 @@
       <div>
         <label for="pf-gate-type" data-tooltip="When the gate triggers: before dispatch, before completion, or on budget">Gate Type</label>
         <select id="pf-gate-type" style="width:100%;">
+          <option value="all">all (matches any gate type)</option>
           <option value="pre_dispatch">pre_dispatch</option>
           <option value="pre_completion">pre_completion</option>
           <option value="budget">budget</option>
           <option value="custom">custom</option>
         </select>
       </div>
-      <div style="grid-column:1/-1;">
+      <div class="full-width">
         <label for="pf-description">Description (optional)</label>
         <input type="text" id="pf-description" placeholder="What this policy does" style="width:100%;">
       </div>
@@ -72,14 +94,14 @@
         <input type="number" id="pf-expiry" min="1" value="60" style="width:100%;">
       </div>
     </div>
-    <div style="margin-top:16px;display:flex;gap:8px;">
+    <div style="margin-top:1rem;display:flex;gap:0.5rem;">
       <button type="submit" class="btn btn-approve">Save Policy</button>
       <button type="button" class="btn" id="btn-cancel-policy">Cancel</button>
     </div>
   </form>
 </div>
 
-<div class="table-wrap" id="approval-policies" aria-live="polite">
+<div class="table-container" id="approval-policies" aria-live="polite">
   <!-- Populated by JS -->
 </div>
 {{ end }}

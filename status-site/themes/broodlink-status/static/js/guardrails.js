@@ -102,17 +102,25 @@
     violationsEl.innerHTML = html;
   }
 
-  function load() {
-    BL.fetchApi('/api/v1/guardrails').then(function (data) {
-      renderPolicies(data.policies || []);
-    }).catch(function () {
-      policiesEl.innerHTML = '<p>Failed to load policies.</p>';
-    });
+  function updateMetrics(policies, violations) {
+    var total = policies.length;
+    var enabled = policies.filter(function (p) { return p.enabled; }).length;
+    var el;
+    el = document.getElementById('guardrail-total'); if (el) el.textContent = total;
+    el = document.getElementById('guardrail-enabled'); if (el) el.textContent = enabled;
+    el = document.getElementById('guardrail-violations'); if (el) el.textContent = violations.length;
+  }
 
-    BL.fetchApi('/api/v1/violations').then(function (data) {
-      renderViolations(data.violations || []);
-    }).catch(function () {
-      if (violationsEl) violationsEl.innerHTML = '<p>Failed to load violations.</p>';
+  function load() {
+    Promise.all([
+      BL.fetchApi('/api/v1/guardrails').catch(function () { return { policies: [] }; }),
+      BL.fetchApi('/api/v1/violations').catch(function () { return { violations: [] }; })
+    ]).then(function (results) {
+      var policies = results[0].policies || [];
+      var violations = results[1].violations || [];
+      updateMetrics(policies, violations);
+      renderPolicies(policies);
+      renderViolations(violations);
     });
   }
 

@@ -1,6 +1,26 @@
 {{ define "main" }}
-<h2>Delegations</h2>
-<p class="page-desc">Tasks delegated from one agent to another, with acceptance status and results.</p>
+<h2>Handoffs</h2>
+<p class="page-desc">When one agent passes work to another — see what was sent, accepted, and completed.</p>
+
+<div class="card-grid" id="delegation-metrics">
+  <div class="card metric-card">
+    <div class="value" id="deleg-total">--</div>
+    <div class="label">Total</div>
+  </div>
+  <div class="card metric-card">
+    <div class="value" id="deleg-pending">--</div>
+    <div class="label">Pending</div>
+  </div>
+  <div class="card metric-card">
+    <div class="value" id="deleg-completed">--</div>
+    <div class="label">Completed</div>
+  </div>
+  <div class="card metric-card">
+    <div class="value" id="deleg-failed">--</div>
+    <div class="label">Failed</div>
+  </div>
+</div>
+
 <div class="filter-bar" id="delegation-filters">
   <label for="delegation-status-filter">Status:</label>
   <select id="delegation-status-filter">
@@ -12,8 +32,24 @@
     <option value="failed">Failed</option>
   </select>
 </div>
-<div class="table-wrap" id="delegations-table" aria-live="polite">
-  <!-- Populated by JS -->
+
+<div class="table-container">
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">Title</th>
+        <th scope="col">From</th>
+        <th scope="col">To</th>
+        <th scope="col">Status</th>
+        <th scope="col" data-tooltip="The originating task that spawned this delegation">Parent Task</th>
+        <th scope="col">Created</th>
+        <th scope="col">Updated</th>
+      </tr>
+    </thead>
+    <tbody id="delegations-tbody" aria-live="polite">
+      <!-- Populated by JS -->
+    </tbody>
+  </table>
 </div>
 {{ end }}
 

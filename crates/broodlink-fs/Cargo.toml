@@ -5,10 +5,18 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+attachments = ["dep:sha2", "dep:hex", "dep:image", "dep:uuid", "dep:chrono"]
+
 [dependencies]
 pdf-extract = "0.7"
 zip = { workspace = true }
 tracing = { workspace = true }
+sha2 = { version = "0.10", optional = true }
+hex = { version = "0.4", optional = true }
+image = { version = "0.25", optional = true, default-features = false, features = ["jpeg", "png"] }
+uuid = { version = "1", optional = true, features = ["v4"] }
+chrono = { version = "0.4", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

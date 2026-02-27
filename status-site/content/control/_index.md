@@ -1,3 +1,3 @@
 ---
-title: "Control Panel"
+title: "Settings"
 ---

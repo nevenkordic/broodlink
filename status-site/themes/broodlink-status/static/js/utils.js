@@ -54,7 +54,7 @@
    *                          response JSON, or the full body if `.data` is
    *                          absent.
    */
-  function fetchApi(path) {
+  function fetchApi(path, opts) {
     var url = STATUS_API_URL + path;
     var hdrs = {
       'Accept': 'application/json',
@@ -69,9 +69,15 @@
       hdrs['X-Broodlink-Session'] = sessionToken;
     }
 
+    // Merge caller-supplied headers (e.g. Content-Type for POST)
+    if (opts && opts.headers) {
+      Object.keys(opts.headers).forEach(function (k) { hdrs[k] = opts.headers[k]; });
+    }
+
     return fetch(url, {
-      method: 'GET',
+      method: (opts && opts.method) || 'GET',
       headers: hdrs,
+      body: opts && opts.body ? opts.body : undefined,
       signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined
     })
       .then(function (res) {

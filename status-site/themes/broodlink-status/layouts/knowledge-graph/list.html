@@ -1,13 +1,13 @@
 {{ define "main" }}
-<h2>Knowledge Graph</h2>
-<p class="page-desc">Entity-relationship graph extracted from agent memories. Shows connections between people, services, technologies, and concepts.</p>
+<h2>Connections</h2>
+<p class="page-desc">A map of how people, services, and concepts relate to each other — built from agent knowledge.</p>
 
 <section aria-labelledby="kg-stats-heading">
   <h3 id="kg-stats-heading">Statistics</h3>
   <div class="card-grid" id="kg-stats" aria-live="polite">
-    <div class="card"><div class="card-value" id="kg-total-entities">&mdash;</div><div class="card-label">Entities</div></div>
-    <div class="card"><div class="card-value" id="kg-active-edges">&mdash;</div><div class="card-label">Active Edges</div></div>
-    <div class="card"><div class="card-value" id="kg-historical-edges">&mdash;</div><div class="card-label">Historical Edges</div></div>
+    <div class="card metric-card"><div class="value" id="kg-total-entities">&mdash;</div><div class="label">Entities</div></div>
+    <div class="card metric-card"><div class="value" id="kg-active-edges">&mdash;</div><div class="label">Active Edges</div></div>
+    <div class="card metric-card"><div class="value" id="kg-historical-edges">&mdash;</div><div class="label">Historical Edges</div></div>
   </div>
 </section>
 
@@ -23,38 +23,42 @@
 
 <section aria-labelledby="kg-connected-heading">
   <h3 id="kg-connected-heading">Most Connected Entities</h3>
-  <table>
-    <caption>Entities with the most active relationships</caption>
-    <thead>
-      <tr>
-        <th scope="col">Name</th>
-        <th scope="col">Type</th>
-        <th scope="col">Edges</th>
-      </tr>
-    </thead>
-    <tbody id="kg-connected-tbody" aria-live="polite">
-      <!-- Populated by JS -->
-    </tbody>
-  </table>
+  <div class="table-container">
+    <table>
+      <caption>Entities with the most active relationships</caption>
+      <thead>
+        <tr>
+          <th scope="col">Name</th>
+          <th scope="col">Type</th>
+          <th scope="col">Edges</th>
+        </tr>
+      </thead>
+      <tbody id="kg-connected-tbody" aria-live="polite">
+        <!-- Populated by JS -->
+      </tbody>
+    </table>
+  </div>
 </section>
 
 <section aria-labelledby="kg-edges-heading">
   <h3 id="kg-edges-heading">Recent Edges</h3>
-  <table>
-    <caption>Most recently created relationships</caption>
-    <thead>
-      <tr>
-        <th scope="col">Source</th>
-        <th scope="col">Relation</th>
-        <th scope="col">Target</th>
-        <th scope="col">Weight</th>
-        <th scope="col">Created</th>
-      </tr>
-    </thead>
-    <tbody id="kg-edges-tbody" aria-live="polite">
-      <!-- Populated by JS -->
-    </tbody>
-  </table>
+  <div class="table-container">
+    <table>
+      <caption>Most recently created relationships</caption>
+      <thead>
+        <tr>
+          <th scope="col">Source</th>
+          <th scope="col">Relation</th>
+          <th scope="col">Target</th>
+          <th scope="col">Weight</th>
+          <th scope="col">Created</th>
+        </tr>
+      </thead>
+      <tbody id="kg-edges-tbody" aria-live="polite">
+        <!-- Populated by JS -->
+      </tbody>
+    </table>
+  </div>
 </section>
 {{ end }}
 

@@ -8,6 +8,9 @@
 //! checks.  Intended to be shared by `a2a-gateway` (chat tools) and
 //! `beads-bridge` (MCP tools).
 
+#[cfg(feature = "attachments")]
+pub mod attachments;
+
 use std::path::{Path, PathBuf};
 
 /// File-name substrings that are always blocked regardless of directory.
@@ -259,7 +262,7 @@ pub fn read_pdf_safe(path: &Path, max_pages: u32) -> Result<String, String> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn expand_tilde(path: &str) -> String {
+pub fn expand_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = std::env::var_os("HOME") {
             return format!("{}/{}", home.to_string_lossy(), rest);

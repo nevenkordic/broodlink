@@ -1,3 +1,3 @@
 ---
-title: "Audit Log"
+title: "Activity Log"
 ---
