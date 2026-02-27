@@ -7395,7 +7395,8 @@ async fn tool_set_approval_policy(
     if !["all", "pre_dispatch", "pre_completion", "budget", "custom"].contains(&gate_type) {
         return Err(BroodlinkError::Validation {
             field: "gate_type".to_string(),
-            message: "must be one of: all, pre_dispatch, pre_completion, budget, custom".to_string(),
+            message: "must be one of: all, pre_dispatch, pre_completion, budget, custom"
+                .to_string(),
         });
     }
 

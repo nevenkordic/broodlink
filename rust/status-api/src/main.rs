@@ -2848,9 +2848,12 @@ async fn handler_upsert_approval_policy(
         serde_json::from_slice(&bytes)
             .map_err(|e| StatusApiError::BadRequest(format!("invalid JSON: {e}")))?
     };
-    if !["all", "pre_dispatch", "pre_completion", "budget", "custom"].contains(&body.gate_type.as_str()) {
+    if !["all", "pre_dispatch", "pre_completion", "budget", "custom"]
+        .contains(&body.gate_type.as_str())
+    {
         return Err(StatusApiError::Internal(
-            "gate_type must be one of: all, pre_dispatch, pre_completion, budget, custom".to_string(),
+            "gate_type must be one of: all, pre_dispatch, pre_completion, budget, custom"
+                .to_string(),
         ));
     }
 
