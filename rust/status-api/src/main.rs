@@ -5227,7 +5227,7 @@ mod tests {
         let diff = claims["exp"].as_i64().unwrap() - claims["iat"].as_i64().unwrap();
         // 365 days = 31,536,000 seconds (± 1 day for leap)
         assert!(
-            diff >= 31_449_600 && diff <= 31_622_400,
+            (31_449_600..=31_622_400).contains(&diff),
             "JWT should expire ~1 year from now, got {diff}s"
         );
     }

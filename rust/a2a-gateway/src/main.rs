@@ -4567,6 +4567,7 @@ enum VerifyResult {
 }
 
 /// Use a fast verifier model to fact-check low-confidence responses.
+#[allow(clippy::too_many_arguments)]
 async fn verify_response(
     client: &reqwest::Client,
     ollama_url: &str,

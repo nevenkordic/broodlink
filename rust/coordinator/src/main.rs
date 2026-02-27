@@ -1131,14 +1131,14 @@ async fn handle_task_completed(
                 let valid = if let Some(obj) = result_data.as_object() {
                     required
                         .iter()
-                        .all(|f| f.as_str().map_or(true, |name| obj.contains_key(name)))
+                        .all(|f| f.as_str().is_none_or(|name| obj.contains_key(name)))
                 } else if let Ok(parsed) =
                     serde_json::from_str::<serde_json::Value>(result_data.as_str().unwrap_or(""))
                 {
                     if let Some(obj) = parsed.as_object() {
                         required
                             .iter()
-                            .all(|f| f.as_str().map_or(true, |name| obj.contains_key(name)))
+                            .all(|f| f.as_str().is_none_or(|name| obj.contains_key(name)))
                     } else {
                         true // Not an object, skip validation
                     }
@@ -2643,7 +2643,7 @@ async fn check_scheduled_tasks(state: &AppState) -> Result<u64, BroodlinkError> 
         match recurrence_secs {
             Some(interval_secs) if *interval_secs > 0 => {
                 // Recurring: advance next_run_at, check max_runs
-                let max_reached = max_runs.map_or(false, |m| new_count >= m);
+                let max_reached = max_runs.is_some_and(|m| new_count >= m);
                 if max_reached {
                     sqlx::query(
                         "UPDATE scheduled_tasks SET run_count = $1, last_run_at = NOW(), enabled = FALSE
@@ -3756,7 +3756,7 @@ output = "out"
             make_agent("agent-b", "low"),
             make_agent("agent-c", "medium"),
         ];
-        let declined = vec!["agent-a".to_string(), "agent-c".to_string()];
+        let declined = ["agent-a".to_string(), "agent-c".to_string()];
         let filtered: Vec<_> = agents
             .into_iter()
             .filter(|a| !declined.contains(&a.agent_id))

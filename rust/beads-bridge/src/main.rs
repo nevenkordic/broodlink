@@ -2213,7 +2213,7 @@ async fn tool_semantic_search(
             &state.config.ollama.url,
             &mem_cfg.query_expansion_model,
             mem_cfg.query_expansion_timeout_seconds,
-            &query,
+            query,
         )
         .await
     } else {
@@ -4764,7 +4764,7 @@ async fn tool_schedule_task(
          RETURNING id",
     )
     .bind(title)
-    .bind(&description)
+    .bind(description)
     .bind(priority as i32)
     .bind(formula_name)
     .bind(run_at)
@@ -6824,7 +6824,7 @@ async fn tool_read_file(
     })?;
 
     let content = broodlink_fs::read_file_safe(&canonical, tool_cfg.max_read_size_bytes)
-        .map_err(|e| BroodlinkError::Internal(e))?;
+        .map_err(BroodlinkError::Internal)?;
 
     Ok(serde_json::json!({
         "path": canonical.display().to_string(),
@@ -6864,7 +6864,7 @@ async fn tool_write_file(
         content.as_bytes(),
         tool_cfg.max_write_size_bytes,
     )
-    .map_err(|e| BroodlinkError::Internal(e))?;
+    .map_err(BroodlinkError::Internal)?;
 
     Ok(serde_json::json!({
         "path": canonical.display().to_string(),
@@ -6898,7 +6898,7 @@ async fn tool_read_pdf(
     })?;
 
     let content = broodlink_fs::read_pdf_safe(&canonical, tool_cfg.max_pdf_pages)
-        .map_err(|e| BroodlinkError::Internal(e))?;
+        .map_err(BroodlinkError::Internal)?;
 
     Ok(serde_json::json!({
         "path": canonical.display().to_string(),
@@ -6932,8 +6932,8 @@ async fn tool_read_docx(
     })?;
 
     let max_chars = tool_cfg.max_pdf_pages as usize * 3000;
-    let content = broodlink_fs::read_docx_safe(&canonical, max_chars)
-        .map_err(|e| BroodlinkError::Internal(e))?;
+    let content =
+        broodlink_fs::read_docx_safe(&canonical, max_chars).map_err(BroodlinkError::Internal)?;
 
     Ok(serde_json::json!({
         "path": canonical.display().to_string(),
