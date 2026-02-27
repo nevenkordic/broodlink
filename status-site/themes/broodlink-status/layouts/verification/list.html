@@ -1,0 +1,59 @@
+{{ define "main" }}
+<h2>Verification Analytics</h2>
+<p class="page-desc">Confidence scoring, verification outcomes, and response quality metrics.</p>
+
+<div class="metric-bar" aria-label="Verification summary">
+  <div class="metric" data-tooltip="Total verification events">
+    <span class="metric-value" id="verify-total">--</span>
+    <span class="metric-label">Total</span>
+  </div>
+  <div class="metric" data-tooltip="Verified without correction">
+    <span class="metric-value" id="verify-verified">--</span>
+    <span class="metric-label">Verified</span>
+  </div>
+  <div class="metric" data-tooltip="Corrected by verifier">
+    <span class="metric-value" id="verify-corrected">--</span>
+    <span class="metric-label">Corrected</span>
+  </div>
+  <div class="metric" data-tooltip="Timed out during verification">
+    <span class="metric-value" id="verify-timeout">--</span>
+    <span class="metric-label">Timeouts</span>
+  </div>
+</div>
+
+<div class="chart-grid">
+  <div class="chart-card">
+    <h3>Daily Verification Outcomes</h3>
+    <canvas id="verify-daily-chart" height="250"></canvas>
+  </div>
+  <div class="chart-card">
+    <h3>Confidence Score Distribution</h3>
+    <canvas id="verify-confidence-chart" height="250"></canvas>
+  </div>
+</div>
+
+<h3>Daily Breakdown</h3>
+<div class="table-wrap">
+  <table id="verify-table" class="data-table">
+    <thead>
+      <tr>
+        <th>Date</th>
+        <th>Total</th>
+        <th>Verified</th>
+        <th>Corrected</th>
+        <th>Timeout</th>
+        <th>Error</th>
+        <th>Avg Duration (ms)</th>
+      </tr>
+    </thead>
+    <tbody id="verify-table-body">
+      <!-- Populated by JS -->
+    </tbody>
+  </table>
+</div>
+{{ end }}
+
+{{ define "scripts" }}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script src="/js/verification.js"></script>
+{{ end }}

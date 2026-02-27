@@ -20,8 +20,9 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::process;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, Method, Request, StatusCode};
@@ -130,6 +131,160 @@ struct A2aTaskStatusInfo {
 }
 
 // ---------------------------------------------------------------------------
+// v0.11.0: Multi-Ollama load balancing
+// ---------------------------------------------------------------------------
+
+struct OllamaInstance {
+    url: String,
+    active_requests: AtomicU32,
+    healthy: AtomicBool,
+    consecutive_failures: AtomicU32,
+}
+
+struct OllamaPool {
+    instances: Vec<OllamaInstance>,
+    /// Global concurrency limiter (sum capacity across all instances).
+    semaphore: tokio::sync::Semaphore,
+}
+
+/// Guard returned by `OllamaPool::acquire`/`try_acquire`.
+/// Holds a semaphore permit and tracks the active request count.
+struct OllamaPermit<'a> {
+    url: String,
+    instance_idx: usize,
+    pool: &'a OllamaPool,
+    _permit: tokio::sync::SemaphorePermit<'a>,
+}
+
+impl Drop for OllamaPermit<'_> {
+    fn drop(&mut self) {
+        self.pool.instances[self.instance_idx]
+            .active_requests
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl OllamaPool {
+    fn new(urls: Vec<String>, concurrency: u32) -> Self {
+        let instances: Vec<OllamaInstance> = urls
+            .into_iter()
+            .map(|url| OllamaInstance {
+                url,
+                active_requests: AtomicU32::new(0),
+                healthy: AtomicBool::new(true),
+                consecutive_failures: AtomicU32::new(0),
+            })
+            .collect();
+        Self {
+            instances,
+            semaphore: tokio::sync::Semaphore::new(concurrency as usize),
+        }
+    }
+
+    /// Pick the least-loaded healthy instance. Falls back to least-loaded overall.
+    fn pick_instance(&self) -> usize {
+        let mut best_idx = 0;
+        let mut best_load = u32::MAX;
+        // Prefer healthy instances
+        for (i, inst) in self.instances.iter().enumerate() {
+            if inst.healthy.load(Ordering::Relaxed) {
+                let load = inst.active_requests.load(Ordering::Relaxed);
+                if load < best_load {
+                    best_load = load;
+                    best_idx = i;
+                }
+            }
+        }
+        if best_load < u32::MAX {
+            return best_idx;
+        }
+        // All unhealthy — pick least-loaded anyway
+        for (i, inst) in self.instances.iter().enumerate() {
+            let load = inst.active_requests.load(Ordering::Relaxed);
+            if load < best_load {
+                best_load = load;
+                best_idx = i;
+            }
+        }
+        best_idx
+    }
+
+    async fn acquire(&self) -> Result<OllamaPermit<'_>, tokio::sync::AcquireError> {
+        let permit = self.semaphore.acquire().await?;
+        let idx = self.pick_instance();
+        self.instances[idx]
+            .active_requests
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(OllamaPermit {
+            url: self.instances[idx].url.clone(),
+            instance_idx: idx,
+            pool: self,
+            _permit: permit,
+        })
+    }
+
+    fn try_acquire(&self) -> Result<OllamaPermit<'_>, tokio::sync::TryAcquireError> {
+        let permit = self.semaphore.try_acquire()?;
+        let idx = self.pick_instance();
+        self.instances[idx]
+            .active_requests
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(OllamaPermit {
+            url: self.instances[idx].url.clone(),
+            instance_idx: idx,
+            pool: self,
+            _permit: permit,
+        })
+    }
+
+    /// Mark an instance healthy or unhealthy based on health check result.
+    fn report_health(&self, idx: usize, ok: bool) {
+        if ok {
+            self.instances[idx]
+                .consecutive_failures
+                .store(0, Ordering::Relaxed);
+            self.instances[idx].healthy.store(true, Ordering::Relaxed);
+        } else {
+            let fails = self.instances[idx]
+                .consecutive_failures
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            if fails >= 3 {
+                self.instances[idx].healthy.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Returns the primary URL (first instance) for backward-compat use.
+    fn primary_url(&self) -> &str {
+        &self.instances[0].url
+    }
+}
+
+/// Background loop: health-check each Ollama instance every 30s via GET /api/tags.
+async fn ollama_health_check_loop(state: &AppState) {
+    let client = &state.ollama_client;
+    loop {
+        for (idx, inst) in state.ollama_pool.instances.iter().enumerate() {
+            let url = format!("{}/api/tags", inst.url);
+            let ok = match client.get(&url).send().await {
+                Ok(resp) => resp.status().is_success(),
+                Err(_) => false,
+            };
+            let was_healthy = inst.healthy.load(Ordering::Relaxed);
+            state.ollama_pool.report_health(idx, ok);
+            let is_healthy = inst.healthy.load(Ordering::Relaxed);
+            if was_healthy && !is_healthy {
+                warn!(url = %inst.url, "ollama instance marked unhealthy");
+            } else if !was_healthy && is_healthy {
+                info!(url = %inst.url, "ollama instance recovered");
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Application state
 // ---------------------------------------------------------------------------
 
@@ -152,8 +307,8 @@ struct AppState {
             std::time::Instant,
         )>,
     >,
-    /// Limits concurrent Ollama chat calls (prevents queue pileup).
-    ollama_semaphore: tokio::sync::Semaphore,
+    /// v0.11.0: Multi-instance Ollama pool with load balancing and health checks.
+    ollama_pool: OllamaPool,
     /// TTL cache for Brave search results: query → (result, fetched_at).
     brave_cache: tokio::sync::RwLock<HashMap<String, (String, std::time::Instant)>>,
     /// In-flight chat dedup: "platform:chat_id:text_hash" → started_at.
@@ -183,6 +338,21 @@ struct ChatParams<'a> {
     model_override: Option<&'a str>,
     images: Option<Vec<String>>,
     chat_ctx: Option<ChatContext>,
+    /// v0.11.0: Streaming context for progressive Telegram message editing.
+    streaming: Option<StreamingContext>,
+    /// v0.11.0: Pool-selected Ollama URL override (for load balancing).
+    ollama_url_override: Option<String>,
+}
+
+/// v0.11.0: Context for streaming Ollama responses to Telegram via message editing.
+#[derive(Clone)]
+struct StreamingContext {
+    chat_id: String,
+    message_id: i64,
+    /// Minimum interval between edits (ms)
+    edit_interval_ms: u64,
+    /// Minimum tokens before first edit
+    min_tokens: usize,
 }
 
 /// v0.10.0: Identifies the chat platform + conversation for write approval routing.
@@ -359,7 +529,10 @@ async fn async_main() {
         api_key,
         config: Arc::clone(&config),
         telegram_creds: tokio::sync::RwLock::new(None),
-        ollama_semaphore: tokio::sync::Semaphore::new(config.a2a.ollama_concurrency as usize),
+        ollama_pool: OllamaPool::new(
+            config.ollama.effective_urls(),
+            config.a2a.ollama_concurrency,
+        ),
         brave_cache: tokio::sync::RwLock::new(HashMap::new()),
         inflight_chats: tokio::sync::RwLock::new(HashMap::new()),
         primary_model_degraded: AtomicBool::new(false),
@@ -382,6 +555,14 @@ async fn async_main() {
         let st = Arc::clone(&state);
         tokio::spawn(async move {
             telegram_polling_loop(st.clone()).await;
+        });
+    }
+
+    // v0.11.0: Spawn Ollama pool health check loop (probes each instance every 30s)
+    if state.ollama_pool.instances.len() > 1 {
+        let st = Arc::clone(&state);
+        tokio::spawn(async move {
+            ollama_health_check_loop(&st).await;
         });
     }
 
@@ -2345,11 +2526,12 @@ async fn webhook_telegram_handler(
             text
         };
 
-        // Acquire the Ollama semaphore BEFORE creating the task so the
+        // Acquire the Ollama pool BEFORE creating the task so the
         // inline path always holds it when the NATS dispatch arrives.
-        let permit = state.ollama_semaphore.acquire().await;
-        let is_busy = permit.is_err();
-        let _permit = permit.ok();
+        let pool_permit = state.ollama_pool.acquire().await;
+        let is_busy = pool_permit.is_err();
+        let pool_url = pool_permit.as_ref().ok().map(|p| p.url.clone());
+        let _permit = pool_permit.ok();
 
         let session_id = handle_chat_message(
             &state,
@@ -2391,6 +2573,66 @@ async fn webhook_telegram_handler(
                 None
             };
 
+            // v0.11.0: streaming path — return 200 OK immediately, stream in background
+            let streaming_enabled = state.config.chat.streaming_enabled;
+            if streaming_enabled {
+                let streaming_ctx = match send_telegram_placeholder(&state, &chat_id_str, None)
+                    .await
+                {
+                    Ok(msg_id) => Some(StreamingContext {
+                        chat_id: chat_id_str.clone(),
+                        message_id: msg_id,
+
+                        edit_interval_ms: state.config.chat.streaming_edit_interval_ms,
+                        min_tokens: state.config.chat.streaming_min_tokens,
+                    }),
+                    Err(e) => {
+                        warn!(error = %e, "failed to send streaming placeholder, falling back to non-streaming");
+                        None
+                    }
+                };
+                let chat_params = ChatParams {
+                    model_override: None,
+                    images,
+                    chat_ctx: Some(ChatContext {
+                        platform: "telegram".to_string(),
+                        chat_id: chat_id_str.clone(),
+                    }),
+                    streaming: streaming_ctx.clone(),
+                    ollama_url_override: pool_url.clone(),
+                };
+                // Spawn streaming in background; return 200 OK immediately
+                let state_bg = Arc::clone(&state);
+                let dedup_key_bg = dedup_key.clone();
+                let session_id_bg = session_id.clone();
+                tokio::spawn(async move {
+                    let llm_reply = call_ollama_chat(&state_bg, &history, &chat_params).await;
+                    // Final edit with complete response
+                    if let Some(ref ctx) = streaming_ctx {
+                        edit_telegram_message(&state_bg, &ctx.chat_id, ctx.message_id, &llm_reply)
+                            .await;
+                    } else {
+                        let _ = deliver_telegram(&state_bg, &chat_id_str, None, &llm_reply).await;
+                    }
+                    // Remove from in-flight
+                    {
+                        let mut guard = state_bg.inflight_chats.write().await;
+                        guard.remove(&dedup_key_bg);
+                    }
+                    // Store outbound reply
+                    if let Some(ref sid) = session_id_bg {
+                        let _ = sqlx::query(
+                            "INSERT INTO chat_messages (session_id, direction, content) VALUES ($1, 'outbound', $2)",
+                        )
+                        .bind(sid)
+                        .bind(&llm_reply)
+                        .execute(&state_bg.pg)
+                        .await;
+                    }
+                });
+                return (StatusCode::OK, "{}").into_response();
+            }
+
             let chat_params = ChatParams {
                 model_override: None,
                 images,
@@ -2398,6 +2640,8 @@ async fn webhook_telegram_handler(
                     platform: "telegram".to_string(),
                     chat_id: chat_id_str.clone(),
                 }),
+                streaming: None,
+                ollama_url_override: pool_url.clone(),
             };
             tokio::select! {
                 r = call_ollama_chat(&state, &history, &chat_params) => r,
@@ -2604,13 +2848,14 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
             text
         };
 
-        // Acquire the Ollama semaphore BEFORE creating the task so the
+        // Acquire the Ollama pool BEFORE creating the task so the
         // inline path always holds it when the NATS dispatch arrives.
         // This prevents the race where dispatch wins and the response
         // is lost (handle_task_completion_for_chat can't find task in Postgres).
-        let permit = state.ollama_semaphore.acquire().await;
-        let is_busy = permit.is_err();
-        let _permit = permit.ok();
+        let pool_permit = state.ollama_pool.acquire().await;
+        let is_busy = pool_permit.is_err();
+        let pool_url = pool_permit.as_ref().ok().map(|p| p.url.clone());
+        let _permit = pool_permit.ok();
 
         let session_id = handle_chat_message(
             state,
@@ -2652,6 +2897,26 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
                 None
             };
 
+            // v0.11.0: streaming path — send placeholder, stream, edit progressively
+            let streaming_enabled = state.config.chat.streaming_enabled;
+            let streaming_ctx = if streaming_enabled {
+                match send_telegram_placeholder(state, &chat_id_str, None).await {
+                    Ok(msg_id) => Some(StreamingContext {
+                        chat_id: chat_id_str.clone(),
+                        message_id: msg_id,
+
+                        edit_interval_ms: state.config.chat.streaming_edit_interval_ms,
+                        min_tokens: state.config.chat.streaming_min_tokens,
+                    }),
+                    Err(e) => {
+                        warn!(error = %e, "streaming placeholder failed, falling back");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             let chat_params = ChatParams {
                 model_override: None,
                 images,
@@ -2659,8 +2924,10 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
                     platform: "telegram".to_string(),
                     chat_id: chat_id_str.clone(),
                 }),
+                streaming: streaming_ctx.clone(),
+                ollama_url_override: pool_url.clone(),
             };
-            tokio::select! {
+            let reply_text = tokio::select! {
                 r = call_ollama_chat(state, &history, &chat_params) => r,
                 _ = async {
                     loop {
@@ -2668,7 +2935,14 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
                         send_telegram_typing(state, &chat_id_str).await;
                     }
                 } => unreachable!(),
+            };
+
+            // Final edit if streaming
+            if let Some(ref ctx) = streaming_ctx {
+                edit_telegram_message(state, &ctx.chat_id, ctx.message_id, &reply_text).await;
             }
+
+            reply_text
         } else {
             state.config.a2a.busy_message.clone()
         };
@@ -3313,13 +3587,15 @@ async fn handle_dispatched_task(
     // Build a minimal conversation: the task description as a user message
     let history = vec![("user".to_string(), description.to_string())];
 
-    // Acquire the Ollama semaphore to respect concurrency limits
-    let reply = match state.ollama_semaphore.try_acquire() {
-        Ok(_permit) => {
+    // Acquire the Ollama pool to respect concurrency limits
+    let reply = match state.ollama_pool.try_acquire() {
+        Ok(permit) => {
             let chat_params = ChatParams {
                 model_override: model_hint.as_deref(),
                 images: None,
                 chat_ctx: None,
+                streaming: None,
+                ollama_url_override: Some(permit.url.clone()),
             };
             call_ollama_chat(state, &history, &chat_params).await
         }
@@ -3599,7 +3875,7 @@ async fn handle_ollama_recovery(
     messages: &[serde_json::Value],
     timeout_secs: u64,
 ) -> String {
-    let ollama_url = &state.config.ollama.url;
+    let ollama_url = state.ollama_pool.primary_url();
     let num_ctx = state.config.ollama.num_ctx;
 
     // Step 1: Unload all known models to maximize free memory for the primary.
@@ -4107,7 +4383,7 @@ async fn call_vision_describe(state: &AppState, image_b64: &str, prompt: &str) -
         return "No vision model configured.".to_string();
     }
 
-    let url = format!("{}/api/chat", state.config.ollama.url);
+    let url = format!("{}/api/chat", state.ollama_pool.primary_url());
     let payload = serde_json::json!({
         "model": vision_model,
         "messages": [{
@@ -4281,6 +4557,18 @@ fn classify_model_domain(text: &str) -> &'static str {
     "general"
 }
 
+/// Outcome of the verification pipeline.
+enum VerifyResult {
+    /// The verifier confirmed the response is accurate.
+    Verified,
+    /// The verifier provided a corrected version.
+    Corrected(String),
+    /// The verifier timed out (exceeded `verifier_timeout_seconds`).
+    Timeout,
+    /// An error occurred during verification (network, parse, etc.).
+    Error(String),
+}
+
 /// Use a fast verifier model to fact-check low-confidence responses.
 async fn verify_response(
     client: &reqwest::Client,
@@ -4291,7 +4579,7 @@ async fn verify_response(
     user_query: &str,
     memory_context: &str,
     num_ctx: u32,
-) -> Option<String> {
+) -> VerifyResult {
     let verification_prompt = format!(
         "You are a fact-checker. The user asked: \"{user_query}\"\n\n\
          The AI responded: \"{original_response}\"\n\n\
@@ -4319,27 +4607,43 @@ async fn verify_response(
         }
     });
 
-    let resp = client
+    let start = std::time::Instant::now();
+    let resp = match client
         .post(&url)
         .json(&payload)
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .send()
         .await
-        .ok()?;
+    {
+        Ok(r) => r,
+        Err(e) if e.is_timeout() => return VerifyResult::Timeout,
+        Err(e) => return VerifyResult::Error(e.to_string()),
+    };
 
-    let body: serde_json::Value = resp.json().await.ok()?;
-    let content = body
+    let body: serde_json::Value = match resp.json().await {
+        Ok(b) => b,
+        Err(e) => return VerifyResult::Error(format!("json parse: {e}")),
+    };
+
+    let content = match body
         .get("message")
         .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())?;
+        .and_then(|c| c.as_str())
+    {
+        Some(c) => c,
+        None => return VerifyResult::Error("no message.content in response".to_string()),
+    };
 
     let cleaned = strip_think_tags(content.trim());
+    let _duration_ms = start.elapsed().as_millis();
+
     if cleaned.contains("VERIFIED") {
-        None
+        VerifyResult::Verified
     } else if let Some(idx) = cleaned.find("CORRECTED:") {
-        Some(cleaned[idx + 10..].trim().to_string())
+        VerifyResult::Corrected(cleaned[idx + 10..].trim().to_string())
     } else {
-        None
+        // Ambiguous response — treat as verified but log
+        VerifyResult::Verified
     }
 }
 
@@ -4349,7 +4653,11 @@ async fn call_ollama_chat(
     params: &ChatParams<'_>,
 ) -> String {
     let model_override = params.model_override;
-    let ollama_url = &state.config.ollama.url;
+    let default_url = state.ollama_pool.primary_url().to_string();
+    let ollama_url = params
+        .ollama_url_override
+        .as_deref()
+        .unwrap_or(&default_url);
     let timeout_secs = state.config.ollama.timeout_seconds;
     let url = format!("{ollama_url}/api/chat");
     let chat_cfg = &state.config.chat;
@@ -4729,7 +5037,7 @@ async fn call_ollama_chat(
             )
             .await;
             // Unload the fallback model to free memory for the primary
-            let unload_url = format!("{}/api/generate", &state.config.ollama.url);
+            let unload_url = format!("{}/api/generate", state.ollama_pool.primary_url());
             let unload_payload = serde_json::json!({
                 "model": fallback,
                 "keep_alive": 0,
@@ -4785,15 +5093,67 @@ async fn call_ollama_chat(
             payload["tools"] = tools_def.clone().unwrap();
         }
 
-        // Send request with one retry on transient connection errors
-        let body: serde_json::Value = match send_ollama_request(
-            &state.ollama_client,
-            &url,
-            &payload,
-            timeout_secs,
-        )
-        .await
-        {
+        // Send request — streaming or non-streaming based on params
+        let ollama_result = if let Some(ref stream_ctx) = params.streaming {
+            // v0.11.0: Streaming path — progressive edits via watch channel
+            let (progress_tx, progress_rx) = tokio::sync::watch::channel(String::new());
+            let ctx = stream_ctx.clone();
+            let pg_for_edit = state.pg.clone();
+            let http_for_edit = state.http_client.clone();
+            let edit_interval = ctx.edit_interval_ms;
+            let min_tokens = ctx.min_tokens;
+            let edit_task = tokio::spawn({
+                let chat_id = ctx.chat_id.clone();
+                let message_id = ctx.message_id;
+                async move {
+                    let mut last_text = String::new();
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(edit_interval)).await;
+                        let current = progress_rx.borrow().clone();
+                        if current == last_text || current.split_whitespace().count() < min_tokens {
+                            if progress_rx.has_changed().is_err() {
+                                break; // sender dropped
+                            }
+                            continue;
+                        }
+                        last_text = current.clone();
+                        // Edit telegram message directly (minimal state)
+                        let tg_token: Option<String> = sqlx::query_scalar(
+                            "SELECT credential_value FROM platform_credentials WHERE platform = 'telegram' AND credential_key = 'telegram_bot_token'",
+                        )
+                        .fetch_optional(&pg_for_edit)
+                        .await
+                        .ok()
+                        .flatten();
+                        if let Some(token) = tg_token {
+                            let url =
+                                format!("https://api.telegram.org/bot{token}/editMessageText");
+                            let payload = serde_json::json!({
+                                "chat_id": chat_id,
+                                "message_id": message_id,
+                                "text": format!("{current}\u{2026}"),
+                            });
+                            let _ = http_for_edit.post(&url).json(&payload).send().await;
+                        }
+                        if progress_rx.has_changed().is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+
+            let result =
+                stream_ollama_request(&state.ollama_client, &url, &payload, &progress_tx).await;
+
+            drop(progress_tx); // signal edit task to stop
+            let _ = edit_task.await;
+
+            result
+        } else {
+            send_ollama_request(&state.ollama_client, &url, &payload, timeout_secs).await
+        };
+
+        let body: serde_json::Value = match ollama_result {
             Ok(b) => b,
             Err(OllamaRequestError::Timeout) => {
                 warn!(model = %model, round = round, "Ollama request timed out ({}s)", timeout_secs);
@@ -5194,9 +5554,10 @@ async fn call_ollama_chat(
 
         // Verify low-confidence responses using a fast verifier model
         if confidence.unwrap_or(3) < 3 && !chat_cfg.verifier_model.is_empty() {
-            if let Some(corrected) = verify_response(
+            let verify_start = std::time::Instant::now();
+            let result = verify_response(
                 &state.ollama_client,
-                &state.config.ollama.url,
+                state.ollama_pool.primary_url(),
                 &chat_cfg.verifier_model,
                 chat_cfg.verifier_timeout_seconds,
                 &clean_text,
@@ -5204,10 +5565,78 @@ async fn call_ollama_chat(
                 &memory_ctx,
                 state.config.ollama.num_ctx,
             )
-            .await
-            {
-                info!(confidence = ?confidence, "response corrected by verifier");
-                return corrected;
+            .await;
+            let duration_ms = verify_start.elapsed().as_millis() as u64;
+
+            match result {
+                VerifyResult::Verified => {
+                    info!(confidence = ?confidence, duration_ms, "response verified");
+                    log_service_event(
+                        &state.pg,
+                        "a2a-gateway",
+                        "verification_completed",
+                        "info",
+                        serde_json::json!({
+                            "confidence": confidence,
+                            "outcome": "verified",
+                            "duration_ms": duration_ms,
+                            "original_len": clean_text.len(),
+                        }),
+                    )
+                    .await;
+                }
+                VerifyResult::Corrected(ref corrected) => {
+                    info!(confidence = ?confidence, duration_ms, "response corrected by verifier");
+                    log_service_event(
+                        &state.pg,
+                        "a2a-gateway",
+                        "verification_completed",
+                        "info",
+                        serde_json::json!({
+                            "confidence": confidence,
+                            "outcome": "corrected",
+                            "duration_ms": duration_ms,
+                            "original_len": clean_text.len(),
+                            "corrected_len": corrected.len(),
+                        }),
+                    )
+                    .await;
+                    return corrected.clone();
+                }
+                VerifyResult::Timeout => {
+                    warn!(confidence = ?confidence, duration_ms, "verification timed out");
+                    log_service_event(
+                        &state.pg,
+                        "a2a-gateway",
+                        "verification_timeout",
+                        "warning",
+                        serde_json::json!({
+                            "confidence": confidence,
+                            "outcome": "timeout",
+                            "duration_ms": duration_ms,
+                            "original_len": clean_text.len(),
+                        }),
+                    )
+                    .await;
+                    return format!("{clean_text}\n\n_[Unverified: verification timed out]_");
+                }
+                VerifyResult::Error(ref e) => {
+                    warn!(confidence = ?confidence, error = %e, "verification error");
+                    log_service_event(
+                        &state.pg,
+                        "a2a-gateway",
+                        "verification_completed",
+                        "warning",
+                        serde_json::json!({
+                            "confidence": confidence,
+                            "outcome": "error",
+                            "duration_ms": duration_ms,
+                            "error": e,
+                        }),
+                    )
+                    .await;
+                    return format!("{clean_text}\n\n_[Unverified: verification unavailable]_");
+                }
             }
         }
 
@@ -5499,6 +5928,225 @@ async fn deliver_telegram(
         return Err(format!("telegram API returned {status}: {body}"));
     }
     Ok(())
+}
+
+/// Send a Telegram placeholder message ("Thinking...") and return its message_id.
+async fn send_telegram_placeholder(
+    state: &AppState,
+    chat_id: &str,
+    thread_id: Option<&str>,
+) -> Result<i64, String> {
+    let (tg_token, _, _, _) = get_telegram_creds(state).await;
+    let token = tg_token.unwrap_or_default();
+    if token.is_empty() {
+        return Err("no telegram_bot_token configured".to_string());
+    }
+    let url = format!("https://api.telegram.org/bot{token}/sendMessage");
+    let mut payload = serde_json::json!({
+        "chat_id": chat_id,
+        "text": "_Thinking\u{2026}_",
+        "parse_mode": "Markdown",
+    });
+    if let Some(tid) = thread_id {
+        payload["message_thread_id"] = serde_json::Value::String(tid.to_string());
+    }
+    let resp = state
+        .http_client
+        .post(&url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("telegram placeholder failed: {body}"));
+    }
+    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    body.get("result")
+        .and_then(|r| r.get("message_id"))
+        .and_then(|id| id.as_i64())
+        .ok_or_else(|| "missing message_id in placeholder response".to_string())
+}
+
+/// Edit an existing Telegram message text. Gracefully handles "message is not modified" (400).
+async fn edit_telegram_message(state: &AppState, chat_id: &str, message_id: i64, text: &str) {
+    let (tg_token, _, _, _) = get_telegram_creds(state).await;
+    let token = match tg_token {
+        Some(t) if !t.is_empty() => t,
+        _ => return,
+    };
+    let url = format!("https://api.telegram.org/bot{token}/editMessageText");
+    let payload = serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+    });
+    match state.http_client.post(&url).json(&payload).send().await {
+        Ok(resp) if !resp.status().is_success() => {
+            let body = resp.text().await.unwrap_or_default();
+            if !body.contains("message is not modified") {
+                warn!(message_id, "telegram edit failed: {body}");
+            }
+        }
+        Err(e) => warn!(message_id, error = %e, "telegram edit request failed"),
+        _ => {}
+    }
+}
+
+/// Stateful streaming filter for `<think>` tags across token boundaries.
+/// Returns the portion of the token that is outside think tags.
+///
+/// `in_think`: mutable flag tracking whether we're inside a `<think>` block.
+/// `think_buffer`: mutable buffer for partial tag detection.
+fn filter_think_streaming(token: &str, in_think: &mut bool, think_buffer: &mut String) -> String {
+    think_buffer.push_str(token);
+    let mut output = String::new();
+    let buf = std::mem::take(think_buffer);
+    let mut rest = buf.as_str();
+
+    loop {
+        if *in_think {
+            if let Some(pos) = rest.find("</think>") {
+                *in_think = false;
+                rest = &rest[pos + 8..];
+            } else {
+                // Might have partial </think> at the end — buffer last 8 chars
+                if rest.len() > 8 {
+                    rest = &rest[rest.len() - 8..];
+                }
+                *think_buffer = rest.to_string();
+                return output;
+            }
+        } else if let Some(pos) = rest.find("<think>") {
+            output.push_str(&rest[..pos]);
+            *in_think = true;
+            rest = &rest[pos + 7..];
+        } else {
+            // No <think> found — might have a partial tag at end
+            if rest.len() > 7 {
+                let safe = rest.len() - 7;
+                output.push_str(&rest[..safe]);
+                *think_buffer = rest[safe..].to_string();
+            } else {
+                *think_buffer = rest.to_string();
+            }
+            return output;
+        }
+    }
+}
+
+/// Stream an Ollama /api/chat request, sending accumulated text through `progress_tx`.
+/// Returns the full response (final message, tool_calls if any) when streaming completes.
+async fn stream_ollama_request(
+    client: &reqwest::Client,
+    url: &str,
+    payload: &serde_json::Value,
+    progress_tx: &tokio::sync::watch::Sender<String>,
+) -> Result<serde_json::Value, OllamaRequestError> {
+    let mut payload = payload.clone();
+    payload["stream"] = serde_json::json!(true);
+
+    let mut resp = client.post(url).json(&payload).send().await.map_err(|e| {
+        if e.is_timeout() {
+            OllamaRequestError::Timeout
+        } else {
+            OllamaRequestError::Connection(e.to_string())
+        }
+    })?;
+
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(OllamaRequestError::Parse(format!(
+            "Ollama streaming returned error: {body}"
+        )));
+    }
+
+    let mut accumulated_content = String::new();
+    let mut accumulated_thinking = String::new();
+    let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+    let mut model = String::new();
+    let mut in_think = false;
+    let mut think_buffer = String::new();
+    let mut line_buffer = String::new();
+
+    while let Ok(Some(bytes)) = resp.chunk().await {
+        line_buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+        // Process complete NDJSON lines from the buffer
+        while let Some(newline_pos) = line_buffer.find('\n') {
+            let line = line_buffer[..newline_pos].to_string();
+            line_buffer = line_buffer[newline_pos + 1..].to_string();
+
+            if line.trim().is_empty() {
+                continue;
+            }
+            let chunk: serde_json::Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            // Extract model name
+            if model.is_empty() {
+                if let Some(m) = chunk.get("model").and_then(|v| v.as_str()) {
+                    model = m.to_string();
+                }
+            }
+
+            // Extract thinking content (qwen3 with think:true)
+            if let Some(thinking) = chunk
+                .get("message")
+                .and_then(|m| m.get("thinking"))
+                .and_then(|t| t.as_str())
+            {
+                accumulated_thinking.push_str(thinking);
+            }
+
+            // Extract content tokens
+            if let Some(content) = chunk
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+            {
+                let filtered = filter_think_streaming(content, &mut in_think, &mut think_buffer);
+                accumulated_content.push_str(&filtered);
+                let _ = progress_tx.send(accumulated_content.clone());
+            }
+
+            // Extract tool calls from the final message
+            if chunk.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
+                if let Some(tc) = chunk
+                    .get("message")
+                    .and_then(|m| m.get("tool_calls"))
+                    .and_then(|t| t.as_array())
+                {
+                    tool_calls.extend(tc.iter().cloned());
+                }
+            }
+        }
+    }
+
+    // Flush any remaining think buffer content
+    if !think_buffer.is_empty() && !in_think {
+        accumulated_content.push_str(&think_buffer);
+    }
+
+    // Reconstruct a response in the same format as non-streaming Ollama response
+    let mut final_message = serde_json::json!({
+        "role": "assistant",
+        "content": accumulated_content,
+    });
+    if !accumulated_thinking.is_empty() {
+        final_message["thinking"] = serde_json::json!(accumulated_thinking);
+    }
+    if !tool_calls.is_empty() {
+        final_message["tool_calls"] = serde_json::json!(tool_calls);
+    }
+
+    Ok(serde_json::json!({
+        "message": final_message,
+        "model": model,
+        "done": true,
+    }))
 }
 
 /// Deliver a proactive notification via Telegram (no session required).
@@ -6191,5 +6839,185 @@ mod tests {
     #[test]
     fn test_strip_think_tags_unclosed() {
         assert_eq!(strip_think_tags("before <think>thinking forever"), "before");
+    }
+
+    #[test]
+    fn test_verify_result_enum_variants() {
+        // Verify all enum variants can be constructed
+        let _v = VerifyResult::Verified;
+        let _c = VerifyResult::Corrected("fixed".to_string());
+        let _t = VerifyResult::Timeout;
+        let _e = VerifyResult::Error("network".to_string());
+    }
+
+    // -----------------------------------------------------------------------
+    // Streaming think-tag filter tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_filter_think_streaming_basic() {
+        let mut in_think = false;
+        let mut buf = String::new();
+        let out = filter_think_streaming("hello world", &mut in_think, &mut buf);
+        // With partial-tag buffering, last 7 chars may be held back
+        assert!(
+            !out.is_empty() || !buf.is_empty(),
+            "content should be somewhere"
+        );
+    }
+
+    #[test]
+    fn test_filter_think_streaming_removes_think() {
+        let mut in_think = false;
+        let mut buf = String::new();
+        let mut output = String::new();
+        output.push_str(&filter_think_streaming(
+            "<think>reasoning",
+            &mut in_think,
+            &mut buf,
+        ));
+        assert!(in_think, "should be inside think block");
+        output.push_str(&filter_think_streaming(
+            "</think>visible",
+            &mut in_think,
+            &mut buf,
+        ));
+        assert!(!in_think, "should be outside think block");
+        // Flush buffer
+        output.push_str(&buf);
+        assert!(
+            output.contains("visible"),
+            "visible content should pass through: {output}"
+        );
+        assert!(
+            !output.contains("reasoning"),
+            "think content should be filtered: {output}"
+        );
+    }
+
+    #[test]
+    fn test_filter_think_streaming_no_tags() {
+        let mut in_think = false;
+        let mut buf = String::new();
+        let mut output = String::new();
+        for token in &["Hello", " ", "world", "!"] {
+            output.push_str(&filter_think_streaming(token, &mut in_think, &mut buf));
+        }
+        output.push_str(&buf);
+        assert_eq!(output, "Hello world!");
+    }
+
+    #[test]
+    fn test_filter_think_streaming_partial_tag() {
+        let mut in_think = false;
+        let mut buf = String::new();
+        let mut output = String::new();
+        // Send "<thi" then "nk>stuff</think>after"
+        output.push_str(&filter_think_streaming("<thi", &mut in_think, &mut buf));
+        output.push_str(&filter_think_streaming(
+            "nk>stuff</think>after",
+            &mut in_think,
+            &mut buf,
+        ));
+        output.push_str(&buf);
+        assert!(
+            output.contains("after"),
+            "content after think should appear: {output}"
+        );
+        assert!(
+            !output.contains("stuff"),
+            "think content should be filtered: {output}"
+        );
+    }
+
+    // --- v0.11.0: OllamaPool tests ---
+
+    #[test]
+    fn test_ollama_pool_single_instance() {
+        let pool = OllamaPool::new(vec!["http://localhost:11434".to_string()], 2);
+        assert_eq!(pool.instances.len(), 1);
+        assert_eq!(pool.primary_url(), "http://localhost:11434");
+    }
+
+    #[test]
+    fn test_ollama_pool_pick_least_loaded() {
+        let pool = OllamaPool::new(
+            vec![
+                "http://host1:11434".to_string(),
+                "http://host2:11434".to_string(),
+            ],
+            4,
+        );
+        // Both idle — should pick first (idx 0)
+        assert_eq!(pool.pick_instance(), 0);
+
+        // Add load to first instance
+        pool.instances[0]
+            .active_requests
+            .store(3, Ordering::Relaxed);
+        // Should now pick second (idx 1, load=0)
+        assert_eq!(pool.pick_instance(), 1);
+    }
+
+    #[test]
+    fn test_ollama_pool_unhealthy_skipped() {
+        let pool = OllamaPool::new(
+            vec![
+                "http://host1:11434".to_string(),
+                "http://host2:11434".to_string(),
+            ],
+            4,
+        );
+        // Mark first unhealthy
+        pool.instances[0].healthy.store(false, Ordering::Relaxed);
+        // Should pick second (healthy)
+        assert_eq!(pool.pick_instance(), 1);
+    }
+
+    #[test]
+    fn test_ollama_pool_all_unhealthy_fallback() {
+        let pool = OllamaPool::new(
+            vec![
+                "http://host1:11434".to_string(),
+                "http://host2:11434".to_string(),
+            ],
+            4,
+        );
+        pool.instances[0].healthy.store(false, Ordering::Relaxed);
+        pool.instances[1].healthy.store(false, Ordering::Relaxed);
+        // Add load to first so second is preferred
+        pool.instances[0]
+            .active_requests
+            .store(2, Ordering::Relaxed);
+        // Should pick second (lower load, even though unhealthy)
+        assert_eq!(pool.pick_instance(), 1);
+    }
+
+    #[test]
+    fn test_ollama_pool_health_reporting() {
+        let pool = OllamaPool::new(vec!["http://host:11434".to_string()], 1);
+        assert!(pool.instances[0].healthy.load(Ordering::Relaxed));
+
+        // 1 failure: still healthy
+        pool.report_health(0, false);
+        assert!(pool.instances[0].healthy.load(Ordering::Relaxed));
+
+        // 2 failures: still healthy
+        pool.report_health(0, false);
+        assert!(pool.instances[0].healthy.load(Ordering::Relaxed));
+
+        // 3 failures: now unhealthy
+        pool.report_health(0, false);
+        assert!(!pool.instances[0].healthy.load(Ordering::Relaxed));
+
+        // 1 success: recover
+        pool.report_health(0, true);
+        assert!(pool.instances[0].healthy.load(Ordering::Relaxed));
+        assert_eq!(
+            pool.instances[0]
+                .consecutive_failures
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 }

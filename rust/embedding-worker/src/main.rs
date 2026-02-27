@@ -460,6 +460,133 @@ fn chunk_content(text: &str, max_tokens: usize, overlap: usize) -> Vec<String> {
     chunks
 }
 
+/// Split priority for smart chunking boundaries (higher = better split point).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SplitPriority {
+    None = 0,
+    Paragraph = 1,
+    TableSep = 2,
+    CodeFence = 3,
+    Heading = 4,
+}
+
+/// Structure-aware markdown chunker.
+///
+/// Splits at markdown headings, code fence boundaries, table separators, and
+/// paragraph breaks instead of arbitrary word counts. Falls back to word-based
+/// splitting when no natural boundary is found within the max_tokens window.
+fn chunk_content_smart(text: &str, max_tokens: usize, overlap: usize) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return vec![];
+    }
+
+    // Pre-compute per-line word counts and cumulative totals
+    let line_words: Vec<usize> = lines.iter().map(|l| l.split_whitespace().count()).collect();
+    let total_words: usize = line_words.iter().sum();
+
+    if total_words <= max_tokens {
+        return vec![text.to_string()];
+    }
+
+    // Identify split priorities per line
+    let mut in_code_fence = false;
+    let priorities: Vec<SplitPriority> = lines
+        .iter()
+        .map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                in_code_fence = !in_code_fence;
+                return SplitPriority::None; // never split at fence boundaries
+            }
+            if in_code_fence {
+                return SplitPriority::None; // never split inside code blocks
+            }
+            if trimmed.starts_with('#') {
+                return SplitPriority::Heading;
+            }
+            if trimmed.starts_with("|---")
+                || trimmed.starts_with("| ---")
+                || trimmed.starts_with("|:--")
+            {
+                return SplitPriority::TableSep;
+            }
+            if trimmed.is_empty() {
+                return SplitPriority::Paragraph;
+            }
+            SplitPriority::None
+        })
+        .collect();
+
+    let mut chunks = Vec::new();
+    let mut chunk_start = 0;
+
+    while chunk_start < lines.len() {
+        // Find how many lines we can fit in max_tokens
+        let mut word_count = 0;
+        let mut chunk_end = chunk_start;
+        while chunk_end < lines.len() && word_count + line_words[chunk_end] <= max_tokens {
+            word_count += line_words[chunk_end];
+            chunk_end += 1;
+        }
+
+        // Handle case where a single line exceeds max_tokens
+        if chunk_end == chunk_start {
+            chunk_end = chunk_start + 1;
+        }
+
+        // If we reached the end, take everything
+        if chunk_end >= lines.len() {
+            chunks.push(lines[chunk_start..].join("\n"));
+            break;
+        }
+
+        // Find the best split point within [chunk_start+1..chunk_end]
+        // Look backward from chunk_end for the highest-priority boundary
+        let mut best_split = None;
+        let mut best_priority = SplitPriority::None;
+
+        // Search from chunk_end backwards (prefer splitting later = larger chunks)
+        for i in (chunk_start + 1..=chunk_end).rev() {
+            if priorities[i] > best_priority {
+                best_priority = priorities[i];
+                best_split = Some(i);
+                if best_priority == SplitPriority::Heading {
+                    break; // headings are optimal, stop searching
+                }
+            }
+        }
+
+        let split_at = if let Some(pos) = best_split {
+            pos
+        } else {
+            // No natural boundary — fall back to word-based split at chunk_end
+            chunk_end.max(chunk_start + 1)
+        };
+
+        chunks.push(lines[chunk_start..split_at].join("\n"));
+
+        // Overlap: rewind by overlap words (capped at 3 lines)
+        let prev_start = chunk_start;
+        let mut overlap_lines = 0;
+        let mut overlap_words = 0;
+        let max_overlap_lines = 3;
+        let mut i = split_at;
+        while i > prev_start + 1 && overlap_lines < max_overlap_lines && overlap_words < overlap {
+            i -= 1;
+            overlap_words += line_words[i];
+            overlap_lines += 1;
+        }
+        chunk_start = if overlap_words > 0 && i < split_at && i > prev_start {
+            i
+        } else {
+            split_at
+        };
+    }
+
+    chunks
+}
+
 // ---------------------------------------------------------------------------
 // Process a single outbox row end-to-end
 // ---------------------------------------------------------------------------
@@ -516,11 +643,19 @@ async fn process_outbox_row(state: &AppState, row: &OutboxRow) -> Result<(), Bro
     // For "embed" operations: full pipeline (embed + qdrant + kg extract)
     // For "kg_extract" operations: skip embedding, only do kg extraction
     if row.operation == "embed" {
-        let chunks = chunk_content(
-            content,
-            state.config.memory_search.chunk_max_tokens,
-            state.config.memory_search.chunk_overlap_tokens,
-        );
+        let chunks = if state.config.memory_search.smart_chunking {
+            chunk_content_smart(
+                content,
+                state.config.memory_search.chunk_max_tokens,
+                state.config.memory_search.chunk_overlap_tokens,
+            )
+        } else {
+            chunk_content(
+                content,
+                state.config.memory_search.chunk_max_tokens,
+                state.config.memory_search.chunk_overlap_tokens,
+            )
+        };
 
         let now_str = chrono::Utc::now().to_rfc3339();
         let qdrant_id = Uuid::new_v4().to_string();
@@ -1697,5 +1832,126 @@ mod tests {
             rel.description.as_deref(),
             Some("Alice manages the auth service team")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Smart chunking tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_smart_chunk_heading_boundaries() {
+        let text = "## Introduction\nFirst paragraph with enough words to test.\n\n\
+                     ## Methods\nSecond section with more content words here.\n\n\
+                     ## Results\nThird section results go here now.";
+        let chunks = chunk_content_smart(text, 12, 0);
+        assert!(chunks.len() >= 2, "should split at heading boundaries");
+        // At least one chunk (after the first) should start with a heading
+        let heading_starts = chunks
+            .iter()
+            .skip(1)
+            .filter(|c| c.starts_with("##"))
+            .count();
+        assert!(
+            heading_starts >= 1,
+            "at least one split should align with heading boundary, chunks: {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn test_smart_chunk_preserves_code_fences() {
+        let text =
+            "Before code.\n\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n\nAfter code.";
+        let chunks = chunk_content_smart(text, 10, 0);
+        // The code block should be kept together: some chunk contains both ``` markers
+        let has_complete_block = chunks.iter().any(|c| c.matches("```").count() >= 2);
+        assert!(
+            has_complete_block,
+            "code block should be kept in one chunk, chunks: {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn test_smart_chunk_paragraph_boundaries() {
+        let text = "First paragraph with several words here.\n\n\
+                     Second paragraph with several words here.\n\n\
+                     Third paragraph with several words here.";
+        let chunks = chunk_content_smart(text, 8, 0);
+        assert!(
+            chunks.len() >= 2,
+            "should split at paragraph boundaries, chunks: {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn test_smart_chunk_table_not_split() {
+        let text = "| Name | Value |\n| --- | --- |\n| a | 1 |\n| b | 2 |";
+        let chunks = chunk_content_smart(text, 50, 2);
+        assert_eq!(chunks.len(), 1, "small table should stay in one chunk");
+        assert!(chunks[0].contains("| --- |"), "table separator preserved");
+    }
+
+    #[test]
+    fn test_smart_chunk_fallback_no_boundaries() {
+        // Multi-line dense prose with no markdown structure
+        let text = (0..6)
+            .map(|i| format!("Line {} has five words here.", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let chunks = chunk_content_smart(&text, 10, 0);
+        assert!(
+            chunks.len() >= 2,
+            "should split multi-line text, chunks: {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn test_smart_chunk_short_text() {
+        let text = "Just a few words here.";
+        let chunks = chunk_content_smart(text, 100, 10);
+        assert_eq!(chunks.len(), 1, "short text should be a single chunk");
+        assert_eq!(chunks[0], text);
+    }
+
+    #[test]
+    fn test_smart_chunk_empty_text() {
+        let chunks = chunk_content_smart("", 100, 10);
+        assert!(chunks.is_empty(), "empty text should produce no chunks");
+    }
+
+    #[test]
+    fn test_smart_chunk_overlap_present() {
+        // Use paragraph boundaries with enough words per paragraph
+        let text = "First paragraph with seven words now.\n\n\
+                     Second paragraph with seven words now.\n\n\
+                     Third paragraph with seven words now.";
+        let chunks = chunk_content_smart(text, 10, 3);
+        if chunks.len() >= 2 {
+            // Check that later chunks contain some content from earlier chunks
+            let all_text: String = chunks
+                .iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>()
+                .join("|");
+            // With overlap, total words across chunks > total unique words
+            let total_chunk_words: usize =
+                chunks.iter().map(|c| c.split_whitespace().count()).sum();
+            let unique_words = text.split_whitespace().count();
+            assert!(
+                total_chunk_words > unique_words || chunks.len() == 1,
+                "overlap should cause repeated words: total_chunk_words={}, unique={}, text={}",
+                total_chunk_words,
+                unique_words,
+                all_text
+            );
+        }
+    }
+
+    #[test]
+    fn test_smart_chunk_single_oversized_line() {
+        // A single line with more words than max_tokens
+        let text = "one two three four five six seven eight nine ten eleven twelve";
+        let chunks = chunk_content_smart(text, 5, 0);
+        assert_eq!(chunks.len(), 1, "single line included even if oversized");
+        assert!(chunks[0].contains("twelve"), "content preserved");
     }
 }

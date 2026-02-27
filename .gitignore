@@ -8,6 +8,7 @@ secrets.enc.toml.key
 .env.*
 .sops.yaml
 secrets.skeleton.toml
+secrets.skeleton.json
 secrets.enc.toml
 secrets.enc.json
 

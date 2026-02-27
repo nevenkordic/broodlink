@@ -153,6 +153,25 @@ struct TaskFailedPayload {
     error: Option<String>,
 }
 
+/// Payload received on the `task_declined` subject.
+#[derive(Deserialize, Debug)]
+struct TaskDeclinedPayload {
+    task_id: String,
+    agent_id: String,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    suggested_agent: Option<String>,
+}
+
+/// Payload received on the `task_context_request` subject.
+#[derive(Deserialize, Debug)]
+struct TaskContextRequestPayload {
+    task_id: String,
+    agent_id: String,
+    questions: Vec<String>,
+}
+
 /// Metrics payload published to `broodlink.metrics.coordinator`.
 #[derive(Serialize)]
 struct MetricsPayload {
@@ -562,11 +581,12 @@ struct TaskRow {
     priority: i32,
     formula_name: Option<String>,
     convoy_id: Option<String>,
+    declined_agents: Vec<String>,
 }
 
 async fn fetch_task(pg: &PgPool, task_id: &str) -> Result<Option<TaskRow>, BroodlinkError> {
     let row = sqlx::query(
-        "SELECT id, title, description, priority, formula_name, convoy_id
+        "SELECT id, title, description, priority, formula_name, convoy_id, declined_agents
          FROM task_queue WHERE id = $1 AND status = 'pending'",
     )
     .bind(task_id)
@@ -575,6 +595,10 @@ async fn fetch_task(pg: &PgPool, task_id: &str) -> Result<Option<TaskRow>, Brood
 
     Ok(row.map(|r| {
         let priority: Option<i32> = r.get("priority");
+        let declined_json: Option<serde_json::Value> = r.get("declined_agents");
+        let declined_agents: Vec<String> = declined_json
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
         TaskRow {
             id: r.get("id"),
             title: r.get("title"),
@@ -582,6 +606,7 @@ async fn fetch_task(pg: &PgPool, task_id: &str) -> Result<Option<TaskRow>, Brood
             priority: priority.unwrap_or(0),
             formula_name: r.get("formula_name"),
             convoy_id: r.get("convoy_id"),
+            declined_agents,
         }
     }))
 }
@@ -1695,6 +1720,116 @@ async fn run_task_failed_subscription(
     Ok(())
 }
 
+// v0.11.0: Negotiation subscription loops
+
+async fn run_task_declined_subscription(
+    state: Arc<AppState>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), BroodlinkError> {
+    let subject = format!(
+        "{}.{}.coordinator.task_declined",
+        state.config.nats.subject_prefix, state.config.broodlink.env,
+    );
+
+    info!(subject = %subject, "subscribing to task_declined");
+    let mut subscriber = state.nats.subscribe(subject.clone()).await?;
+
+    loop {
+        tokio::select! {
+            msg = subscriber.next() => {
+                match msg {
+                    Some(nats_msg) => {
+                        match serde_json::from_slice::<TaskDeclinedPayload>(&nats_msg.payload) {
+                            Ok(payload) => {
+                                let state_clone = Arc::clone(&state);
+                                tokio::spawn(async move {
+                                    if let Err(e) = handle_task_declined(&state_clone, &payload).await {
+                                        warn!(
+                                            error = %e,
+                                            task_id = %payload.task_id,
+                                            "task_declined handling failed"
+                                        );
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "failed to deserialize task_declined payload");
+                            }
+                        }
+                    }
+                    None => {
+                        warn!("task_declined subscription stream ended");
+                        break;
+                    }
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                info!("shutdown signal, stopping task_declined subscription");
+                break;
+            }
+        }
+    }
+
+    if let Err(e) = subscriber.unsubscribe().await {
+        warn!(error = %e, "failed to unsubscribe from task_declined");
+    }
+    Ok(())
+}
+
+async fn run_task_context_request_subscription(
+    state: Arc<AppState>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), BroodlinkError> {
+    let subject = format!(
+        "{}.{}.coordinator.task_context_request",
+        state.config.nats.subject_prefix, state.config.broodlink.env,
+    );
+
+    info!(subject = %subject, "subscribing to task_context_request");
+    let mut subscriber = state.nats.subscribe(subject.clone()).await?;
+
+    loop {
+        tokio::select! {
+            msg = subscriber.next() => {
+                match msg {
+                    Some(nats_msg) => {
+                        match serde_json::from_slice::<TaskContextRequestPayload>(&nats_msg.payload) {
+                            Ok(payload) => {
+                                let state_clone = Arc::clone(&state);
+                                tokio::spawn(async move {
+                                    if let Err(e) = handle_task_context_request(&state_clone, &payload).await {
+                                        warn!(
+                                            error = %e,
+                                            task_id = %payload.task_id,
+                                            "task_context_request handling failed"
+                                        );
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "failed to deserialize task_context_request payload");
+                            }
+                        }
+                    }
+                    None => {
+                        warn!("task_context_request subscription stream ended");
+                        break;
+                    }
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                info!("shutdown signal, stopping task_context_request subscription");
+                break;
+            }
+        }
+    }
+
+    if let Err(e) = subscriber.unsubscribe().await {
+        warn!(error = %e, "failed to unsubscribe from task_context_request");
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Metrics publishing
 // ---------------------------------------------------------------------------
@@ -1778,7 +1913,12 @@ async fn handle_task_available(
         outer_attempt = backoff_round;
 
         // 3a. Query Dolt agent_profiles for eligible agents
-        let agents = find_eligible_agents(&state.dolt, role, cost_tier).await?;
+        let mut agents = find_eligible_agents(&state.dolt, role, cost_tier).await?;
+
+        // v0.11.0: Filter out agents that have already declined this task
+        if !task.declined_agents.is_empty() {
+            agents.retain(|a| !task.declined_agents.contains(&a.agent_id));
+        }
 
         if agents.is_empty() {
             warn!(
@@ -2014,6 +2154,169 @@ async fn handle_task_available(
     // 7. Publish metrics (best-effort)
     if let Err(e) = publish_metrics(state).await {
         warn!(error = %e, "failed to publish metrics");
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// v0.11.0: Agent negotiation protocol — decline and context request handlers
+// ---------------------------------------------------------------------------
+
+async fn handle_task_declined(
+    state: &Arc<AppState>,
+    payload: &TaskDeclinedPayload,
+) -> Result<(), BroodlinkError> {
+    let max_declines = state.config.collaboration.max_declines_per_task;
+
+    info!(
+        task_id = %payload.task_id,
+        agent_id = %payload.agent_id,
+        reason = ?payload.reason,
+        suggested_agent = ?payload.suggested_agent,
+        "agent declined task"
+    );
+
+    // 1. Log to task_negotiations table
+    sqlx::query(
+        "INSERT INTO task_negotiations (task_id, agent_id, action, reason, suggested_agent, created_at)
+         VALUES ($1, $2, 'declined', $3, $4, NOW())",
+    )
+    .bind(&payload.task_id)
+    .bind(&payload.agent_id)
+    .bind(&payload.reason)
+    .bind(&payload.suggested_agent)
+    .execute(&state.pg)
+    .await?;
+
+    // 2. Update task_queue: increment decline_count, append to declined_agents
+    let row = sqlx::query(
+        "UPDATE task_queue
+         SET decline_count = decline_count + 1,
+             declined_agents = COALESCE(declined_agents, '[]'::jsonb) || to_jsonb($2::text),
+             assigned_agent = NULL,
+             status = 'pending',
+             updated_at = NOW()
+         WHERE id = $1 AND status IN ('claimed', 'in_progress')
+         RETURNING decline_count",
+    )
+    .bind(&payload.task_id)
+    .bind(&payload.agent_id)
+    .fetch_optional(&state.pg)
+    .await?;
+
+    let decline_count: i32 = match row {
+        Some(r) => r.get("decline_count"),
+        None => {
+            warn!(task_id = %payload.task_id, "task not found or not in claimable state for decline");
+            return Ok(());
+        }
+    };
+
+    // 3. Log service event
+    let _ = sqlx::query(
+        "INSERT INTO service_events (service, event_type, severity, details, created_at)
+         VALUES ('coordinator', 'task_declined', 'info', $1, NOW())",
+    )
+    .bind(serde_json::json!({
+        "task_id": payload.task_id,
+        "agent_id": payload.agent_id,
+        "reason": payload.reason,
+        "suggested_agent": payload.suggested_agent,
+        "decline_count": decline_count,
+    }))
+    .execute(&state.pg)
+    .await;
+
+    // 4. If max declines reached, dead-letter the task
+    if decline_count as u32 >= max_declines {
+        let reason = format!(
+            "task declined {} times (max={}), agents: declined by {}",
+            decline_count, max_declines, payload.agent_id,
+        );
+        warn!(task_id = %payload.task_id, %reason, "dead-lettering over-declined task");
+        publish_dead_letter(state, &payload.task_id, &reason).await?;
+        return Ok(());
+    }
+
+    // 5. Re-publish task_available so it gets re-routed (excluding declined agents)
+    let subject = format!(
+        "{}.{}.coordinator.task_available",
+        state.config.nats.subject_prefix, state.config.broodlink.env,
+    );
+    let nats_payload = serde_json::json!({ "task_id": payload.task_id });
+    if let Ok(bytes) = serde_json::to_vec(&nats_payload) {
+        let _ = state.nats.publish(subject, bytes.into()).await;
+    }
+
+    Ok(())
+}
+
+async fn handle_task_context_request(
+    state: &Arc<AppState>,
+    payload: &TaskContextRequestPayload,
+) -> Result<(), BroodlinkError> {
+    info!(
+        task_id = %payload.task_id,
+        agent_id = %payload.agent_id,
+        questions = ?payload.questions,
+        "agent requested context for task"
+    );
+
+    // 1. Log to task_negotiations table
+    let questions_json = serde_json::to_value(&payload.questions).unwrap_or_default();
+    sqlx::query(
+        "INSERT INTO task_negotiations (task_id, agent_id, action, questions, created_at)
+         VALUES ($1, $2, 'context_requested', $3, NOW())",
+    )
+    .bind(&payload.task_id)
+    .bind(&payload.agent_id)
+    .bind(&questions_json)
+    .execute(&state.pg)
+    .await?;
+
+    // 2. Update task_queue with context request info
+    sqlx::query(
+        "UPDATE task_queue
+         SET status = 'context_requested',
+             context_questions = $2,
+             context_requested_by = $3,
+             context_requested_at = NOW(),
+             updated_at = NOW()
+         WHERE id = $1 AND status IN ('claimed', 'in_progress')",
+    )
+    .bind(&payload.task_id)
+    .bind(&questions_json)
+    .bind(&payload.agent_id)
+    .execute(&state.pg)
+    .await?;
+
+    // 3. Log service event
+    let _ = sqlx::query(
+        "INSERT INTO service_events (service, event_type, severity, details, created_at)
+         VALUES ('coordinator', 'task_context_requested', 'info', $1, NOW())",
+    )
+    .bind(serde_json::json!({
+        "task_id": payload.task_id,
+        "agent_id": payload.agent_id,
+        "questions": payload.questions,
+    }))
+    .execute(&state.pg)
+    .await;
+
+    // 4. Publish questions to the parent/originator agent via NATS
+    //    (the agent that created the task can listen on this subject)
+    let subject = format!(
+        "{}.{}.coordinator.task_context_needed",
+        state.config.nats.subject_prefix, state.config.broodlink.env,
+    );
+    let nats_payload = serde_json::json!({
+        "task_id": payload.task_id,
+        "requesting_agent": payload.agent_id,
+        "questions": payload.questions,
+    });
+    if let Ok(bytes) = serde_json::to_vec(&nats_payload) {
+        let _ = state.nats.publish(subject, bytes.into()).await;
     }
 
     Ok(())
@@ -2390,7 +2693,11 @@ async fn check_scheduled_tasks(state: &AppState) -> Result<u64, BroodlinkError> 
 /// Background loop that detects timed-out tasks and resets them for re-assignment.
 async fn task_timeout_loop(state: Arc<AppState>, mut shutdown_rx: watch::Receiver<bool>) {
     let timeout_minutes = state.config.collaboration.task_claim_timeout_minutes;
-    info!(timeout_minutes, "task timeout detection loop started");
+    let ctx_timeout_minutes = state.config.collaboration.context_request_timeout_minutes;
+    info!(
+        timeout_minutes,
+        ctx_timeout_minutes, "task timeout detection loop started"
+    );
 
     loop {
         if *shutdown_rx.borrow() {
@@ -2403,6 +2710,15 @@ async fn task_timeout_loop(state: Arc<AppState>, mut shutdown_rx: watch::Receive
             }
             Ok(_) => {}
             Err(e) => warn!(error = %e, "task timeout check failed"),
+        }
+
+        // v0.11.0: Check for timed-out context requests
+        match detect_timed_out_context_requests(&state, ctx_timeout_minutes).await {
+            Ok(count) if count > 0 => {
+                info!(count, "reset timed-out context requests to pending");
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "context request timeout check failed"),
         }
 
         tokio::select! {
@@ -2450,6 +2766,55 @@ async fn detect_timed_out_tasks(
         }
 
         info!(task_id = %task_id, "task timed out, reset to pending");
+        count += 1;
+    }
+
+    Ok(count)
+}
+
+/// v0.11.0: Reset tasks stuck in `context_requested` status back to `pending`
+/// after the configured timeout, so they can be re-routed.
+async fn detect_timed_out_context_requests(
+    state: &AppState,
+    timeout_minutes: u32,
+) -> Result<u32, BroodlinkError> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "UPDATE task_queue
+         SET status = 'pending',
+             context_questions = NULL,
+             context_requested_by = NULL,
+             context_requested_at = NULL,
+             updated_at = NOW()
+         WHERE status = 'context_requested'
+         AND context_requested_at IS NOT NULL
+         AND context_requested_at < NOW() - make_interval(mins => $1::int)
+         RETURNING id",
+    )
+    .bind(timeout_minutes as i32)
+    .fetch_all(&state.pg)
+    .await?;
+
+    let mut count = 0u32;
+    for (task_id,) in &rows {
+        let _ = sqlx::query(
+            "INSERT INTO service_events (service, event_type, severity, details, created_at)
+             VALUES ('coordinator', 'context_request_timeout', 'warning', $1, NOW())",
+        )
+        .bind(serde_json::json!({"task_id": task_id}))
+        .execute(&state.pg)
+        .await;
+
+        // Re-publish task_available
+        let subject = format!(
+            "{}.{}.coordinator.task_available",
+            state.config.nats.subject_prefix, state.config.broodlink.env,
+        );
+        let payload = serde_json::json!({"task_id": task_id});
+        if let Ok(bytes) = serde_json::to_vec(&payload) {
+            let _ = state.nats.publish(subject, bytes.into()).await;
+        }
+
+        info!(task_id = %task_id, "context request timed out, reset to pending");
         count += 1;
     }
 
@@ -2603,6 +2968,24 @@ async fn main() {
         }
     });
 
+    // v0.11.0: Spawn negotiation subscription loops
+    let declined_state = Arc::clone(&state);
+    let declined_shutdown = shutdown_rx.clone();
+    let declined_handle = tokio::spawn(async move {
+        if let Err(e) = run_task_declined_subscription(declined_state, declined_shutdown).await {
+            error!(error = %e, "task_declined subscription failed");
+        }
+    });
+
+    let ctx_req_state = Arc::clone(&state);
+    let ctx_req_shutdown = shutdown_rx.clone();
+    let ctx_req_handle = tokio::spawn(async move {
+        if let Err(e) = run_task_context_request_subscription(ctx_req_state, ctx_req_shutdown).await
+        {
+            error!(error = %e, "task_context_request subscription failed");
+        }
+    });
+
     // Spawn the periodic metrics publisher
     let metrics_state = Arc::clone(&state);
     let metrics_shutdown = shutdown_rx.clone();
@@ -2665,6 +3048,12 @@ async fn main() {
         }
         if let Err(e) = timeout_handle.await {
             warn!(error = %e, "task timeout loop panicked");
+        }
+        if let Err(e) = declined_handle.await {
+            warn!(error = %e, "task declined handler panicked");
+        }
+        if let Err(e) = ctx_req_handle.await {
+            warn!(error = %e, "task context request handler panicked");
         }
     })
     .await
@@ -3315,5 +3704,78 @@ output = "out"
         let formula: FormulaFile = serde_json::from_value(registry_def).unwrap();
         assert_eq!(formula.formula.name, "from-registry");
         assert!(!formula.steps.is_empty());
+    }
+
+    // --- v0.11.0: Negotiation protocol tests ---
+
+    #[test]
+    fn test_task_declined_payload_deserialization() {
+        let json = serde_json::json!({
+            "task_id": "t-1",
+            "agent_id": "agent-a",
+            "reason": "I lack capability",
+            "suggested_agent": "agent-b"
+        });
+        let payload: TaskDeclinedPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(payload.task_id, "t-1");
+        assert_eq!(payload.agent_id, "agent-a");
+        assert_eq!(payload.reason.as_deref(), Some("I lack capability"));
+        assert_eq!(payload.suggested_agent.as_deref(), Some("agent-b"));
+    }
+
+    #[test]
+    fn test_task_declined_payload_minimal() {
+        let json = serde_json::json!({
+            "task_id": "t-2",
+            "agent_id": "agent-x"
+        });
+        let payload: TaskDeclinedPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(payload.task_id, "t-2");
+        assert!(payload.reason.is_none());
+        assert!(payload.suggested_agent.is_none());
+    }
+
+    #[test]
+    fn test_task_context_request_payload_deserialization() {
+        let json = serde_json::json!({
+            "task_id": "t-3",
+            "agent_id": "agent-c",
+            "questions": ["What format?", "Which database?"]
+        });
+        let payload: TaskContextRequestPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(payload.task_id, "t-3");
+        assert_eq!(payload.agent_id, "agent-c");
+        assert_eq!(payload.questions.len(), 2);
+        assert_eq!(payload.questions[0], "What format?");
+    }
+
+    #[test]
+    fn test_declined_agents_filter_excludes_declined() {
+        let agents = vec![
+            make_agent("agent-a", "low"),
+            make_agent("agent-b", "low"),
+            make_agent("agent-c", "medium"),
+        ];
+        let declined = vec!["agent-a".to_string(), "agent-c".to_string()];
+        let filtered: Vec<_> = agents
+            .into_iter()
+            .filter(|a| !declined.contains(&a.agent_id))
+            .collect();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].agent_id, "agent-b");
+    }
+
+    #[test]
+    fn test_declined_agents_empty_filter_keeps_all() {
+        let agents = vec![
+            make_agent("agent-a", "low"),
+            make_agent("agent-b", "medium"),
+        ];
+        let declined: Vec<String> = vec![];
+        let filtered: Vec<_> = agents
+            .into_iter()
+            .filter(|a| !declined.contains(&a.agent_id))
+            .collect();
+        assert_eq!(filtered.len(), 2);
     }
 }

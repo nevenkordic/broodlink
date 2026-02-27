@@ -1132,6 +1132,16 @@ static TOOL_REGISTRY: std::sync::LazyLock<Vec<serde_json::Value>> = std::sync::L
             tool_def("read_docx", "Extract text from a Word (.docx) document within allowed directories.", serde_json::json!({
                 "path": p_str("Absolute path to the .docx file"),
             }), &["path"]),
+            // --- Negotiation (v0.11.0) ---
+            tool_def("decline_task", "Decline a claimed task. Optionally suggest another agent.", serde_json::json!({
+                "task_id": p_str("The task ID to decline"),
+                "reason": p_str("Why the agent is declining"),
+                "suggested_agent": p_str("Optional: agent ID better suited for this task"),
+            }), &["task_id"]),
+            tool_def("request_task_context", "Request additional context before working on a claimed task.", serde_json::json!({
+                "task_id": p_str("The task ID to request context for"),
+                "questions": {"type": "array", "items": {"type": "string"}, "description": "List of questions needing answers"},
+            }), &["task_id", "questions"]),
         ]
     },
 );
@@ -1440,6 +1450,8 @@ async fn tool_dispatch(
         "claim_task" => tool_claim_task(&state, agent_id, params).await,
         "complete_task" => tool_complete_task(&state, agent_id, params).await,
         "fail_task" => tool_fail_task(&state, agent_id, params).await,
+        "decline_task" => tool_decline_task(&state, agent_id, params).await,
+        "request_task_context" => tool_request_task_context(&state, agent_id, params).await,
 
         // --- Scheduled Tasks (Postgres) ---
         "schedule_task" => tool_schedule_task(&state, agent_id, params).await,
@@ -2073,6 +2085,105 @@ async fn tool_delete_memory(
     }))
 }
 
+// ---------------------------------------------------------------------------
+// Query expansion — generate variant phrasings before searching
+// ---------------------------------------------------------------------------
+
+/// Remove `<think>...</think>` blocks from model output (for expansion parsing).
+fn strip_think_tags_bridge(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut rest = s;
+    // Handle case where text starts inside a think block (no opening tag before closing tag)
+    if let Some(close_pos) = rest.find("</think>") {
+        let open_before = rest.find("<think>").map(|p| p < close_pos).unwrap_or(false);
+        if !open_before {
+            // Started mid-think — skip everything up to </think>
+            rest = &rest[close_pos + 8..];
+        }
+    }
+    while let Some(start) = rest.find("<think>") {
+        result.push_str(&rest[..start]);
+        rest = &rest[start + 7..];
+        if let Some(end) = rest.find("</think>") {
+            rest = &rest[end + 8..];
+        } else {
+            return result;
+        }
+    }
+    result.push_str(rest);
+    result
+}
+
+/// Generate 2-3 variant phrasings of a search query using a fast LLM.
+/// Returns `vec![original_query]` on any error or when expansion is disabled.
+async fn expand_query(
+    client: &reqwest::Client,
+    ollama_url: &str,
+    model: &str,
+    timeout_secs: u64,
+    query: &str,
+) -> Vec<String> {
+    // Skip expansion for very short queries
+    if query.split_whitespace().count() < 3 {
+        return vec![query.to_string()];
+    }
+
+    let prompt = format!(
+        "Generate 2-3 alternative search phrasings for the following query. \
+         Return one phrasing per line, nothing else. No numbering, no explanation.\n\n\
+         Query: {query}"
+    );
+
+    let url = format!("{ollama_url}/api/generate");
+    let payload = serde_json::json!({
+        "model": model,
+        "prompt": prompt,
+        "stream": false,
+        "options": {
+            "temperature": 0.7,
+            "num_predict": 100,
+        }
+    });
+
+    let resp = match client
+        .post(&url)
+        .json(&payload)
+        .timeout(Duration::from_secs(timeout_secs))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "query expansion request failed");
+            return vec![query.to_string()];
+        }
+    };
+
+    let body: serde_json::Value = match resp.json().await {
+        Ok(b) => b,
+        Err(_) => return vec![query.to_string()],
+    };
+
+    let raw = body.get("response").and_then(|r| r.as_str()).unwrap_or("");
+
+    let cleaned = strip_think_tags_bridge(raw);
+
+    let mut variants: Vec<String> = vec![query.to_string()];
+    for line in cleaned.lines() {
+        let trimmed = line.trim().trim_start_matches(|c: char| {
+            c == '-' || c == '*' || c.is_ascii_digit() || c == '.' || c == ')'
+        });
+        let trimmed = trimmed.trim();
+        if !trimmed.is_empty() && trimmed.len() > 5 && trimmed != query {
+            variants.push(trimmed.to_string());
+        }
+    }
+
+    // Cap at 4 total (original + 3 expansions)
+    variants.truncate(4);
+    variants
+}
+
 async fn tool_semantic_search(
     state: &AppState,
     _agent_id: &str,
@@ -2092,51 +2203,79 @@ async fn tool_semantic_search(
     let agent_filter = param_str_opt(params, "agent_id");
     let date_from = param_str_opt(params, "date_from");
     let date_to = param_str_opt(params, "date_to");
+    let mem_cfg = &state.config.memory_search;
 
-    // Step 1: get embedding from Ollama
-    let ollama_url = format!("{}/api/embeddings", state.config.ollama.url);
-    let embed_body = serde_json::json!({
-        "model": state.config.ollama.embedding_model,
-        "prompt": query,
-    });
-
+    // Step 0: query expansion
     let client = reqwest::Client::new();
-    let embed_resp = client
-        .post(&ollama_url)
-        .json(&embed_body)
-        .timeout(Duration::from_secs(state.config.ollama.timeout_seconds))
-        .send()
+    let queries = if mem_cfg.query_expansion_enabled {
+        expand_query(
+            &client,
+            &state.config.ollama.url,
+            &mem_cfg.query_expansion_model,
+            mem_cfg.query_expansion_timeout_seconds,
+            &query,
+        )
         .await
-        .map_err(|e| {
-            state.ollama_breaker.record_failure();
-            BroodlinkError::Internal(format!("ollama request failed: {e}"))
-        })?;
+    } else {
+        vec![query.to_string()]
+    };
 
-    if !embed_resp.status().is_success() {
+    if queries.len() > 1 {
+        tracing::info!(
+            original = %query,
+            expansions = ?&queries[1..],
+            "query expansion generated {} variants",
+            queries.len()
+        );
+    }
+
+    // Step 1: embed all variants in parallel
+    let ollama_url = format!("{}/api/embeddings", state.config.ollama.url);
+    let embed_futures: Vec<_> = queries
+        .iter()
+        .map(|q| {
+            let client = &client;
+            let ollama_url = &ollama_url;
+            let model = &state.config.ollama.embedding_model;
+            let timeout = state.config.ollama.timeout_seconds;
+            async move {
+                let embed_body = serde_json::json!({
+                    "model": model,
+                    "prompt": q,
+                });
+                let resp = client
+                    .post(ollama_url.as_str())
+                    .json(&embed_body)
+                    .timeout(Duration::from_secs(timeout))
+                    .send()
+                    .await
+                    .ok()?;
+                if !resp.status().is_success() {
+                    return None;
+                }
+                let json: serde_json::Value = resp.json().await.ok()?;
+                json.get("embedding").cloned()
+            }
+        })
+        .collect();
+
+    let embeddings: Vec<Option<serde_json::Value>> = futures::future::join_all(embed_futures).await;
+
+    // Require at least the original query's embedding
+    if embeddings.is_empty() || embeddings[0].is_none() {
         state.ollama_breaker.record_failure();
-        return Err(BroodlinkError::Internal(format!(
-            "ollama returned status {}",
-            embed_resp.status()
-        )));
+        return Err(BroodlinkError::Internal(
+            "failed to embed original query".to_string(),
+        ));
     }
     state.ollama_breaker.record_success();
 
-    let embed_json: serde_json::Value = embed_resp
-        .json()
-        .await
-        .map_err(|e| BroodlinkError::Internal(format!("ollama parse error: {e}")))?;
-
-    let embedding = embed_json
-        .get("embedding")
-        .ok_or_else(|| BroodlinkError::Internal("no embedding in ollama response".to_string()))?;
-
-    // Step 2: query Qdrant
+    // Step 2: search Qdrant with each embedding in parallel
     let qdrant_url = format!(
         "{}/collections/{}/points/search",
         state.config.qdrant.url, state.config.qdrant.collection,
     );
 
-    // Build Qdrant filter conditions
     let mut must_conditions: Vec<serde_json::Value> = Vec::new();
     if let Some(ref aid) = agent_filter {
         must_conditions.push(serde_json::json!({
@@ -2157,46 +2296,86 @@ async fn tool_semantic_search(
         }));
     }
 
-    let mut qdrant_body = serde_json::json!({
-        "vector": {
-            "name": "default",
-            "vector": embedding,
-        },
-        "limit": limit,
-        "with_payload": true,
-    });
-    if !must_conditions.is_empty() {
-        qdrant_body["filter"] = serde_json::json!({"must": must_conditions});
-    }
+    let search_futures: Vec<_> = embeddings
+        .iter()
+        .filter_map(|e| e.as_ref())
+        .map(|embedding| {
+            let client = &client;
+            let qdrant_url = &qdrant_url;
+            let must_conditions = &must_conditions;
+            async move {
+                let mut qdrant_body = serde_json::json!({
+                    "vector": {
+                        "name": "default",
+                        "vector": embedding,
+                    },
+                    "limit": limit,
+                    "with_payload": true,
+                });
+                if !must_conditions.is_empty() {
+                    qdrant_body["filter"] = serde_json::json!({"must": must_conditions.clone()});
+                }
+                let resp = client
+                    .post(qdrant_url.as_str())
+                    .json(&qdrant_body)
+                    .timeout(Duration::from_secs(10))
+                    .send()
+                    .await
+                    .ok()?;
+                if !resp.status().is_success() {
+                    return None;
+                }
+                let json: serde_json::Value = resp.json().await.ok()?;
+                json.get("result").cloned()
+            }
+        })
+        .collect();
 
-    let qdrant_resp = client
-        .post(&qdrant_url)
-        .json(&qdrant_body)
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| {
-            state.qdrant_breaker.record_failure();
-            BroodlinkError::Internal(format!("qdrant request failed: {e}"))
-        })?;
+    let search_results: Vec<Option<serde_json::Value>> =
+        futures::future::join_all(search_futures).await;
 
-    if !qdrant_resp.status().is_success() {
-        state.qdrant_breaker.record_failure();
-        return Err(BroodlinkError::Internal(format!(
-            "qdrant returned status {}",
-            qdrant_resp.status()
-        )));
+    // Step 3: merge results by topic, taking max score per candidate
+    let mut merged: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+
+    for result_opt in &search_results {
+        if let Some(serde_json::Value::Array(results)) = result_opt {
+            for item in results {
+                let topic = item
+                    .get("payload")
+                    .and_then(|p| p.get("topic"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let score = item.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
+
+                let existing_score = merged
+                    .get(&topic)
+                    .and_then(|v| v.get("score"))
+                    .and_then(|s| s.as_f64())
+                    .unwrap_or(0.0);
+
+                if score > existing_score {
+                    merged.insert(topic, item.clone());
+                }
+            }
+        }
     }
     state.qdrant_breaker.record_success();
 
-    let qdrant_json: serde_json::Value = qdrant_resp
-        .json()
-        .await
-        .map_err(|e| BroodlinkError::Internal(format!("qdrant parse error: {e}")))?;
+    // Sort by score descending and take top `limit`
+    let mut sorted: Vec<serde_json::Value> = merged.into_values().collect();
+    sorted.sort_by(|a, b| {
+        let sa = a.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
+        let sb = b.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    sorted.truncate(limit as usize);
 
     Ok(serde_json::json!({
         "query": query,
-        "results": qdrant_json.get("result"),
+        "expanded_queries": queries,
+        "results": sorted,
     }))
 }
 
@@ -2476,34 +2655,116 @@ async fn tool_hybrid_search(
     let rerank =
         param_bool_opt(params, "rerank").unwrap_or(state.config.memory_search.reranker_enabled);
 
-    let lambda = state.config.memory_search.decay_lambda;
-    let max_content_len = state.config.memory_search.max_content_length;
+    let mem_cfg = &state.config.memory_search;
+    let lambda = mem_cfg.decay_lambda;
+    let max_content_len = mem_cfg.max_content_length;
     let fetch_limit = limit * 2; // over-fetch for fusion
 
-    // --- Run BM25 + semantic search in parallel ---
+    // --- Step 0: query expansion ---
+    let client = reqwest::Client::new();
+    let queries = if mem_cfg.query_expansion_enabled {
+        expand_query(
+            &client,
+            &state.config.ollama.url,
+            &mem_cfg.query_expansion_model,
+            mem_cfg.query_expansion_timeout_seconds,
+            query,
+        )
+        .await
+    } else {
+        vec![query.to_string()]
+    };
+
+    if queries.len() > 1 {
+        tracing::info!(
+            original = %query,
+            expansions = ?&queries[1..],
+            "hybrid search query expansion generated {} variants",
+            queries.len()
+        );
+    }
+
+    // --- Run BM25 (all variants) + semantic (all variants) in parallel ---
     let qdrant_available =
         state.qdrant_breaker.check().is_ok() && state.ollama_breaker.check().is_ok();
 
-    let bm25_fut = bm25_search(&state.pg, query, agent_filter, fetch_limit);
+    let bm25_fut = async {
+        let futs: Vec<_> = queries
+            .iter()
+            .map(|q| bm25_search(&state.pg, q.as_str(), agent_filter, fetch_limit))
+            .collect();
+        futures::future::join_all(futs).await
+    };
 
     let semantic_fut = async {
         if !qdrant_available {
-            return Ok(vec![]);
+            return vec![Ok(vec![])];
         }
-        let embedding = get_ollama_embedding(state, query).await?;
-        semantic_search_raw(state, &embedding, fetch_limit).await
+        // Embed all variants in parallel
+        let embed_futs: Vec<_> = queries
+            .iter()
+            .map(|q| get_ollama_embedding(state, q.as_str()))
+            .collect();
+        let embeddings = futures::future::join_all(embed_futs).await;
+        // Search with each successful embedding in parallel
+        let search_futs: Vec<_> = embeddings
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .map(|emb| async move { semantic_search_raw(state, &emb, fetch_limit).await })
+            .collect();
+        futures::future::join_all(search_futs).await
     };
 
-    let (bm25_result, semantic_result) = tokio::join!(bm25_fut, semantic_fut);
+    let (bm25_results, semantic_results) = tokio::join!(bm25_fut, semantic_fut);
 
-    let bm25_rows = bm25_result.unwrap_or_else(|e| {
-        warn!(error = %e, "BM25 search failed, using empty results");
-        vec![]
-    });
-    let semantic_rows = semantic_result.unwrap_or_else(|e| {
-        warn!(error = %e, "semantic search failed, using empty results");
-        vec![]
-    });
+    // Flatten BM25 results, dedup by (agent_id, topic) keeping max score
+    let mut bm25_map: HashMap<(String, String), _> = HashMap::new();
+    for result in bm25_results {
+        for row in result.unwrap_or_else(|e| {
+            warn!(error = %e, "BM25 search variant failed");
+            vec![]
+        }) {
+            let key = (row.1.clone(), row.2.clone());
+            let existing_score = bm25_map
+                .get(&key)
+                .map(
+                    |r: &(
+                        i64,
+                        String,
+                        String,
+                        String,
+                        Option<String>,
+                        f64,
+                        String,
+                        String,
+                    )| r.5,
+                )
+                .unwrap_or(f64::NEG_INFINITY);
+            if row.5 > existing_score {
+                bm25_map.insert(key, row);
+            }
+        }
+    }
+    let bm25_rows: Vec<_> = bm25_map.into_values().collect();
+
+    // Flatten semantic results, dedup by (agent_id, topic) keeping max score
+    let mut sem_map: HashMap<(String, String), _> = HashMap::new();
+    for result in semantic_results {
+        for (topic, aid, score, created_at) in result.unwrap_or_else(|e| {
+            warn!(error = %e, "semantic search variant failed");
+            vec![]
+        }) {
+            let key = (aid.clone(), topic.clone());
+            let existing_score = sem_map
+                .get(&key)
+                .map(|r: &(String, String, f64, String)| r.2)
+                .unwrap_or(f64::NEG_INFINITY);
+            if score > existing_score {
+                sem_map.insert(key, (topic, aid, score, created_at));
+            }
+        }
+    }
+    let semantic_rows: Vec<_> = sem_map.into_values().collect();
 
     let bm25_empty = bm25_rows.is_empty();
     let semantic_empty = semantic_rows.is_empty();
@@ -2716,6 +2977,7 @@ async fn tool_hybrid_search(
     Ok(serde_json::json!({
         "results": results,
         "query": query,
+        "expanded_queries": queries,
         "total": total,
         "method": method,
     }))
@@ -4355,6 +4617,119 @@ async fn tool_fail_task(
     }
 
     Ok(serde_json::json!({ "task_id": task_id, "failed": true }))
+}
+
+// ---------------------------------------------------------------------------
+// v0.11.0: Negotiation tools (Postgres + NATS)
+// ---------------------------------------------------------------------------
+
+async fn tool_decline_task(
+    state: &AppState,
+    agent_id: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let task_id = param_str(params, "task_id")?;
+    let reason = param_str_opt(params, "reason");
+    let suggested_agent = param_str_opt(params, "suggested_agent");
+
+    // Verify the task is assigned to this agent
+    let affected = sqlx::query(
+        "SELECT id FROM task_queue
+         WHERE id = $1 AND assigned_agent = $2 AND status IN ('claimed', 'in_progress')",
+    )
+    .bind(task_id)
+    .bind(agent_id)
+    .fetch_optional(&state.pg)
+    .await?;
+
+    if affected.is_none() {
+        return Err(BroodlinkError::NotFound(format!(
+            "task {task_id} not claimed/in_progress for agent {agent_id}"
+        )));
+    }
+
+    // Publish decline event to coordinator via NATS
+    let subject = format!(
+        "{}.{}.coordinator.task_declined",
+        state.config.nats.subject_prefix, state.config.broodlink.env,
+    );
+    let nats_payload = serde_json::json!({
+        "task_id": task_id,
+        "agent_id": agent_id,
+        "reason": reason,
+        "suggested_agent": suggested_agent,
+    });
+    if let Ok(bytes) = serde_json::to_vec(&nats_payload) {
+        if let Err(e) = state.nats.publish(subject, bytes.into()).await {
+            warn!(error = %e, "failed to publish task_declined event");
+        }
+    }
+
+    Ok(serde_json::json!({
+        "task_id": task_id,
+        "declined": true,
+        "suggested_agent": suggested_agent,
+    }))
+}
+
+async fn tool_request_task_context(
+    state: &AppState,
+    agent_id: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let task_id = param_str(params, "task_id")?;
+    let questions: Vec<String> = params
+        .get("questions")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .ok_or_else(|| BroodlinkError::Validation {
+            field: "questions".to_string(),
+            message: "missing or invalid 'questions' array".to_string(),
+        })?;
+
+    if questions.is_empty() {
+        return Err(BroodlinkError::Validation {
+            field: "questions".to_string(),
+            message: "questions array must not be empty".to_string(),
+        });
+    }
+
+    // Verify the task is assigned to this agent
+    let row = sqlx::query(
+        "SELECT id FROM task_queue
+         WHERE id = $1 AND assigned_agent = $2 AND status IN ('claimed', 'in_progress')",
+    )
+    .bind(task_id)
+    .bind(agent_id)
+    .fetch_optional(&state.pg)
+    .await?;
+
+    if row.is_none() {
+        return Err(BroodlinkError::NotFound(format!(
+            "task {task_id} not claimed/in_progress for agent {agent_id}"
+        )));
+    }
+
+    // Publish context request to coordinator via NATS
+    let subject = format!(
+        "{}.{}.coordinator.task_context_request",
+        state.config.nats.subject_prefix, state.config.broodlink.env,
+    );
+    let nats_payload = serde_json::json!({
+        "task_id": task_id,
+        "agent_id": agent_id,
+        "questions": questions,
+    });
+    if let Ok(bytes) = serde_json::to_vec(&nats_payload) {
+        if let Err(e) = state.nats.publish(subject, bytes.into()).await {
+            warn!(error = %e, "failed to publish task_context_request event");
+        }
+    }
+
+    Ok(serde_json::json!({
+        "task_id": task_id,
+        "context_requested": true,
+        "questions": questions,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -8534,8 +8909,8 @@ mod tests {
         // Must match the number of match arms in tool_dispatch (excluding the _ fallback)
         assert_eq!(
             TOOL_REGISTRY.len(),
-            94,
-            "tool registry should have 94 tools"
+            96,
+            "tool registry should have 96 tools"
         );
     }
 
@@ -9533,5 +9908,61 @@ mod tests {
             !is_readonly_tool("update_formula"),
             "update_formula should NOT be readonly"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_think_tags_bridge tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strip_think_tags_basic() {
+        let input = "hello <think>internal reasoning</think> world";
+        assert_eq!(strip_think_tags_bridge(input), "hello  world");
+    }
+
+    #[test]
+    fn test_strip_think_tags_leading_think() {
+        let input = "<think>reasoning at start</think>actual content";
+        assert_eq!(strip_think_tags_bridge(input), "actual content");
+    }
+
+    #[test]
+    fn test_strip_think_tags_no_tags() {
+        let input = "plain text with no tags";
+        assert_eq!(strip_think_tags_bridge(input), "plain text with no tags");
+    }
+
+    #[test]
+    fn test_strip_think_tags_multiple() {
+        let input = "<think>first</think>A<think>second</think>B";
+        assert_eq!(strip_think_tags_bridge(input), "AB");
+    }
+
+    #[test]
+    fn test_strip_think_tags_unclosed() {
+        let input = "start <think>unclosed tag never ends";
+        assert_eq!(strip_think_tags_bridge(input), "start ");
+    }
+
+    // -----------------------------------------------------------------------
+    // expand_query helpers test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_expand_query_short_query_skips() {
+        // expand_query skips queries with fewer than 3 words
+        // We test the skip logic indirectly: short queries should come back as-is
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(expand_query(
+            &reqwest::Client::new(),
+            "http://localhost:99999", // unreachable, shouldn't be called
+            "test-model",
+            1,
+            "two words",
+        ));
+        assert_eq!(result, vec!["two words".to_string()]);
     }
 }

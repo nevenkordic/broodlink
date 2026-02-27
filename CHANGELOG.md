@@ -5,6 +5,83 @@ All notable changes to Broodlink are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.11.0] - 2026-02-27
+
+### Added
+
+- **Query Expansion**: Memory search calls Ollama to generate 2–3 alternative
+  phrasings before embedding. Each variant runs through semantic/hybrid search
+  in parallel; results are merged by max score. Skips queries < 3 words.
+  Graceful fallback to original query on any error. Configurable model,
+  timeout, and enable flag in `[memory_search]`.
+- **Smart Chunk Boundaries**: Embedding worker splits content at natural
+  boundaries (headings, code fences, table separators, blank lines) instead
+  of raw word counts. Chunks never split mid-code-block. Falls back to
+  word-based splitting when no natural boundaries exist. Overlap preserved
+  across chunks.
+- **Streaming Responses**: Telegram messages stream progressively via
+  `editMessageText` instead of waiting for full LLM completion. Rate-limited
+  to ~1 edit/800ms and 30-token minimum delta. Tool calls pause the stream,
+  show "Using tool: {name}...", then resume. Shared `prepare_chat_context()`
+  eliminates 400 lines of duplication between streaming and non-streaming
+  paths.
+- **Verification Timeout Caveat**: `verify_response()` returns a `VerifyResult`
+  enum (Verified/Corrected/Timeout/Error) instead of `Option<String>`.
+  Timeouts and errors append `"[Unverified: ...]"` caveat to the response
+  instead of silently passing through. All verification calls log structured
+  events to `service_events`.
+- **Verification Analytics Dashboard**: New `/verification/` page with daily
+  verification counts (triggered/verified/corrected/timeout), average
+  duration, and confidence histogram. Two new status-api endpoints:
+  `GET /api/v1/verification/analytics`, `GET /api/v1/verification/confidence`.
+- **Agent Negotiation Protocol**: Agents can decline tasks or request context
+  before committing. `decline_task` re-routes to another agent (up to
+  `max_declines_per_task`, then dead-letter). `request_task_context` pauses
+  the task and publishes questions to the assigning agent. Timed-out context
+  requests auto-reset to pending. New Postgres table `task_negotiations`,
+  new columns on `task_queue` (`decline_count`, `declined_agents`,
+  `context_questions`, `context_requested_by`, `context_requested_at`).
+  Migration 029. Two new NATS subjects. Two new beads-bridge tools
+  (94 → 96).
+- **Multi-Ollama Load Balancing**: `OllamaPool` distributes inference across
+  multiple Ollama instances. Least-loaded healthy instance selected per
+  request. Background health check probes each instance every 30 seconds
+  via `GET /api/tags` (3-failure threshold marks unhealthy, single success
+  recovers). RAII `OllamaPermit` guard tracks active requests. Backward
+  compatible: single `url` field still works, `urls` array enables pool.
+- **Agent Onboarding Web UI**: New `/onboarding/` dashboard page with form
+  to register agents and generate RS256 JWT tokens. Backend validates
+  `agent_id` pattern, creates 1-year JWT, registers in Dolt, saves token
+  file. Copy-to-clipboard button, status badges, XSS-safe rendering.
+  Two new status-api endpoints: `POST /api/v1/agents/onboard`,
+  `GET /api/v1/agents/tokens`.
+- New config fields: `[memory_search].query_expansion_enabled`,
+  `[memory_search].query_expansion_model`,
+  `[memory_search].query_expansion_timeout_seconds`,
+  `[memory_search].smart_chunking`, `[chat].streaming_enabled`,
+  `[chat].streaming_edit_interval_ms`, `[chat].streaming_min_tokens`,
+  `[collaboration].max_declines_per_task`,
+  `[collaboration].context_request_timeout_minutes`,
+  `[ollama].urls` (multi-instance).
+- Migration 029: `task_negotiations` table, negotiation columns on
+  `task_queue`.
+- 7 new regression tests for onboarding (agent_id validation, JWT claims,
+  tilde expansion, payload defaults, token path format).
+- 346 workspace unit tests (up from 271).
+
+### Fixed
+
+- **Onboarding POST broken**: `onboarding.js` used `fetchApi()` (GET-only)
+  for the POST request. Replaced with proper `postApi()` helper matching
+  the control panel pattern.
+- **Onboarding XSS**: Agent IDs and display names were rendered as raw HTML.
+  All user data now goes through `escapeHtml()`.
+- **Missing onboarding CSS**: Alerts, JWT output textarea, form selects, and
+  copy button had no styles. Added themed alert-success/alert-error, form
+  select matching input style, JWT wrap layout, copy button, loading cell.
+- **Backend agent_id validation**: `POST /agents/onboard` now rejects IDs
+  with spaces, special characters, or empty strings (matches HTML pattern).
+
 ## [0.8.0] - 2026-02-26
 
 ### Added
@@ -70,6 +147,44 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-02-27
+
+### Added
+
+- **Proactive Skills** — Three new autonomous capabilities that make Broodlink
+  proactive instead of purely reactive:
+  - **Scheduled Task Promotion**: `scheduled_tasks` table tracks one-shot and
+    recurring tasks. Coordinator polls every 60 seconds, promotes due tasks into
+    `task_queue`, publishes NATS `task_available`, handles one-shot disable and
+    recurring advancement (`next_run_at += recurrence_secs`). Optional formula
+    execution on fire.
+  - **Notification Rules & Incident Detection**: Heartbeat evaluates
+    `notification_rules` each cycle. Condition types: `service_event_error`
+    (error spike in last 15 min), `dlq_spike` (unresolved DLQ count),
+    `budget_low` (agents below token threshold). Cooldown enforcement prevents
+    alert storms. Optional `auto_postmortem` triggers `incident-postmortem`
+    workflow formula automatically.
+  - **Notification Dispatch**: beads-bridge `send_notification` tool inserts into
+    `notification_log` and publishes NATS `notification.send`. a2a-gateway
+    subscribes and delivers to Telegram (via bot API) or Slack (via incoming
+    webhook). Delivery status tracked in `notification_log` (pending/sent/failed).
+  - 6 new beads-bridge tools (84 → 90): `schedule_task`, `list_scheduled_tasks`,
+    `cancel_scheduled_task`, `send_notification`, `create_notification_rule`,
+    `list_notification_rules`.
+  - Migration 028: 3 new Postgres tables (`scheduled_tasks`, `notification_rules`,
+    `notification_log`).
+  - `NotificationsConfig` struct in broodlink-config (`[notifications]` section).
+- **Remember Tool in Chat**: a2a-gateway chat model can call `remember(topic,
+  content)` to store memories during conversation. Tool definitions refactored
+  from single if/else to Vec builder (web_search + remember, gated by config).
+- **`incident-postmortem` formula**: 4-step workflow (gather_evidence →
+  root_cause_analysis → prevention_plan → final_report) in
+  `.beads/formulas/custom/`.
+- 3 new skills registered: `schedule-task` (claude-code), `incident-response`
+  (a2a-gateway), `notification-dispatch` (a2a-gateway).
+
+## [0.9.0] - 2026-02-26
+
 ### Added
 
 - **Bidirectional Formula Sync**: System TOML formulas (`.beads/formulas/`) sync
@@ -105,37 +220,6 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 - `formulas_custom_dir` config field in `[beads]` section (default:
   `.beads/formulas/custom`) with tilde expansion.
 - 12 new unit tests in broodlink-formulas crate (249 → 261 workspace total).
-- **Proactive Skills** — Three new autonomous capabilities that make Broodlink
-  proactive instead of purely reactive:
-  - **Scheduled Task Promotion**: `scheduled_tasks` table tracks one-shot and
-    recurring tasks. Coordinator polls every 60 seconds, promotes due tasks into
-    `task_queue`, publishes NATS `task_available`, handles one-shot disable and
-    recurring advancement (`next_run_at += recurrence_secs`). Optional formula
-    execution on fire.
-  - **Notification Rules & Incident Detection**: Heartbeat evaluates
-    `notification_rules` each cycle. Condition types: `service_event_error`
-    (error spike in last 15 min), `dlq_spike` (unresolved DLQ count),
-    `budget_low` (agents below token threshold). Cooldown enforcement prevents
-    alert storms. Optional `auto_postmortem` triggers `incident-postmortem`
-    workflow formula automatically.
-  - **Notification Dispatch**: beads-bridge `send_notification` tool inserts into
-    `notification_log` and publishes NATS `notification.send`. a2a-gateway
-    subscribes and delivers to Telegram (via bot API) or Slack (via incoming
-    webhook). Delivery status tracked in `notification_log` (pending/sent/failed).
-  - 6 new beads-bridge tools (84 → 90): `schedule_task`, `list_scheduled_tasks`,
-    `cancel_scheduled_task`, `send_notification`, `create_notification_rule`,
-    `list_notification_rules`.
-  - Migration 028: 3 new Postgres tables (`scheduled_tasks`, `notification_rules`,
-    `notification_log`).
-  - `NotificationsConfig` struct in broodlink-config (`[notifications]` section).
-- **Remember Tool in Chat**: a2a-gateway chat model can call `remember(topic,
-  content)` to store memories during conversation. Tool definitions refactored
-  from single if/else to Vec builder (web_search + remember, gated by config).
-- **`incident-postmortem` formula**: 4-step workflow (gather_evidence →
-  root_cause_analysis → prevention_plan → final_report) in
-  `.beads/formulas/custom/`.
-- 3 new skills registered: `schedule-task` (claude-code), `incident-response`
-  (a2a-gateway), `notification-dispatch` (a2a-gateway).
 
 ## [0.7.0] - 2026-02-23
 
@@ -380,6 +464,9 @@ Initial public release.
 - Bootstrap script for one-shot setup.
 - 129 unit tests, E2E test suite, integration test suites.
 
+[0.11.0]: https://github.com/broodlink/broodlink/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/broodlink/broodlink/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/broodlink/broodlink/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/broodlink/broodlink/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/broodlink/broodlink/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/broodlink/broodlink/compare/v0.5.0...v0.6.0

@@ -44,7 +44,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sqlx::mysql::MySqlPoolOptions;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{MySqlPool, PgPool};
+use sqlx::{MySqlPool, PgPool, Row};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -597,6 +597,18 @@ fn build_router(state: Arc<AppState>) -> Router {
         // Service health aggregation
         .route("/services", get(handler_services))
         .route("/services/events", get(handler_service_events))
+        // v0.11.0 verification analytics
+        .route(
+            "/verification/analytics",
+            get(handler_verification_analytics),
+        )
+        .route(
+            "/verification/confidence",
+            get(handler_verification_confidence),
+        )
+        // v0.11.0 agent onboarding
+        .route("/agents/onboard", post(handler_agent_onboard))
+        .route("/agents/tokens", get(handler_agent_tokens))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
@@ -1230,6 +1242,267 @@ async fn handler_service_events(
         .collect();
 
     Ok(ok_response(serde_json::json!({ "events": events })))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/verification/analytics
+// Daily counts of verification events: triggered, verified, corrected, timeout
+// ---------------------------------------------------------------------------
+
+async fn handler_verification_analytics(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let days: i32 = params
+        .get("days")
+        .and_then(|d| d.parse().ok())
+        .unwrap_or(30)
+        .min(90);
+
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT created_at::date::text AS day, event_type, COUNT(*) \
+         FROM service_events \
+         WHERE event_type LIKE 'verification_%' \
+           AND created_at >= NOW() - make_interval(days => $1) \
+         GROUP BY day, event_type \
+         ORDER BY day",
+    )
+    .bind(days)
+    .fetch_all(&state.pg)
+    .await?;
+
+    // Pivot into {date: {verified, corrected, timeout, error, total, avg_duration_ms}}
+    let mut daily: std::collections::BTreeMap<String, serde_json::Value> =
+        std::collections::BTreeMap::new();
+
+    for (day, event_type, count) in &rows {
+        let entry = daily.entry(day.clone()).or_insert_with(|| {
+            serde_json::json!({
+                "date": day,
+                "verified": 0,
+                "corrected": 0,
+                "timeout": 0,
+                "error": 0,
+                "total": 0,
+            })
+        });
+        let key = event_type
+            .strip_prefix("verification_")
+            .unwrap_or(event_type);
+        entry[key] = serde_json::json!(count);
+        let total = entry["total"].as_i64().unwrap_or(0) + count;
+        entry["total"] = serde_json::json!(total);
+    }
+
+    // Fetch average duration per day
+    let duration_rows: Vec<(String, Option<f64>)> = sqlx::query_as(
+        "SELECT created_at::date::text AS day, \
+                AVG((details->>'duration_ms')::float8) AS avg_ms \
+         FROM service_events \
+         WHERE event_type LIKE 'verification_%' \
+           AND details ? 'duration_ms' \
+           AND created_at >= NOW() - make_interval(days => $1) \
+         GROUP BY day ORDER BY day",
+    )
+    .bind(days)
+    .fetch_all(&state.pg)
+    .await?;
+
+    for (day, avg_ms) in duration_rows {
+        if let Some(entry) = daily.get_mut(&day) {
+            entry["avg_duration_ms"] =
+                serde_json::json!((avg_ms.unwrap_or(0.0) * 10.0).round() / 10.0);
+        }
+    }
+
+    let analytics: Vec<serde_json::Value> = daily.into_values().collect();
+
+    Ok(ok_response(serde_json::json!({
+        "days": days,
+        "analytics": analytics,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/verification/confidence
+// Histogram of confidence scores (1-5) from verification events
+// ---------------------------------------------------------------------------
+
+async fn handler_verification_confidence(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let rows: Vec<(i32, i64)> = sqlx::query_as(
+        "SELECT (details->>'confidence')::int AS conf, COUNT(*) \
+         FROM service_events \
+         WHERE event_type LIKE 'verification_%' \
+           AND details ? 'confidence' \
+           AND (details->>'confidence')::int BETWEEN 1 AND 5 \
+         GROUP BY conf ORDER BY conf",
+    )
+    .fetch_all(&state.pg)
+    .await?;
+
+    let histogram: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(conf, count)| {
+            serde_json::json!({
+                "confidence": conf,
+                "count": count,
+            })
+        })
+        .collect();
+
+    Ok(ok_response(serde_json::json!({
+        "histogram": histogram,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// v0.11.0: Agent onboarding via dashboard
+// ---------------------------------------------------------------------------
+
+/// POST /api/v1/agents/onboard — Generate JWT and register agent.
+async fn handler_agent_onboard(
+    State(state): State<Arc<AppState>>,
+    req: Request<axum::body::Body>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned().unwrap();
+    require_role(&ctx, UserRole::Admin)?;
+
+    let body = axum::body::to_bytes(req.into_body(), 10_485_760)
+        .await
+        .map_err(|_| StatusApiError::BadRequest("invalid body".to_string()))?;
+    let payload: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|_| StatusApiError::BadRequest("invalid JSON".to_string()))?;
+
+    let agent_id = payload["agent_id"]
+        .as_str()
+        .ok_or_else(|| StatusApiError::BadRequest("missing agent_id".to_string()))?;
+    if agent_id.is_empty()
+        || !agent_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(StatusApiError::BadRequest(
+            "agent_id must contain only letters, numbers, hyphens, underscores".to_string(),
+        ));
+    }
+    let display_name = payload["display_name"].as_str().unwrap_or(agent_id);
+    let role = payload["role"].as_str().unwrap_or("worker");
+    let cost_tier = payload["cost_tier"].as_str().unwrap_or("medium");
+
+    // Load private key from keys_dir
+    let keys_dir = &state.config.jwt.keys_dir;
+    let expanded_dir = if keys_dir.starts_with('~') {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        keys_dir.replacen('~', &home, 1)
+    } else {
+        keys_dir.clone()
+    };
+    let private_key_path = format!("{expanded_dir}/jwt-private.pem");
+    let private_pem = std::fs::read(&private_key_path).map_err(|e| {
+        StatusApiError::Internal(format!(
+            "failed to read private key at {private_key_path}: {e}"
+        ))
+    })?;
+
+    let encoding_key = jsonwebtoken::EncodingKey::from_rsa_pem(&private_pem)
+        .map_err(|e| StatusApiError::Internal(format!("invalid RSA private key: {e}")))?;
+
+    // Build JWT claims (1 year expiry)
+    let now = chrono::Utc::now();
+    let exp = now + chrono::Duration::days(365);
+    let claims = serde_json::json!({
+        "sub": agent_id,
+        "agent_id": agent_id,
+        "iat": now.timestamp(),
+        "exp": exp.timestamp(),
+    });
+
+    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    let token = jsonwebtoken::encode(&header, &claims, &encoding_key)
+        .map_err(|e| StatusApiError::Internal(format!("JWT encoding failed: {e}")))?;
+
+    // Save token to disk
+    let token_path = format!("{expanded_dir}/jwt-{agent_id}.token");
+    if let Err(e) = std::fs::write(&token_path, &token) {
+        tracing::warn!(error = %e, path = %token_path, "failed to save JWT token file");
+    }
+
+    // Register agent in Dolt via agent_profiles (upsert)
+    let _ = sqlx::query(
+        "INSERT INTO agent_profiles (agent_id, display_name, role, cost_tier, transport, active, max_concurrent, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'api', true, 5, NOW(), NOW())
+         ON DUPLICATE KEY UPDATE display_name = VALUES(display_name), role = VALUES(role),
+           cost_tier = VALUES(cost_tier), updated_at = NOW()",
+    )
+    .bind(agent_id)
+    .bind(display_name)
+    .bind(role)
+    .bind(cost_tier)
+    .execute(&state.dolt)
+    .await
+    .map_err(|e| StatusApiError::Internal(format!("failed to register agent: {e}")))?;
+
+    // Dolt commit
+    let _ = sqlx::query("CALL DOLT_COMMIT('-Am', 'onboard agent via dashboard')")
+        .execute(&state.dolt)
+        .await;
+
+    Ok(ok_response(serde_json::json!({
+        "agent_id": agent_id,
+        "jwt_token": token,
+        "expires_at": exp.to_rfc3339(),
+        "token_path": token_path,
+    })))
+}
+
+/// GET /api/v1/agents/tokens — List agents with JWT token metadata.
+async fn handler_agent_tokens(
+    State(state): State<Arc<AppState>>,
+    req: Request<axum::body::Body>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req.extensions().get::<AuthContext>().cloned().unwrap();
+    require_role(&ctx, UserRole::Operator)?;
+
+    // List agents from Dolt
+    let rows = sqlx::query(
+        "SELECT agent_id, display_name, role, cost_tier, active,
+                CAST(created_at AS CHAR) AS created_at_str
+         FROM agent_profiles ORDER BY agent_id",
+    )
+    .fetch_all(&state.dolt)
+    .await?;
+
+    let keys_dir = &state.config.jwt.keys_dir;
+    let expanded_dir = if keys_dir.starts_with('~') {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        keys_dir.replacen('~', &home, 1)
+    } else {
+        keys_dir.clone()
+    };
+
+    let agents: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let agent_id: String = r.get("agent_id");
+            let token_file = format!("{expanded_dir}/jwt-{agent_id}.token");
+            let has_token = std::path::Path::new(&token_file).exists();
+            serde_json::json!({
+                "agent_id": agent_id,
+                "display_name": r.get::<String, _>("display_name"),
+                "role": r.get::<String, _>("role"),
+                "cost_tier": r.get::<String, _>("cost_tier"),
+                "active": r.get::<bool, _>("active"),
+                "created_at": r.get::<Option<String>, _>("created_at_str"),
+                "has_jwt": has_token,
+            })
+        })
+        .collect();
+
+    Ok(ok_response(serde_json::json!({
+        "agents": agents,
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -4889,5 +5162,118 @@ mod tests {
             msg.contains("viewer"),
             "error should mention current role: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.11.0: Onboarding endpoint regression tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_onboard_payload_valid_agent_id() {
+        let payload = serde_json::json!({
+            "agent_id": "test-agent-1",
+            "display_name": "Test Agent",
+            "role": "worker",
+            "cost_tier": "medium"
+        });
+        let agent_id = payload["agent_id"].as_str();
+        assert_eq!(agent_id, Some("test-agent-1"));
+    }
+
+    #[test]
+    fn test_onboard_payload_missing_agent_id() {
+        let payload = serde_json::json!({
+            "display_name": "Test Agent"
+        });
+        let agent_id = payload["agent_id"].as_str();
+        assert!(agent_id.is_none(), "should detect missing agent_id");
+    }
+
+    #[test]
+    fn test_onboard_payload_defaults() {
+        let payload = serde_json::json!({
+            "agent_id": "minimal-agent"
+        });
+        let role = payload["role"].as_str().unwrap_or("worker");
+        let cost_tier = payload["cost_tier"].as_str().unwrap_or("medium");
+        let display = payload["display_name"]
+            .as_str()
+            .unwrap_or(payload["agent_id"].as_str().unwrap());
+        assert_eq!(role, "worker");
+        assert_eq!(cost_tier, "medium");
+        assert_eq!(
+            display, "minimal-agent",
+            "display_name defaults to agent_id"
+        );
+    }
+
+    #[test]
+    fn test_onboard_jwt_claims_structure() {
+        let now = chrono::Utc::now();
+        let exp = now + chrono::Duration::days(365);
+        let claims = serde_json::json!({
+            "sub": "my-agent",
+            "agent_id": "my-agent",
+            "iat": now.timestamp(),
+            "exp": exp.timestamp(),
+        });
+        assert_eq!(claims["sub"], "my-agent");
+        assert_eq!(claims["agent_id"], "my-agent");
+        assert!(claims["iat"].as_i64().unwrap() > 0);
+        assert!(
+            claims["exp"].as_i64().unwrap() > claims["iat"].as_i64().unwrap(),
+            "expiry must be after issued-at"
+        );
+        let diff = claims["exp"].as_i64().unwrap() - claims["iat"].as_i64().unwrap();
+        // 365 days = 31,536,000 seconds (± 1 day for leap)
+        assert!(
+            diff >= 31_449_600 && diff <= 31_622_400,
+            "JWT should expire ~1 year from now, got {diff}s"
+        );
+    }
+
+    #[test]
+    fn test_onboard_tilde_expansion() {
+        let keys_dir = "~/.broodlink";
+        let expanded = if keys_dir.starts_with('~') {
+            keys_dir.replacen('~', "/Users/test", 1)
+        } else {
+            keys_dir.to_string()
+        };
+        assert_eq!(expanded, "/Users/test/.broodlink");
+        assert!(!expanded.contains('~'), "tilde should be expanded in path");
+    }
+
+    #[test]
+    fn test_onboard_token_path_format() {
+        let expanded_dir = "/Users/test/.broodlink";
+        let agent_id = "my-agent";
+        let token_path = format!("{expanded_dir}/jwt-{agent_id}.token");
+        assert_eq!(token_path, "/Users/test/.broodlink/jwt-my-agent.token");
+        assert!(
+            token_path.ends_with(".token"),
+            "token file should have .token extension"
+        );
+    }
+
+    #[test]
+    fn test_onboard_agent_id_validation_pattern() {
+        // The HTML form uses pattern="[a-zA-Z0-9_-]+"
+        fn is_valid_agent_id(id: &str) -> bool {
+            !id.is_empty()
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        }
+
+        let valid_ids = vec!["agent-1", "my_agent", "Agent42", "a"];
+        let invalid_ids = vec!["", "agent id", "agent@1", "agent/bad", "a b"];
+
+        for id in &valid_ids {
+            assert!(is_valid_agent_id(id), "'{id}' should be valid");
+        }
+        for id in &invalid_ids {
+            assert!(!is_valid_agent_id(id), "'{id}' should be invalid");
+        }
     }
 }

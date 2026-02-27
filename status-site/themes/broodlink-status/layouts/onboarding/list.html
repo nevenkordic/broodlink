@@ -1,0 +1,63 @@
+{{ define "main" }}
+<h2>Agent Onboarding</h2>
+<p class="page-desc">Register new agents and generate JWT tokens from the dashboard.</p>
+
+<div class="card" style="max-width: 600px; margin-bottom: 2rem;">
+  <h3>Onboard New Agent</h3>
+  <form id="onboard-form" aria-label="Onboard a new agent">
+    <div class="form-group">
+      <label for="agent-id">Agent ID <span aria-hidden="true">*</span></label>
+      <input type="text" id="agent-id" placeholder="my-agent" required
+             pattern="[a-zA-Z0-9_-]+"
+             title="Letters, numbers, hyphens, underscores only"
+             autocomplete="off" spellcheck="false">
+    </div>
+    <div class="form-group">
+      <label for="display-name">Display Name</label>
+      <input type="text" id="display-name" placeholder="My Agent" autocomplete="off">
+    </div>
+    <div class="form-group">
+      <label for="agent-role">Role</label>
+      <select id="agent-role">
+        <option value="worker" selected>worker</option>
+        <option value="reviewer">reviewer</option>
+        <option value="orchestrator">orchestrator</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label for="cost-tier">Cost Tier</label>
+      <select id="cost-tier">
+        <option value="low">low</option>
+        <option value="medium" selected>medium</option>
+        <option value="high">high</option>
+      </select>
+    </div>
+    <button type="submit" class="btn btn-primary" id="onboard-btn">Onboard Agent</button>
+  </form>
+  <div id="onboard-result" style="display:none;" aria-live="polite"></div>
+</div>
+
+<h3>Registered Agents</h3>
+<div class="table-wrap">
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th scope="col">Agent ID</th>
+        <th scope="col">Display Name</th>
+        <th scope="col">Role</th>
+        <th scope="col">Cost Tier</th>
+        <th scope="col">Active</th>
+        <th scope="col">JWT</th>
+        <th scope="col">Created</th>
+      </tr>
+    </thead>
+    <tbody id="agents-table-body" aria-live="polite">
+      <tr><td colspan="7" class="loading-cell">Loading agents...</td></tr>
+    </tbody>
+  </table>
+</div>
+{{ end }}
+
+{{ define "scripts" }}
+<script src="/js/onboarding.js"></script>
+{{ end }}

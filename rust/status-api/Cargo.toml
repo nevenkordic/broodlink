@@ -32,6 +32,7 @@ axum-server = { workspace = true }
 bcrypt = "0.15"
 rand = "0.8"
 url = "2"
+jsonwebtoken = { workspace = true }
 
 [lints]
 workspace = true

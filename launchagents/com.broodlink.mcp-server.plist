@@ -13,7 +13,7 @@
         <key>BROODLINK_CONFIG</key>
         <string>__BROOD_DIR__/config.toml</string>
         <key>BROODLINK_STATUS_API_KEY</key>
-        <string>dev-api-key</string>
+        <string>__STATUS_API_KEY__</string>
         <key>PATH</key>
         <string>__HOMEBREW_PREFIX__/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>

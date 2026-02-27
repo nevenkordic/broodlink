@@ -119,11 +119,17 @@ kg_entity_ttl_days = 90                            # 0 = never expire; entities 
 kg_edge_decay_rate = 0.005                         # per-day edge weight reduction (0 = no decay)
 kg_cleanup_interval_hours = 24                     # run cleanup every N hours
 kg_min_mention_count = 3                           # protect entities with >= N mentions from TTL pruning
+smart_chunking = true                              # split at markdown headings, code fences, tables (false = word-based)
+query_expansion_enabled = true                     # generate variant phrasings before searching
+query_expansion_model = "qwen3:1.7b"               # fast model for query expansion
+query_expansion_timeout_seconds = 15               # timeout for expansion LLM call
 
 [collaboration]
-max_sub_tasks              = 10
-workspace_ttl_hours        = 24
-task_claim_timeout_minutes = 30
+max_sub_tasks                    = 10
+workspace_ttl_hours              = 24
+task_claim_timeout_minutes       = 30
+max_declines_per_task            = 3
+context_request_timeout_minutes  = 30
 
 [dlq]
 auto_retry_enabled  = true
@@ -164,6 +170,9 @@ greeting_enabled = true
 greeting_message = "Hello! I'm a Broodlink agent. How can I help?"
 memory_enabled     = true
 memory_max_results = 3
+streaming_enabled = true
+streaming_edit_interval_ms = 800
+streaming_min_tokens = 30
 
 [chat.tools]
 web_search_enabled = true

@@ -191,11 +191,26 @@ fn default_formulas_custom_dir() -> String {
 #[derive(Deserialize, Clone, Debug)]
 pub struct OllamaConfig {
     pub url: String,
+    /// v0.11.0: Multiple Ollama instance URLs for load balancing.
+    /// If empty, falls back to single `url`.
+    #[serde(default)]
+    pub urls: Vec<String>,
     pub embedding_model: String,
     #[serde(default = "default_ollama_timeout")]
     pub timeout_seconds: u64,
     #[serde(default = "default_ollama_num_ctx")]
     pub num_ctx: u32,
+}
+
+impl OllamaConfig {
+    /// Returns the effective list of Ollama URLs (uses `urls` if non-empty, else `[url]`).
+    pub fn effective_urls(&self) -> Vec<String> {
+        if self.urls.is_empty() {
+            vec![self.url.clone()]
+        } else {
+            self.urls.clone()
+        }
+    }
 }
 
 fn default_ollama_num_ctx() -> u32 {
@@ -563,6 +578,16 @@ pub struct MemorySearchConfig {
     pub chunk_max_tokens: usize,
     #[serde(default = "default_chunk_overlap_tokens")]
     pub chunk_overlap_tokens: usize,
+    // v0.11.0: Smart chunking — split at markdown headings, code fences, tables
+    #[serde(default = "default_smart_chunking")]
+    pub smart_chunking: bool,
+    // v0.11.0: Query expansion — generate variant phrasings before searching
+    #[serde(default = "default_query_expansion_enabled")]
+    pub query_expansion_enabled: bool,
+    #[serde(default = "default_query_expansion_model")]
+    pub query_expansion_model: String,
+    #[serde(default = "default_query_expansion_timeout_seconds")]
+    pub query_expansion_timeout_seconds: u64,
 }
 
 impl Default for MemorySearchConfig {
@@ -583,6 +608,10 @@ impl Default for MemorySearchConfig {
             kg_min_mention_count: default_kg_min_mention_count(),
             chunk_max_tokens: default_chunk_max_tokens(),
             chunk_overlap_tokens: default_chunk_overlap_tokens(),
+            smart_chunking: default_smart_chunking(),
+            query_expansion_enabled: default_query_expansion_enabled(),
+            query_expansion_model: default_query_expansion_model(),
+            query_expansion_timeout_seconds: default_query_expansion_timeout_seconds(),
         }
     }
 }
@@ -749,6 +778,10 @@ pub struct CollaborationConfig {
     pub workspace_ttl_hours: u32,
     #[serde(default = "default_task_claim_timeout_minutes")]
     pub task_claim_timeout_minutes: u32,
+    #[serde(default = "default_max_declines_per_task")]
+    pub max_declines_per_task: u32,
+    #[serde(default = "default_context_request_timeout_minutes")]
+    pub context_request_timeout_minutes: u32,
 }
 
 impl Default for CollaborationConfig {
@@ -757,6 +790,8 @@ impl Default for CollaborationConfig {
             max_sub_tasks: default_max_sub_tasks(),
             workspace_ttl_hours: default_workspace_ttl_hours(),
             task_claim_timeout_minutes: default_task_claim_timeout_minutes(),
+            max_declines_per_task: default_max_declines_per_task(),
+            context_request_timeout_minutes: default_context_request_timeout_minutes(),
         }
     }
 }
@@ -770,6 +805,14 @@ fn default_workspace_ttl_hours() -> u32 {
 }
 
 fn default_task_claim_timeout_minutes() -> u32 {
+    30
+}
+
+fn default_max_declines_per_task() -> u32 {
+    3
+}
+
+fn default_context_request_timeout_minutes() -> u32 {
     30
 }
 
@@ -862,6 +905,13 @@ pub struct ChatConfig {
     // v0.10.0: Vision model for image analysis
     #[serde(default)]
     pub chat_vision_model: String,
+    // v0.11.0: Streaming responses — progressive message updates
+    #[serde(default = "default_streaming_enabled")]
+    pub streaming_enabled: bool,
+    #[serde(default = "default_streaming_edit_interval_ms")]
+    pub streaming_edit_interval_ms: u64,
+    #[serde(default = "default_streaming_min_tokens")]
+    pub streaming_min_tokens: usize,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -938,6 +988,9 @@ impl Default for ChatConfig {
             verifier_timeout_seconds: default_verifier_timeout_seconds(),
             chat_code_model: String::new(),
             chat_vision_model: String::new(),
+            streaming_enabled: default_streaming_enabled(),
+            streaming_edit_interval_ms: default_streaming_edit_interval_ms(),
+            streaming_min_tokens: default_streaming_min_tokens(),
         }
     }
 }
@@ -957,6 +1010,16 @@ fn default_max_pdf_pages() -> u32 {
 
 fn default_verifier_timeout_seconds() -> u64 {
     60
+}
+
+fn default_streaming_enabled() -> bool {
+    true
+}
+fn default_streaming_edit_interval_ms() -> u64 {
+    800
+}
+fn default_streaming_min_tokens() -> usize {
+    30
 }
 
 fn default_chat_enabled() -> bool {
@@ -1080,6 +1143,22 @@ fn default_chunk_max_tokens() -> usize {
 
 fn default_chunk_overlap_tokens() -> usize {
     50
+}
+
+fn default_smart_chunking() -> bool {
+    true
+}
+
+fn default_query_expansion_enabled() -> bool {
+    true
+}
+
+fn default_query_expansion_model() -> String {
+    "qwen3:1.7b".to_string()
+}
+
+fn default_query_expansion_timeout_seconds() -> u64 {
+    15
 }
 
 // --- Heartbeat config ---
