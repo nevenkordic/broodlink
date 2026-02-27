@@ -5,8 +5,8 @@
 > License: AGPL-3.0-or-later
 > Generated: 2026-02-27
 
-This document covers changes in v0.12.0. For previous versions, see
-[broodlink-v0_11_0-docs.md](broodlink-v0_11_0-docs.md).
+This document covers changes in v0.12.0. For previous versions, see the
+[CHANGELOG](../CHANGELOG.md).
 
 ---
 
