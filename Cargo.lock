@@ -15,6 +15,7 @@ dependencies = [
  "broodlink-runtime",
  "broodlink-secrets",
  "broodlink-telemetry",
+ "chrono",
  "futures",
  "hmac",
  "reqwest",

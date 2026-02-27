@@ -5,10 +5,29 @@ All notable changes to Broodlink are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 
-## [0.12.0] - 2026-02-27
+## [0.12.0] - 2026-02-28
 
 ### Added
 
+- **Chat Tool Expansion**: Four new chat tools in a2a-gateway —
+  `fetch_webpage` (direct HTTP GET with HTML tag stripping, 8000-char
+  truncation), `schedule_task` (one-time or recurring via bridge),
+  `list_scheduled_tasks`, `cancel_scheduled_task`. All tool descriptions
+  are generic (no site-specific logic) so the model learns monitoring
+  patterns from conversation context.
+- **Auto-Fetch URLs from Conversation History**: When a user asks a
+  follow-up question, the system queries the DB for the last 5 inbound
+  messages containing URLs (beyond the chat context window), fetches the
+  most recent URL, truncates to 3000 chars, and injects the live content
+  into the system prompt. The model reads and answers — no tool calling
+  needed. Eliminates the unreliable tool-selection behaviour of small
+  models.
+- **Retry with Reduced Tool Set**: When qwen3:30b-a3b produces
+  thinking-only output (exhausts `num_predict` on internal reasoning),
+  the system retries with a focused 3-tool set (schedule_task, web_search,
+  fetch_webpage) and a simplified system prompt. Includes recent
+  conversation history (last 6 turns) so the model has context about
+  previously-discussed URLs and topics.
 - **Multi-Modal Chat Attachments**: Slack, Teams, and Telegram file uploads
   are downloaded, stored to `attachments_dir`, and persisted as chat message
   attachments. `PendingAttachment` struct carries metadata (type, MIME,
@@ -52,9 +71,36 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
   accessors (`memory`, `agents`, `tasks`, `kg`), typed models via
   Pydantic, `NATSHelper`, `BaseAgent` framework, ML utilities. Full
   test suite under `agents/tests/`.
+- `chrono` dependency added to a2a-gateway for date/time injection.
 
 ### Fixed
 
+- **Telegram streaming double-send**: When streaming is enabled, the
+  polling loop both edited the placeholder message AND returned the reply
+  for a second `sendMessage` call. Fixed by returning `None` from
+  `process_telegram_update()` when streaming has already delivered via
+  edit.
+- **Byte-boundary panics on emoji/multi-byte content**: Five instances of
+  unsafe `&str[..N]` byte slicing replaced with `floor_char_boundary()` —
+  streaming think-tag filtering, title truncation, content truncation,
+  write preview, and Telegram message guard. Prevents crashes on messages
+  containing emoji or non-ASCII characters.
+- **Think tag leakage in summarization**: Summarization path used
+  `think: false`, causing qwen3 MoE to leak chain-of-thought into
+  content without tags (making `strip_think_tags` useless). Changed to
+  `think: true` with `num_predict: 1024` so thinking separates cleanly
+  into `message.thinking` field.
+- **Verbose chat responses**: Strengthened system prompt from "Keep
+  responses concise" to explicit "1-3 short sentences, no markdown
+  headers, no bullet lists, no disclaimers." Tightened confidence
+  instruction, summarization prompt, URL context instruction, and
+  fallback model prompt to all enforce brevity.
+- **Telegram message length overflow**: Added 4000-char truncation guard
+  with `[truncated]` suffix in `deliver_telegram()` to prevent Telegram
+  API 400 errors on messages exceeding the 4096-char limit.
+- **Date/time awareness**: Injected `chrono::Utc::now()` formatted as
+  AEST into every system prompt and retry prompt so the model knows the
+  current date for scheduling and time-sensitive queries.
 - **Verification analytics query**: Grouped by `details->>'outcome'`
   instead of `event_type` prefix stripping, since a2a-gateway writes
   all verification events as `verification_completed` with the actual

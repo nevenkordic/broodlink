@@ -369,6 +369,7 @@ struct StreamingContext {
 struct ChatContext {
     platform: String,
     chat_id: String,
+    session_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2835,6 +2836,7 @@ async fn webhook_telegram_handler(
                     chat_ctx: Some(ChatContext {
                         platform: "telegram".to_string(),
                         chat_id: chat_id_str.clone(),
+                        session_id: session_id.clone(),
                     }),
                     streaming: streaming_ctx.clone(),
                     ollama_url_override: pool_url.clone(),
@@ -2877,6 +2879,7 @@ async fn webhook_telegram_handler(
                 chat_ctx: Some(ChatContext {
                     platform: "telegram".to_string(),
                     chat_id: chat_id_str.clone(),
+                    session_id: session_id.clone(),
                 }),
                 streaming: None,
                 ollama_url_override: pool_url.clone(),
@@ -3287,6 +3290,7 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
                 chat_ctx: Some(ChatContext {
                     platform: "telegram".to_string(),
                     chat_id: chat_id_str.clone(),
+                    session_id: session_id.clone(),
                 }),
                 streaming: streaming_ctx.clone(),
                 ollama_url_override: pool_url.clone(),
@@ -3301,9 +3305,25 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
                 } => unreachable!(),
             };
 
-            // Final edit if streaming
+            // Final edit if streaming — already delivered via edit, so return None
             if let Some(ref ctx) = streaming_ctx {
                 edit_telegram_message(state, &ctx.chat_id, ctx.message_id, &reply_text).await;
+                // Store outbound reply
+                if let Some(ref sid) = session_id {
+                    let _ = sqlx::query(
+                        "INSERT INTO chat_messages (session_id, direction, content) VALUES ($1, 'outbound', $2)",
+                    )
+                    .bind(sid)
+                    .bind(&reply_text)
+                    .execute(&state.pg)
+                    .await;
+                }
+                // Remove from in-flight
+                {
+                    let mut guard = state.inflight_chats.write().await;
+                    guard.remove(&dedup_key);
+                }
+                return None; // already delivered via streaming edit
             }
 
             reply_text
@@ -3710,7 +3730,11 @@ async fn handle_chat_message(
     };
 
     // Truncate title to 80 chars
-    let title_text = if text.len() > 80 { &text[..80] } else { text };
+    let title_text = if text.len() > 80 {
+        &text[..text.floor_char_boundary(80)]
+    } else {
+        text
+    };
     let title = format!("Chat: {title_text}");
 
     // Create task with chat metadata in dependencies field
@@ -4194,7 +4218,7 @@ async fn extract_telegram_document(
     };
 
     if content.len() > max_chars {
-        let truncated = &content[..max_chars];
+        let truncated = &content[..content.floor_char_boundary(max_chars)];
         Ok(format!(
             "[Attached file: {file_name}]\n{truncated}\n[Truncated]"
         ))
@@ -4729,8 +4753,8 @@ async fn fallback_chat(
     let mut fallback_messages = Vec::with_capacity(messages.len());
     fallback_messages.push(serde_json::json!({
         "role": "system",
-        "content": "You are Broodlink, an AI assistant running in lightweight mode. \
-            Answer the user's question as best you can. Keep responses concise."
+        "content": "You are Broodlink, a knowledgeable AI assistant. You can discuss any topic. \
+            Be extremely brief — 1-3 short sentences max. Just give the answer."
     }));
     // Copy user/assistant messages (skip original system prompt)
     for msg in messages {
@@ -4868,7 +4892,11 @@ async fn request_write_approval(
     let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
 
     let preview = if content.len() > 500 {
-        format!("{}...\n({} bytes total)", &content[..500], content.len())
+        format!(
+            "{}...\n({} bytes total)",
+            &content[..content.floor_char_boundary(500)],
+            content.len()
+        )
     } else {
         content.to_string()
     };
@@ -5321,40 +5349,49 @@ async fn call_ollama_chat(
         .get("a2a-gateway")
         .and_then(|a| a.system_prompt.as_deref())
         .unwrap_or(
-            "You are Broodlink, an AI assistant. Keep responses concise and conversational.",
+            "You are Broodlink, a knowledgeable AI assistant. You can help with any topic — \
+             general knowledge, coding, analysis, creative writing, math, science, and more. \
+             Be extremely brief: 1-3 short sentences, no markdown headers, no bullet lists. \
+             Answer directly like a text message.",
         );
     let mut system_prompt = String::from(base_prompt);
-    if tools_available {
-        system_prompt.push_str(
-            " You have a web_search tool. ONLY use it for: \
-             (1) real-time data like news, weather, stock prices, sports scores, \
-             (2) events or information from the last 30 days, \
-             (3) specific URLs, product availability, or live status checks. \
-             Do NOT search for general knowledge, definitions, programming concepts, \
-             or anything you can answer from training data. \
-             When you do search, cite your sources.",
-        );
-    }
-    if chat_cfg.memory_enabled {
-        system_prompt.push_str(
-            " You have a remember tool. Use it to save important facts the user tells you \
-             about themselves, their preferences, or things they explicitly ask you to remember. \
-             Call remember with a short topic and the content to store. \
-             Do NOT remember every message — only save noteworthy personal facts or explicit requests.",
-        );
-    }
+    // Inject current date/time so the model always knows "today"
+    let now_aest =
+        chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(11 * 3600).unwrap());
+    system_prompt.push_str(&format!(
+        "\n\nCurrent date/time: {} (AEST, UTC+11).",
+        now_aest.format("%Y-%m-%dT%H:%M:%S+11:00, %A %d %B %Y")
+    ));
+
+    system_prompt.push_str(
+        "\n\n## Your tools and how to use them\n\
+         ALWAYS call the right tool — never just describe what you would do.\n\n\
+         - **web_search**: Search the web when you need to FIND something and don't have a URL.\n\
+         - **fetch_webpage**: Fetch a specific URL and return its text. When the user gives you a URL, \
+           ALWAYS use this — never use web_search for a known URL.\n\
+         - **remember**: Save important facts, preferences, or things the user asks you to remember.\n\
+         - **schedule_task**: Schedule a one-time or recurring task. Use when the user wants something \
+           done later, at a specific time, or on a recurring basis.\n\
+         - **list_scheduled_tasks**: Show all active scheduled tasks.\n\
+         - **cancel_scheduled_task**: Cancel a scheduled task by ID.\n\
+         - **read_file / write_file / view_image**: Read, write, or analyze local files.\n\
+         - **read_pdf / read_docx**: Extract text from PDF or Word documents.\n\n\
+         ## Monitoring pattern\n\
+         When the user asks you to check or monitor a URL on a schedule:\n\
+         1. First use fetch_webpage to check the URL NOW so you can confirm it works and show the user what you found.\n\
+         2. Then use schedule_task to set up the recurring check. In the task description, include:\n\
+            - The exact URL to fetch\n\
+            - What specific information to look for in the page content\n\
+            - How to report the findings (e.g. send a summary)\n\
+         3. Parse the user's timing into run_at (ISO 8601 with their timezone) and recurrence_secs.\n\
+            For twice daily, create two separate schedule_task calls.\n\n\
+         If you don't know something and can't look it up, say so honestly.",
+    );
+
     if tool_cfg.file_tools_enabled {
-        system_prompt.push_str(
-            " You have file tools: read_file, write_file, view_image. \
-             You MUST call read_file when the user asks to read, show, or look at a text file. \
-             You MUST call write_file when the user asks to write, save, create, or modify a file — the user will be prompted to approve. \
-             You MUST call view_image to analyze image files on disk (png, jpg, gif, webp). \
-             ALWAYS use the tool instead of just describing what you would do.",
-        );
-        // Tell the model which directories are accessible
         if !tool_cfg.allowed_read_dirs.is_empty() {
             system_prompt.push_str(&format!(
-                " Readable directories: {}.",
+                "\nReadable directories: {}.",
                 tool_cfg.allowed_read_dirs.join(", ")
             ));
         }
@@ -5365,14 +5402,6 @@ async fn call_ollama_chat(
             ));
         }
     }
-    if tool_cfg.pdf_tools_enabled {
-        system_prompt.push_str(
-            " You MUST call read_pdf when the user asks to read a PDF document. \
-             You MUST call read_docx when the user asks to read a Word document (.docx). \
-             ALWAYS use the tool instead of saying you cannot read these formats.",
-        );
-    }
-    system_prompt.push_str(" If you don't know something and can't look it up, say so honestly.");
 
     // Extract the last user message (used for memory search and verification)
     let last_user_msg = history
@@ -5397,10 +5426,94 @@ async fn call_ollama_chat(
         }
     }
 
-    // Append confidence scoring instruction
+    // Auto-fetch URLs so the model has live content without needing tool calls.
+    // Small models struggle with reliable tool calling; pre-fetching removes that dependency.
+    // Scan recent user messages for URLs — look beyond the chat context window
+    // so that a URL mentioned 20 messages ago still gets re-fetched on follow-ups.
+    let mut url_context = String::new();
+    let mut seen_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Query DB for recent inbound messages containing URLs (wider window than chat context)
+    let session_id_for_urls = params
+        .chat_ctx
+        .as_ref()
+        .and_then(|c| c.session_id.as_deref());
+    let url_messages: Vec<(String,)> = if let Some(sid) = session_id_for_urls {
+        sqlx::query_as(
+            "SELECT content FROM chat_messages \
+             WHERE session_id = $1 AND direction = 'inbound' \
+               AND (content LIKE '%http://%' OR content LIKE '%https://%') \
+             ORDER BY created_at DESC LIMIT 5",
+        )
+        .bind(sid)
+        .fetch_all(&state.pg)
+        .await
+        .unwrap_or_default()
+    } else {
+        // Fallback: scan in-memory history
+        history
+            .iter()
+            .rev()
+            .filter(|(role, content)| {
+                role == "user" && (content.contains("http://") || content.contains("https://"))
+            })
+            .take(5)
+            .map(|(_, content)| (content.clone(),))
+            .collect()
+    };
+    for (content,) in &url_messages {
+        for word in content.split_whitespace() {
+            let trimmed = word.trim_matches(|c: char| {
+                !c.is_alphanumeric()
+                    && c != ':'
+                    && c != '/'
+                    && c != '.'
+                    && c != '?'
+                    && c != '='
+                    && c != '&'
+                    && c != '-'
+                    && c != '_'
+            });
+            if (trimmed.starts_with("http://") || trimmed.starts_with("https://"))
+                && trimmed.len() > 10
+                && seen_urls.insert(trimmed.to_string())
+            {
+                // Only fetch 1 URL to keep context small for the model
+                if seen_urls.len() > 1 {
+                    break;
+                }
+                info!(url = %trimmed, "auto-fetching URL from conversation history");
+                match fetch_webpage_text(&state.http_client, trimmed).await {
+                    Ok(text) => {
+                        // Truncate to 3000 chars — keeps context manageable for small models
+                        let truncated = &text[..text.floor_char_boundary(3000.min(text.len()))];
+                        info!(url = %trimmed, len = text.len(), injected = truncated.len(), "auto-fetched URL");
+                        url_context.push_str(&format!(
+                            "\n\n## Fetched content from {trimmed} (live):\n{truncated}"
+                        ));
+                    }
+                    Err(e) => {
+                        warn!(url = %trimmed, error = %e, "auto-fetch failed");
+                        url_context.push_str(&format!("\n\n## Failed to fetch {trimmed}: {e}"));
+                    }
+                }
+            }
+        }
+        if !seen_urls.is_empty() {
+            break;
+        }
+    }
+    if !url_context.is_empty() {
+        system_prompt.push_str(&url_context);
+        system_prompt.push_str(
+            "\n\nThe above content was fetched live just now. \
+             Use it to answer the user's question in 1-2 sentences. \
+             Do NOT say you cannot access URLs. Do NOT repeat or dump the raw content.",
+        );
+    }
+
+    // Append confidence scoring instruction (compact — avoid encouraging verbosity)
     system_prompt.push_str(
-        "\n\nAt the end of every response, include a confidence rating in this exact format: \
-         [CONFIDENCE: N/5] where N is 1=guessing, 2=uncertain, 3=reasonable, 4=confident, 5=certain."
+        "\n\nEnd every response with [CONFIDENCE: N/5] (1=guess,5=certain). Do NOT explain the rating."
     );
 
     // Tool definitions — conditionally include web_search and remember
@@ -5541,6 +5654,103 @@ async fn call_ollama_chat(
             }
         }));
     }
+    // Web fetch tool — always available (direct HTTP)
+    if tools_available {
+        tools_vec.push(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "fetch_webpage",
+                "description": "Fetch the content of a specific URL and return the page text. Use this to check live status pages, read specific websites, or retrieve data from a known URL.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["url"],
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "The full URL to fetch (e.g. https://example.com)"
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    // Scheduling tools — always available (bridge-backed)
+    tools_vec.push(serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "schedule_task",
+            "description": "Schedule a one-time or recurring task to run at a specific date and time. Use this when the user wants something done later or on a regular basis.",
+            "parameters": {
+                "type": "object",
+                "required": ["title", "description", "run_at"],
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Short title for the task"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Detailed description of what should happen when the task runs"
+                    },
+                    "run_at": {
+                        "type": "string",
+                        "description": "When to first run the task, in ISO 8601 format (e.g. 2026-03-01T06:00:00+11:00)"
+                    },
+                    "recurrence_secs": {
+                        "type": "integer",
+                        "description": "If recurring, the interval in seconds between runs (e.g. 86400 for daily). Omit for one-time tasks."
+                    },
+                    "max_runs": {
+                        "type": "integer",
+                        "description": "Maximum number of times to run. Omit for unlimited recurring or leave unset for one-time."
+                    },
+                    "formula_name": {
+                        "type": "string",
+                        "description": "Optional workflow formula to execute when the task runs"
+                    },
+                    "priority": {
+                        "type": "integer",
+                        "description": "Priority level (1=low, 5=critical). Defaults to 3."
+                    }
+                }
+            }
+        }
+    }));
+    tools_vec.push(serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "list_scheduled_tasks",
+            "description": "List all currently scheduled tasks, including their next run time and status.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "description": "Filter by status: 'active', 'paused', or 'completed'. Omit for all."
+                    }
+                }
+            }
+        }
+    }));
+    tools_vec.push(serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "cancel_scheduled_task",
+            "description": "Cancel a scheduled task by its ID so it will no longer run.",
+            "parameters": {
+                "type": "object",
+                "required": ["task_id"],
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "The ID of the scheduled task to cancel"
+                    }
+                }
+            }
+        }
+    }));
+
     let tools_def = if tools_vec.is_empty() {
         None
     } else {
@@ -5714,7 +5924,7 @@ async fn call_ollama_chat(
         let use_think = !is_vision;
         // Tool calls need more output budget: thinking tokens eat into num_predict,
         // and the tool-call JSON itself can be 50-100+ tokens.
-        let predict_limit = if include_tools { 2048 } else { 512 };
+        let predict_limit = if include_tools { 4096 } else { 512 };
         let mut payload = serde_json::json!({
             "model": model,
             "messages": messages,
@@ -6157,6 +6367,161 @@ async fn call_ollama_chat(
                                 }
                             }
                         }
+                        "fetch_webpage" => {
+                            let parsed = args_raw
+                                .and_then(|a| {
+                                    if let Some(s) = a.as_str() {
+                                        serde_json::from_str::<serde_json::Value>(s).ok()
+                                    } else {
+                                        Some(a.clone())
+                                    }
+                                })
+                                .unwrap_or_default();
+                            let url_str = parsed
+                                .get("url")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+
+                            if url_str.is_empty() {
+                                "Error: url is required.".to_string()
+                            } else if !url_str.starts_with("http://")
+                                && !url_str.starts_with("https://")
+                            {
+                                "Error: url must start with http:// or https://".to_string()
+                            } else {
+                                match fetch_webpage_text(&state.http_client, &url_str).await {
+                                    Ok(text) => {
+                                        info!(url = %url_str, len = text.len(), "fetched webpage");
+                                        text
+                                    }
+                                    Err(e) => {
+                                        warn!(url = %url_str, error = %e, "fetch_webpage failed");
+                                        format!("Failed to fetch {url_str}: {e}")
+                                    }
+                                }
+                            }
+                        }
+                        "schedule_task" => {
+                            let parsed = args_raw
+                                .and_then(|a| {
+                                    if let Some(s) = a.as_str() {
+                                        serde_json::from_str::<serde_json::Value>(s).ok()
+                                    } else {
+                                        Some(a.clone())
+                                    }
+                                })
+                                .unwrap_or_default();
+
+                            let title = parsed
+                                .get("title")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let desc = parsed
+                                .get("description")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let run_at = parsed
+                                .get("run_at")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+
+                            if title.is_empty() || run_at.is_empty() {
+                                "Error: title and run_at are required.".to_string()
+                            } else {
+                                let mut bridge_params = serde_json::json!({
+                                    "title": title,
+                                    "description": desc,
+                                    "run_at": run_at,
+                                });
+                                if let Some(v) = parsed.get("recurrence_secs") {
+                                    bridge_params["recurrence_secs"] = v.clone();
+                                }
+                                if let Some(v) = parsed.get("max_runs") {
+                                    bridge_params["max_runs"] = v.clone();
+                                }
+                                if let Some(v) = parsed.get("formula_name") {
+                                    bridge_params["formula_name"] = v.clone();
+                                }
+                                if let Some(v) = parsed.get("priority") {
+                                    bridge_params["priority"] = v.clone();
+                                }
+                                match bridge_call(state, "schedule_task", bridge_params).await {
+                                    Ok(resp) => {
+                                        info!(title = %title, "scheduled task via chat");
+                                        format!("Task scheduled: {title}. {}", resp)
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "schedule_task failed");
+                                        format!("Failed to schedule task: {e}")
+                                    }
+                                }
+                            }
+                        }
+                        "list_scheduled_tasks" => {
+                            let parsed = args_raw
+                                .and_then(|a| {
+                                    if let Some(s) = a.as_str() {
+                                        serde_json::from_str::<serde_json::Value>(s).ok()
+                                    } else {
+                                        Some(a.clone())
+                                    }
+                                })
+                                .unwrap_or_default();
+
+                            let mut bridge_params = serde_json::json!({});
+                            if let Some(status) = parsed.get("status").and_then(|v| v.as_str()) {
+                                bridge_params["status"] = serde_json::json!(status);
+                            }
+                            match bridge_call(state, "list_scheduled_tasks", bridge_params).await {
+                                Ok(resp) => serde_json::to_string_pretty(&resp)
+                                    .unwrap_or_else(|_| resp.to_string()),
+                                Err(e) => {
+                                    warn!(error = %e, "list_scheduled_tasks failed");
+                                    format!("Failed to list scheduled tasks: {e}")
+                                }
+                            }
+                        }
+                        "cancel_scheduled_task" => {
+                            let parsed = args_raw
+                                .and_then(|a| {
+                                    if let Some(s) = a.as_str() {
+                                        serde_json::from_str::<serde_json::Value>(s).ok()
+                                    } else {
+                                        Some(a.clone())
+                                    }
+                                })
+                                .unwrap_or_default();
+                            let task_id = parsed
+                                .get("task_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+
+                            if task_id.is_empty() {
+                                "Error: task_id is required.".to_string()
+                            } else {
+                                match bridge_call(
+                                    state,
+                                    "cancel_scheduled_task",
+                                    serde_json::json!({ "task_id": task_id }),
+                                )
+                                .await
+                                {
+                                    Ok(_) => {
+                                        info!(task_id = %task_id, "cancelled scheduled task via chat");
+                                        format!("Scheduled task {task_id} cancelled.")
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "cancel_scheduled_task failed");
+                                        format!("Failed to cancel task: {e}")
+                                    }
+                                }
+                            }
+                        }
                         _ => format!("Unknown tool: {name}"),
                     };
 
@@ -6182,6 +6547,292 @@ async fn call_ollama_chat(
 
         let final_text = strip_think_tags(content);
         if final_text.is_empty() {
+            let thinking = msg.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
+            warn!(
+                round = round,
+                thinking_len = thinking.len(),
+                "empty content after stripping think tags"
+            );
+
+            // If the model produced thinking but no content, retry with ONLY
+            // the scheduling tools and a simplified prompt — the full tool list
+            // overwhelms qwen3 MoE, causing it to think without acting.
+            if !thinking.is_empty() && round < max_rounds {
+                info!("retrying with reduced tool set (schedule only)");
+                let schedule_tools = serde_json::json!([
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "schedule_task",
+                            "description": "Schedule a task. CALL THIS NOW.",
+                            "parameters": {
+                                "type": "object",
+                                "required": ["title", "description", "run_at"],
+                                "properties": {
+                                    "title": { "type": "string", "description": "Short title" },
+                                    "description": { "type": "string", "description": "What to do when task runs" },
+                                    "run_at": { "type": "string", "description": "ISO 8601 datetime" },
+                                    "recurrence_secs": { "type": "integer", "description": "Repeat interval in seconds" },
+                                    "max_runs": { "type": "integer", "description": "Max repetitions" }
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "web_search",
+                            "description": "Search the web for information.",
+                            "parameters": {
+                                "type": "object",
+                                "required": ["query"],
+                                "properties": {
+                                    "query": { "type": "string", "description": "Search query" }
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "fetch_webpage",
+                            "description": "Fetch the content of a specific URL and return the page text. Use this to check live status pages.",
+                            "parameters": {
+                                "type": "object",
+                                "required": ["url"],
+                                "properties": {
+                                    "url": { "type": "string", "description": "The full URL to fetch" }
+                                }
+                            }
+                        }
+                    }
+                ]);
+                // Rebuild messages with a focused system prompt
+                let now_melb = chrono::Utc::now()
+                    .with_timezone(&chrono::FixedOffset::east_opt(11 * 3600).unwrap());
+                let retry_system = format!(
+                    "You are a helpful assistant. You MUST use the tools provided to fulfill the user's request. \
+                     Current date/time: {} (AEST, UTC+11). Use this timezone for all scheduling.\n\n\
+                     Tool guidance:\n\
+                     - If the user wants something checked on a schedule: call schedule_task. \
+                       In the description, include the exact URL to fetch and what to look for.\n\
+                     - If the user gives a URL to check NOW: call fetch_webpage with that URL.\n\
+                     - If there are multiple times per day, create separate schedule_task calls for each.\n\
+                     - For daily recurrence use recurrence_secs=86400. Set run_at to the next occurrence.\n\n\
+                     ALWAYS call the tool. Respond briefly confirming what you did.",
+                    now_melb.format("%Y-%m-%dT%H:%M:%S+11:00 (%A %d %B %Y)")
+                );
+                let mut retry_msgs = vec![serde_json::json!({
+                    "role": "system",
+                    "content": retry_system,
+                })];
+                // Include recent conversation history (last 6 user/assistant turns)
+                // so the model has context about URLs/topics discussed earlier.
+                let non_system: Vec<&serde_json::Value> = messages
+                    .iter()
+                    .filter(|m| m.get("role").and_then(|r| r.as_str()) != Some("system"))
+                    .collect();
+                let recent = if non_system.len() > 6 {
+                    &non_system[non_system.len() - 6..]
+                } else {
+                    &non_system[..]
+                };
+                for msg in recent {
+                    retry_msgs.push((*msg).clone());
+                }
+                let retry_payload = serde_json::json!({
+                    "model": model,
+                    "messages": retry_msgs,
+                    "stream": false,
+                    "think": true,
+                    "tools": schedule_tools,
+                    "options": {
+                        "temperature": 0.3,
+                        "num_predict": 4096,
+                        "num_ctx": state.config.ollama.num_ctx,
+                    }
+                });
+                if let Ok(retry_body) =
+                    send_ollama_request(&state.ollama_client, &url, &retry_payload, timeout_secs)
+                        .await
+                {
+                    let retry_msg = retry_body.get("message");
+                    // Check for tool calls in retry
+                    if let Some(tc) = retry_msg
+                        .and_then(|m| m.get("tool_calls"))
+                        .and_then(|t| t.as_array())
+                    {
+                        if !tc.is_empty() {
+                            let mut results = Vec::new();
+                            for call in tc {
+                                let fn_obj = call.get("function");
+                                let name = fn_obj
+                                    .and_then(|f| f.get("name"))
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or("");
+                                let args_raw = fn_obj.and_then(|f| f.get("arguments"));
+                                info!(tool = name, "executing tool call from retry");
+                                let parsed = args_raw
+                                    .and_then(|a| {
+                                        if let Some(s) = a.as_str() {
+                                            serde_json::from_str::<serde_json::Value>(s).ok()
+                                        } else {
+                                            Some(a.clone())
+                                        }
+                                    })
+                                    .unwrap_or_default();
+                                if name == "schedule_task" {
+                                    let title = parsed
+                                        .get("title")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("Scheduled task")
+                                        .to_string();
+                                    let desc = parsed
+                                        .get("description")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let run_at = parsed
+                                        .get("run_at")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    if !run_at.is_empty() {
+                                        let mut bp = serde_json::json!({
+                                            "title": title,
+                                            "description": desc,
+                                            "run_at": run_at,
+                                        });
+                                        if let Some(v) = parsed.get("recurrence_secs") {
+                                            bp["recurrence_secs"] = v.clone();
+                                        }
+                                        if let Some(v) = parsed.get("max_runs") {
+                                            bp["max_runs"] = v.clone();
+                                        }
+                                        match bridge_call(state, "schedule_task", bp).await {
+                                            Ok(_) => {
+                                                info!(title = %title, "scheduled task via retry");
+                                                results.push(format!(
+                                                    "Scheduled: {title} (first run: {run_at})"
+                                                ));
+                                            }
+                                            Err(e) => {
+                                                warn!(error = %e, "schedule_task failed in retry");
+                                                results.push(format!(
+                                                    "Failed to schedule {title}: {e}"
+                                                ));
+                                            }
+                                        }
+                                    }
+                                } else if name == "web_search" {
+                                    let query = parsed
+                                        .get("query")
+                                        .and_then(|q| q.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    if let Some(ref key) = brave_key {
+                                        let r = execute_brave_search(
+                                            &state.http_client,
+                                            key,
+                                            &query,
+                                            tool_cfg.search_result_count,
+                                        )
+                                        .await;
+                                        results.push(r);
+                                    }
+                                } else if name == "fetch_webpage" {
+                                    let fetch_url = parsed
+                                        .get("url")
+                                        .and_then(|u| u.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    if !fetch_url.is_empty() {
+                                        match fetch_webpage_text(&state.http_client, &fetch_url)
+                                            .await
+                                        {
+                                            Ok(text) => {
+                                                info!(url = %fetch_url, len = text.len(), "fetched webpage from retry");
+                                                results.push(text);
+                                            }
+                                            Err(e) => results
+                                                .push(format!("Failed to fetch {fetch_url}: {e}")),
+                                        }
+                                    }
+                                }
+                            }
+                            if !results.is_empty() {
+                                // Schedule confirmations can be returned directly
+                                let has_fetched_content = results.iter().any(|r| r.len() > 500);
+                                if !has_fetched_content {
+                                    return results.join("\n\n");
+                                }
+                                // Fetched content needs summarization — ask model to interpret
+                                let tool_output = results.join("\n\n---\n\n");
+                                let summarize_msgs = vec![
+                                    serde_json::json!({
+                                        "role": "system",
+                                        "content": "Answer the user's question in 1-2 sentences using the tool results below. \
+                                                     No headers, no bullet points, no disclaimers. Just the answer.",
+                                    }),
+                                    serde_json::json!({
+                                        "role": "user",
+                                        "content": format!(
+                                            "User asked: {}\n\nTool results:\n{}",
+                                            last_user_msg.unwrap_or(""),
+                                            &tool_output[..tool_output.floor_char_boundary(6000.min(tool_output.len()))]
+                                        ),
+                                    }),
+                                ];
+                                let summarize_payload = serde_json::json!({
+                                    "model": model,
+                                    "messages": summarize_msgs,
+                                    "stream": false,
+                                    "think": true,
+                                    "options": {
+                                        "temperature": 0.3,
+                                        "num_predict": 1024,
+                                        "num_ctx": state.config.ollama.num_ctx,
+                                    }
+                                });
+                                if let Ok(sum_body) = send_ollama_request(
+                                    &state.ollama_client,
+                                    &url,
+                                    &summarize_payload,
+                                    timeout_secs,
+                                )
+                                .await
+                                {
+                                    if let Some(summary) = sum_body
+                                        .get("message")
+                                        .and_then(|m| m.get("content"))
+                                        .and_then(|c| c.as_str())
+                                    {
+                                        let clean = strip_think_tags(summary);
+                                        if !clean.is_empty() {
+                                            return strip_confidence_tag(&clean);
+                                        }
+                                    }
+                                }
+                                // Fallback: truncate raw results
+                                let truncated = &tool_output[..tool_output
+                                    .floor_char_boundary(3500.min(tool_output.len()))];
+                                return truncated.to_string();
+                            }
+                        }
+                    }
+                    // No tool calls — use content
+                    if let Some(retry_content) = retry_msg
+                        .and_then(|m| m.get("content"))
+                        .and_then(|c| c.as_str())
+                    {
+                        let retry_text = strip_think_tags(retry_content);
+                        if !retry_text.is_empty() {
+                            return strip_confidence_tag(&retry_text);
+                        }
+                    }
+                }
+            }
+
             return "I wasn't able to generate a response. Please try again.".to_string();
         }
 
@@ -6315,6 +6966,73 @@ fn strip_think_tags(s: &str) -> String {
 // ---------------------------------------------------------------------------
 // Tool executors
 // ---------------------------------------------------------------------------
+
+/// Fetch a webpage and return its text content (HTML tags stripped).
+async fn fetch_webpage_text(http_client: &reqwest::Client, url: &str) -> Result<String, String> {
+    let resp = http_client
+        .get(url)
+        .header("User-Agent", "Mozilla/5.0 (compatible; Broodlink/1.0)")
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("failed to read body: {e}"))?;
+
+    // Strip HTML tags to extract text
+    let mut text = String::with_capacity(body.len() / 2);
+    let mut in_tag = false;
+    let mut in_script = false;
+    let mut in_style = false;
+    let lower = body.to_lowercase();
+    let chars: Vec<char> = body.chars().collect();
+    let lower_chars: Vec<char> = lower.chars().collect();
+
+    let mut i = 0;
+    while i < chars.len() {
+        if !in_tag && chars[i] == '<' {
+            in_tag = true;
+            // Check for <script> or <style>
+            let rest: String = lower_chars[i..].iter().take(10).collect();
+            if rest.starts_with("<script") {
+                in_script = true;
+            } else if rest.starts_with("<style") {
+                in_style = true;
+            } else if rest.starts_with("</script") {
+                in_script = false;
+            } else if rest.starts_with("</style") {
+                in_style = false;
+            }
+        } else if in_tag && chars[i] == '>' {
+            in_tag = false;
+        } else if !in_tag && !in_script && !in_style {
+            text.push(chars[i]);
+        }
+        i += 1;
+    }
+
+    // Collapse whitespace and trim
+    let collapsed: String = text.split_whitespace().collect::<Vec<&str>>().join(" ");
+
+    // Truncate to ~8000 chars to avoid overwhelming the model
+    let max_len = 8000;
+    if collapsed.len() > max_len {
+        Ok(format!(
+            "{}... [truncated, {} chars total]",
+            &collapsed[..collapsed.floor_char_boundary(max_len)],
+            collapsed.len()
+        ))
+    } else {
+        Ok(collapsed)
+    }
+}
 
 /// Execute a Brave Web Search and return formatted results.
 async fn execute_brave_search(
@@ -6544,9 +7262,16 @@ async fn deliver_telegram(
         return Err("no telegram_bot_token configured".to_string());
     }
     let url = format!("https://api.telegram.org/bot{token}/sendMessage");
+    // Telegram has a 4096 char limit per message
+    let safe_text = if text.len() > 4000 {
+        let boundary = text.floor_char_boundary(4000);
+        format!("{}\n\n[truncated]", &text[..boundary])
+    } else {
+        text.to_string()
+    };
     let mut payload = serde_json::json!({
         "chat_id": chat_id,
-        "text": text,
+        "text": safe_text,
     });
     if let Some(tid) = thread_id {
         payload["message_thread_id"] = serde_json::Value::String(tid.to_string());
@@ -6649,7 +7374,8 @@ fn filter_think_streaming(token: &str, in_think: &mut bool, think_buffer: &mut S
             } else {
                 // Might have partial </think> at the end — buffer last 8 chars
                 if rest.len() > 8 {
-                    rest = &rest[rest.len() - 8..];
+                    let boundary = rest.floor_char_boundary(rest.len() - 8);
+                    rest = &rest[boundary..];
                 }
                 *think_buffer = rest.to_string();
                 return output;
@@ -6661,7 +7387,7 @@ fn filter_think_streaming(token: &str, in_think: &mut bool, think_buffer: &mut S
         } else {
             // No <think> found — might have a partial tag at end
             if rest.len() > 7 {
-                let safe = rest.len() - 7;
+                let safe = rest.floor_char_boundary(rest.len() - 7);
                 output.push_str(&rest[..safe]);
                 *think_buffer = rest[safe..].to_string();
             } else {

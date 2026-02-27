@@ -13,15 +13,16 @@ This document covers changes in v0.12.0. For previous versions, see the
 ## Table of Contents
 
 1. [Overview](#1-overview)
-2. [Multi-Modal Chat Attachments](#2-multi-modal-chat-attachments)
-3. [Python SDK Overhaul](#3-python-sdk-overhaul)
-4. [Dashboard Redesign](#4-dashboard-redesign)
-5. [Verification Page Enhancements](#5-verification-page-enhancements)
-6. [Attachment Storage Module](#6-attachment-storage-module)
-7. [Migration 030](#7-migration-030)
-8. [Config Reference](#8-config-reference)
-9. [Bug Fixes](#9-bug-fixes)
-10. [Test Coverage](#10-test-coverage)
+2. [Chat Tools & Intelligent Fetching](#2-chat-tools--intelligent-fetching)
+3. [Multi-Modal Chat Attachments](#3-multi-modal-chat-attachments)
+4. [Python SDK Overhaul](#4-python-sdk-overhaul)
+5. [Dashboard Redesign](#5-dashboard-redesign)
+6. [Verification Page Enhancements](#6-verification-page-enhancements)
+7. [Attachment Storage Module](#7-attachment-storage-module)
+8. [Migration 030](#8-migration-030)
+9. [Config Reference](#9-config-reference)
+10. [Bug Fixes](#10-bug-fixes)
+11. [Test Coverage](#11-test-coverage)
 
 ---
 
@@ -36,6 +37,7 @@ the entire dashboard for structural consistency.
 | Metric | v0.11.0 | v0.12.0 |
 |--------|---------|---------|
 | beads-bridge tools | 96 | 96 |
+| a2a-gateway chat tools | 6 | 10 |
 | Unit tests | 346 | 346+ |
 | Dashboard pages | 16 | 16 |
 | SQL migrations | 29 | 30 |
@@ -44,7 +46,85 @@ the entire dashboard for structural consistency.
 
 ---
 
-## 2. Multi-Modal Chat Attachments
+## 2. Chat Tools & Intelligent Fetching
+
+**Problem:** The chat gateway only had 6 tools (web_search, remember, read_file,
+write_file, read_pdf, read_docx). Users couldn't schedule tasks, fetch specific
+URLs, or get live data reliably — small models (qwen3:30b-a3b) often picked
+`web_search` instead of fetching a known URL, and URLs from earlier in the
+conversation were lost beyond the 10-message context window.
+
+### New Chat Tools
+
+Four new tools bring the total to 10:
+
+| Tool | Purpose |
+|------|---------|
+| `fetch_webpage` | HTTP GET a specific URL, strip HTML tags, return first 8000 chars of text. Used when user provides or has previously shared a URL. |
+| `schedule_task` | Create a one-time or recurring task via beads-bridge. Supports cron-like recurrence. |
+| `list_scheduled_tasks` | Show all active scheduled tasks for the current agent. |
+| `cancel_scheduled_task` | Cancel a scheduled task by ID. |
+
+All tool descriptions are generic (no site-specific logic) so the model learns
+monitoring patterns from conversation context rather than hardcoded URLs.
+
+### Auto-Fetch from Conversation History
+
+When a user asks a follow-up question without providing a URL, the system
+queries the database for recent inbound messages containing URLs — beyond the
+chat context window limit:
+
+```sql
+SELECT content FROM chat_messages
+WHERE session_id = $1 AND direction = 'inbound'
+  AND (content LIKE '%http://%' OR content LIKE '%https://%')
+ORDER BY created_at DESC LIMIT 5
+```
+
+The most recent URL is fetched via HTTP, truncated to 3000 chars, and injected
+into the system prompt. This eliminates the unreliable tool-selection behaviour
+of small models — the content is already present when the model generates its
+response, no tool calling needed.
+
+Falls back to scanning in-memory conversation history when no session ID is
+available.
+
+### Retry with Reduced Tool Set
+
+When qwen3:30b-a3b exhausts its `num_predict` budget on internal reasoning
+(producing thinking tokens but zero content), the system automatically retries
+with:
+
+- A focused 3-tool set: `schedule_task`, `web_search`, `fetch_webpage`
+- A simplified system prompt
+- Recent conversation history (last 6 user/assistant turns) for context
+
+This prevents the model from getting stuck in reasoning loops with 10+ tools.
+
+### Concise Response Enforcement
+
+System prompts across all paths (base, confidence, summarization, URL context,
+fallback) enforce brevity:
+
+- Base: "1-3 short sentences, no markdown headers, no bullet lists"
+- Summarization: "Answer in 1-2 sentences. No headers, no bullet points"
+- URL context: "Use it to answer in 1-2 sentences. Do NOT dump raw content"
+
+### Date/Time Awareness
+
+Every system prompt now includes the current date/time (AEST, UTC+11) via
+`chrono::Utc::now()`, enabling accurate scheduling and time-sensitive queries.
+
+### Files
+
+| File | Changes |
+|------|---------|
+| `rust/a2a-gateway/src/main.rs` | 4 new tool definitions, auto-fetch DB query, retry logic, prompt tightening, `ChatContext.session_id` |
+| `rust/a2a-gateway/Cargo.toml` | Added `chrono` dependency |
+
+---
+
+## 3. Multi-Modal Chat Attachments
 
 **Problem:** Chat messages are text-only. Users sending images, documents,
 or voice notes via Slack/Teams/Telegram have their files ignored.
@@ -146,7 +226,7 @@ returns 404.
 
 ---
 
-## 3. Python SDK Overhaul
+## 4. Python SDK Overhaul
 
 **Problem:** The Python package was a thin argparse wrapper with no typed
 client library. Users had to make raw HTTP calls to beads-bridge.
@@ -266,7 +346,7 @@ All API responses are deserialized into typed models:
 
 ---
 
-## 4. Dashboard Redesign
+## 5. Dashboard Redesign
 
 **Problem:** Dashboard pages used inconsistent HTML structure. Many tables
 lacked `.table-container` wrappers, metric cards used non-existent CSS
@@ -363,7 +443,7 @@ All layouts in `status-site/themes/broodlink-status/layouts/`, all JS in
 
 ---
 
-## 5. Verification Page Enhancements
+## 6. Verification Page Enhancements
 
 The existing Verification page (`/verification/`) received functional
 upgrades while keeping its status as the design reference:
@@ -381,7 +461,7 @@ upgrades while keeping its status as the design reference:
 
 ---
 
-## 6. Attachment Storage Module
+## 7. Attachment Storage Module
 
 New module in `crates/broodlink-fs/src/attachments.rs` for file persistence.
 
@@ -421,7 +501,7 @@ Returns SHA-256 hex digest.
 
 ---
 
-## 7. Migration 030
+## 8. Migration 030
 
 **File:** `migrations/030_chat_attachments.sql`
 
@@ -463,7 +543,7 @@ psql -h 127.0.0.1 -p 5432 -U broodlink -d broodlink \
 
 ---
 
-## 8. Config Reference
+## 9. Config Reference
 
 New fields added in v0.12.0:
 
@@ -488,7 +568,7 @@ max_attachment_bytes = 20971520                 # 20 MiB max file size
 
 ---
 
-## 9. Bug Fixes
+## 10. Bug Fixes
 
 ### Verification Analytics Query
 
@@ -524,7 +604,7 @@ headers, and body.
 
 ---
 
-## 10. Test Coverage
+## 11. Test Coverage
 
 ### New Tests
 

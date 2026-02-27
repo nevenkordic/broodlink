@@ -29,6 +29,7 @@ broodlink-fs = { path = "../../crates/broodlink-fs", features = ["attachments"] 
 hmac = { workspace = true }
 sha2 = { workspace = true }
 base64 = "0.22"
+chrono = { workspace = true }
 
 [lints]
 workspace = true
