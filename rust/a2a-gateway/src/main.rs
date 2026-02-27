@@ -4208,9 +4208,6 @@ fn strip_confidence_tag(text: &str) -> String {
     text.to_string()
 }
 
-/// v0.9.0: Classify text into a model domain using fast keyword/pattern matching.
-/// Returns "code" for programming-related content, "general" otherwise.
-/// Zero LLM overhead — pure string matching.
 // ---------------------------------------------------------------------------
 // v0.10.0: Write approval + vision helpers
 // ---------------------------------------------------------------------------
