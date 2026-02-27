@@ -1129,6 +1129,9 @@ static TOOL_REGISTRY: std::sync::LazyLock<Vec<serde_json::Value>> = std::sync::L
             tool_def("read_pdf", "Extract text from a PDF file within allowed directories.", serde_json::json!({
                 "path": p_str("Absolute path to the PDF file"),
             }), &["path"]),
+            tool_def("read_docx", "Extract text from a Word (.docx) document within allowed directories.", serde_json::json!({
+                "path": p_str("Absolute path to the .docx file"),
+            }), &["path"]),
         ]
     },
 );
@@ -1531,6 +1534,7 @@ async fn tool_dispatch(
         "read_file" => tool_read_file(&state, params).await,
         "write_file" => tool_write_file(&state, params).await,
         "read_pdf" => tool_read_pdf(&state, params).await,
+        "read_docx" => tool_read_docx(&state, params).await,
 
         "ping" => Ok(serde_json::json!({ "pong": true })),
 
@@ -6528,6 +6532,41 @@ async fn tool_read_pdf(
     }))
 }
 
+async fn tool_read_docx(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let path = param_str(params, "path")?;
+    let tool_cfg = &state.config.chat.tools;
+
+    if !tool_cfg.pdf_tools_enabled {
+        return Err(BroodlinkError::Validation {
+            field: "path".to_string(),
+            message: "Document tools are disabled".to_string(),
+        });
+    }
+
+    let canonical = broodlink_fs::validate_read_path(
+        path,
+        &tool_cfg.allowed_read_dirs,
+        tool_cfg.max_read_size_bytes,
+    )
+    .map_err(|e| BroodlinkError::Validation {
+        field: "path".to_string(),
+        message: e,
+    })?;
+
+    let max_chars = tool_cfg.max_pdf_pages as usize * 3000;
+    let content = broodlink_fs::read_docx_safe(&canonical, max_chars)
+        .map_err(|e| BroodlinkError::Internal(e))?;
+
+    Ok(serde_json::json!({
+        "path": canonical.display().to_string(),
+        "content": content,
+        "size_bytes": content.len(),
+    }))
+}
+
 async fn check_guardrails(
     state: &AppState,
     agent_id: &str,
@@ -8495,8 +8534,8 @@ mod tests {
         // Must match the number of match arms in tool_dispatch (excluding the _ fallback)
         assert_eq!(
             TOOL_REGISTRY.len(),
-            93,
-            "tool registry should have 93 tools"
+            94,
+            "tool registry should have 94 tools"
         );
     }
 
@@ -9430,6 +9469,7 @@ mod tests {
         assert!(names.contains(&"read_file"), "registry missing read_file");
         assert!(names.contains(&"write_file"), "registry missing write_file");
         assert!(names.contains(&"read_pdf"), "registry missing read_pdf");
+        assert!(names.contains(&"read_docx"), "registry missing read_docx");
     }
 
     #[test]

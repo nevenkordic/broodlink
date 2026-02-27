@@ -57,6 +57,7 @@ toml                = "0.8"
 hmac                = "0.12"
 sha2                = "0.10"
 pdf-extract         = "0.7"
+zip                 = { version = "2", default-features = false, features = ["deflate"] }
 base64              = "0.22"
 
 [profile.release]

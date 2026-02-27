@@ -4284,7 +4284,9 @@ async fn call_ollama_chat(
     }
     if tool_cfg.pdf_tools_enabled {
         system_prompt.push_str(
-            " You MUST call read_pdf when the user asks to read or extract text from a PDF document.",
+            " You MUST call read_pdf when the user asks to read a PDF document. \
+             You MUST call read_docx when the user asks to read a Word document (.docx). \
+             ALWAYS use the tool instead of saying you cannot read these formats.",
         );
     }
     system_prompt.push_str(" If you don't know something and can't look it up, say so honestly.");
@@ -4433,6 +4435,23 @@ async fn call_ollama_chat(
                         "path": {
                             "type": "string",
                             "description": "Absolute path to the PDF file"
+                        }
+                    }
+                }
+            }
+        }));
+        tools_vec.push(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_docx",
+                "description": "Extract text content from a Word (.docx) document.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["path"],
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute path to the .docx file"
                         }
                     }
                 }
@@ -4921,6 +4940,37 @@ async fn call_ollama_chat(
                                         ) {
                                             Ok(text) => text,
                                             Err(e) => format!("Error reading PDF: {e}"),
+                                        }
+                                    }
+                                    Err(e) => format!("Access denied: {e}"),
+                                }
+                            }
+                        }
+                        "read_docx" => {
+                            let parsed = args_raw
+                                .and_then(|a| {
+                                    if let Some(s) = a.as_str() {
+                                        serde_json::from_str::<serde_json::Value>(s).ok()
+                                    } else {
+                                        Some(a.clone())
+                                    }
+                                })
+                                .unwrap_or_default();
+                            let path = parsed.get("path").and_then(|p| p.as_str()).unwrap_or("");
+
+                            if path.is_empty() {
+                                "Error: path is required.".to_string()
+                            } else {
+                                match broodlink_fs::validate_read_path(
+                                    path,
+                                    &tool_cfg.allowed_read_dirs,
+                                    tool_cfg.max_read_size_bytes,
+                                ) {
+                                    Ok(canonical) => {
+                                        let max_chars = tool_cfg.max_pdf_pages as usize * 3000;
+                                        match broodlink_fs::read_docx_safe(&canonical, max_chars) {
+                                            Ok(text) => text,
+                                            Err(e) => format!("Error reading DOCX: {e}"),
                                         }
                                     }
                                     Err(e) => format!("Access denied: {e}"),

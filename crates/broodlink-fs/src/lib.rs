@@ -146,6 +146,86 @@ pub fn write_file_safe(path: &Path, content: &[u8], max_size: u64) -> Result<(),
     Ok(())
 }
 
+/// Extract text from a Word (.docx) file.
+///
+/// DOCX files are ZIP archives containing `word/document.xml`.
+/// We extract text from `<w:t>` elements, inserting paragraph breaks at `</w:p>`.
+pub fn read_docx_safe(path: &Path, max_chars: usize) -> Result<String, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("cannot open file: {e}"))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("not a valid DOCX: {e}"))?;
+
+    let mut xml = String::new();
+    {
+        let mut doc = archive
+            .by_name("word/document.xml")
+            .map_err(|_| "DOCX missing word/document.xml".to_string())?;
+        std::io::Read::read_to_string(&mut doc, &mut xml)
+            .map_err(|e| format!("read error: {e}"))?;
+    }
+
+    let text = extract_text_from_docx_xml(&xml);
+
+    if text.len() > max_chars {
+        let truncated = match text[..max_chars].rfind('\n') {
+            Some(idx) => &text[..idx],
+            None => &text[..max_chars],
+        };
+        Ok(format!(
+            "{}\n\n[Truncated: showing first ~{} characters of {}]",
+            truncated,
+            max_chars,
+            text.len()
+        ))
+    } else {
+        Ok(text)
+    }
+}
+
+/// Simple XML text extraction for DOCX document.xml.
+fn extract_text_from_docx_xml(xml: &str) -> String {
+    let mut result = String::with_capacity(xml.len() / 4);
+    let mut in_tag = false;
+    let mut tag_buf = String::new();
+    let mut in_wt = false;
+
+    for ch in xml.chars() {
+        if ch == '<' {
+            in_tag = true;
+            tag_buf.clear();
+            continue;
+        }
+        if ch == '>' {
+            in_tag = false;
+            // Check if this is a <w:t> opening or </w:t> closing
+            let tag = tag_buf.trim();
+            if tag == "w:t" || tag.starts_with("w:t ") {
+                in_wt = true;
+            } else if tag == "/w:t" {
+                in_wt = false;
+            } else if tag == "/w:p" {
+                // Paragraph break
+                result.push('\n');
+            } else if tag == "w:br" || tag == "w:br/" || tag == "w:br /" {
+                result.push('\n');
+            }
+            continue;
+        }
+        if in_tag {
+            tag_buf.push(ch);
+        } else if in_wt {
+            result.push(ch);
+        }
+    }
+
+    // Decode common XML entities
+    result
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+}
+
 /// Extract text from a PDF file, truncating to approximately `max_pages` pages.
 pub fn read_pdf_safe(path: &Path, max_pages: u32) -> Result<String, String> {
     let text =
@@ -335,6 +415,36 @@ mod tests {
     fn test_pdf_extraction_nonexistent() {
         let result = read_pdf_safe(Path::new("/nonexistent/file.pdf"), 100);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_docx_extraction_nonexistent() {
+        let result = read_docx_safe(Path::new("/nonexistent/file.docx"), 100_000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_docx_extraction_not_zip() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("fake.docx");
+        std::fs::write(&file, "this is not a zip file").unwrap();
+        let result = read_docx_safe(&file, 100_000);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not a valid DOCX"));
+    }
+
+    #[test]
+    fn test_extract_text_from_docx_xml() {
+        let xml = r#"<w:document><w:body><w:p><w:r><w:t>Hello</w:t></w:r><w:r><w:t xml:space="preserve"> World</w:t></w:r></w:p><w:p><w:r><w:t>Second paragraph</w:t></w:r></w:p></w:body></w:document>"#;
+        let text = extract_text_from_docx_xml(xml);
+        assert_eq!(text, "Hello World\nSecond paragraph\n");
+    }
+
+    #[test]
+    fn test_extract_text_xml_entities() {
+        let xml = r#"<w:p><w:r><w:t>A &amp; B &lt; C</w:t></w:r></w:p>"#;
+        let text = extract_text_from_docx_xml(xml);
+        assert_eq!(text, "A & B < C\n");
     }
 
     #[test]

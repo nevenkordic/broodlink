@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 pdf-extract = "0.7"
+zip = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
