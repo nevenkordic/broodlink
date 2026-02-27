@@ -148,6 +148,31 @@ bash tests/v060-regression.sh             # 164 v0.6.0 regression tests
 
 The E2E suite covers: service health, JWT/API key auth, all tool categories, status API endpoints, background service verification, SSE streaming, NATS integration, error handling, database round-trips, semantic search, hybrid memory search, knowledge graph tools, chat sessions, and login page. The v0.6.0 regression suite covers: budget enforcement, DLQ tooling, OTLP telemetry, KG expiry, JWT rotation, workflow branching, dashboard control panel, multi-agent collaboration, and webhooks. v0.7.0 adds chat integration, formula registry, and dashboard auth test suites. v0.11.0 adds onboarding regression tests (agent_id validation, JWT claims, tilde expansion, payload defaults).
 
+## Benchmarks
+
+Measured on Mac Studio — Apple M4 Max, 16 cores (12P + 4E), 128 GB unified memory.
+
+### Ollama Models
+
+| Model | Role | Size | Prompt | Generation |
+|-------|------|------|--------|------------|
+| qwen3:30b-a3b | Primary chat | 18 GB | 104 tok/s | 95.7 tok/s |
+| deepseek-r1:14b | Verifier | 9 GB | 156 tok/s | 46.2 tok/s |
+| qwen3:1.7b | Fallback | 1.4 GB | 606 tok/s | 191.2 tok/s |
+| gemma3:27b | Vision | 17 GB | 78 tok/s | 25.1 tok/s |
+| nomic-embed-text | Embeddings | 274 MB | — | 13.9 emb/s |
+
+### Services & Databases
+
+| Component | Latency |
+|-----------|---------|
+| Service health endpoints | 23–29ms |
+| Bridge tool call (no DB) | 36ms |
+| Bridge tool call (Postgres) | 38ms |
+| Bridge tool call (Qdrant + Ollama) | 135ms |
+| Postgres queries (402–8233 rows) | 0.3–1.1ms |
+| Disk sequential write | 6.5 GB/s |
+
 ## Prerequisites
 
 - Rust 1.75+ with `cargo-deny`
