@@ -683,6 +683,7 @@ static TOOL_REGISTRY: std::sync::LazyLock<Vec<serde_json::Value>> = std::sync::L
             }), &["topic", "content"]),
             tool_def("recall_memory", "Search agent memory. If topic_search given, matches by LIKE pattern. Otherwise returns all.", serde_json::json!({
                 "topic_search": p_str("Optional search string to filter memories"),
+                "limit": { "type": "integer", "description": "Max results to return (default 200, max 1000)" },
             }), &[]),
             tool_def("delete_memory", "Delete a memory entry by exact topic name.", serde_json::json!({
                 "topic": p_str("Exact topic name to delete"),
@@ -1983,21 +1984,24 @@ async fn tool_recall_memory(
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
     let topic_search = param_str_opt(params, "topic_search");
+    let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(200));
 
     let rows = if let Some(search) = topic_search {
         let pattern = format!("%{search}%");
         sqlx::query_as::<_, (i64, String, String, String, Option<serde_json::Value>, String, String)>(
             "SELECT id, topic, content, agent_name, tags, CAST(created_at AS CHAR), CAST(updated_at AS CHAR)
-             FROM agent_memory WHERE topic LIKE ? ORDER BY updated_at DESC LIMIT 50",
+             FROM agent_memory WHERE topic LIKE ? ORDER BY updated_at DESC LIMIT ?",
         )
         .bind(&pattern)
+        .bind(limit)
         .fetch_all(&state.dolt)
         .await?
     } else {
         sqlx::query_as::<_, (i64, String, String, String, Option<serde_json::Value>, String, String)>(
             "SELECT id, topic, content, agent_name, tags, CAST(created_at AS CHAR), CAST(updated_at AS CHAR)
-             FROM agent_memory ORDER BY updated_at DESC LIMIT 50",
+             FROM agent_memory ORDER BY updated_at DESC LIMIT ?",
         )
+        .bind(limit)
         .fetch_all(&state.dolt)
         .await?
     };
