@@ -2186,6 +2186,19 @@ async fn webhook_telegram_handler(
         .and_then(|p| p.get("file_id"))
         .and_then(|f| f.as_str());
     let has_photo = photo_file_id.is_some();
+
+    // v0.10.0: Extract document attachment (PDF, DOCX, text files)
+    let doc_file_id = message
+        .get("document")
+        .and_then(|d| d.get("file_id"))
+        .and_then(|f| f.as_str());
+    let doc_file_name = message
+        .get("document")
+        .and_then(|d| d.get("file_name"))
+        .and_then(|f| f.as_str())
+        .unwrap_or("document");
+    let has_document = doc_file_id.is_some();
+
     let user_name = message
         .get("from")
         .and_then(|f| f.get("first_name"))
@@ -2273,8 +2286,8 @@ async fn webhook_telegram_handler(
         }
     }
 
-    // Conversational message (non-command) — also proceed for photos without text
-    if state.config.chat.enabled && (!text.is_empty() || has_photo) {
+    // Conversational message (non-command) — also proceed for photos/documents without text
+    if state.config.chat.enabled && (!text.is_empty() || has_photo || has_document) {
         let chat_id_str = chat_id.to_string();
         let user_id_str = user_id_val.to_string();
 
@@ -2300,8 +2313,33 @@ async fn webhook_telegram_handler(
             }
         }
 
-        // For photo-only messages, provide a default prompt
-        let chat_text = if text.is_empty() && has_photo {
+        // Download and extract document content if present
+        let doc_content = if let Some(fid) = doc_file_id {
+            match extract_telegram_document(&state, fid, doc_file_name).await {
+                Ok(text) => {
+                    info!(file_name = %doc_file_name, len = text.len(), "extracted document text");
+                    Some(text)
+                }
+                Err(e) => {
+                    warn!(error = %e, file_name = %doc_file_name, "failed to extract document");
+                    Some(format!("[Could not read {doc_file_name}: {e}]"))
+                }
+            }
+        } else {
+            None
+        };
+
+        // Build chat text: document content + user caption/message
+        let chat_text_owned;
+        let chat_text = if let Some(ref doc) = doc_content {
+            let user_msg = if text.is_empty() {
+                "Please read and summarize this document."
+            } else {
+                text
+            };
+            chat_text_owned = format!("{doc}\n\n{user_msg}");
+            chat_text_owned.as_str()
+        } else if text.is_empty() && has_photo {
             "What's in this image?"
         } else {
             text
@@ -2442,7 +2480,19 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
         .and_then(|f| f.as_str());
     let has_photo = photo_file_id.is_some();
 
-    if text.is_empty() && !has_photo {
+    // v0.10.0: Extract document attachment (PDF, DOCX, text files)
+    let doc_file_id = message
+        .get("document")
+        .and_then(|d| d.get("file_id"))
+        .and_then(|f| f.as_str());
+    let doc_file_name = message
+        .get("document")
+        .and_then(|d| d.get("file_name"))
+        .and_then(|f| f.as_str())
+        .unwrap_or("document");
+    let has_document = doc_file_id.is_some();
+
+    if text.is_empty() && !has_photo && !has_document {
         return None;
     }
 
@@ -2491,13 +2541,21 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
         }
     }
 
-    // Conversational message — also proceed for photos without text
-    if state.config.chat.enabled && (!text.is_empty() || has_photo) {
+    // Conversational message — also proceed for photos/documents without text
+    if state.config.chat.enabled && (!text.is_empty() || has_photo || has_document) {
         let chat_id_str = chat_id.to_string();
         let user_id_str = user_id_val.to_string();
 
         // Dedup: skip if same message is already in-flight (before DB/bridge work)
-        let dedup_text = if text.is_empty() { "[photo]" } else { text };
+        let dedup_text = if text.is_empty() {
+            if has_photo {
+                "[photo]"
+            } else {
+                "[document]"
+            }
+        } else {
+            text
+        };
         let dedup_key = chat_dedup_key("telegram", &chat_id_str, dedup_text);
         let dedup_window = std::time::Duration::from_secs(state.config.a2a.dedup_window_secs);
         {
@@ -2514,8 +2572,33 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
             }
         }
 
-        // For photo-only messages, provide a default prompt
-        let chat_text = if text.is_empty() && has_photo {
+        // Download and extract document content if present
+        let doc_content = if let Some(fid) = doc_file_id {
+            match extract_telegram_document(state, fid, doc_file_name).await {
+                Ok(text) => {
+                    info!(file_name = %doc_file_name, len = text.len(), "extracted document text");
+                    Some(text)
+                }
+                Err(e) => {
+                    warn!(error = %e, file_name = %doc_file_name, "failed to extract document");
+                    Some(format!("[Could not read {doc_file_name}: {e}]"))
+                }
+            }
+        } else {
+            None
+        };
+
+        // Build chat text: document content + user caption/message
+        let chat_text_owned;
+        let chat_text = if let Some(ref doc) = doc_content {
+            let user_msg = if text.is_empty() {
+                "Please read and summarize this document."
+            } else {
+                text
+            };
+            chat_text_owned = format!("{doc}\n\n{user_msg}");
+            chat_text_owned.as_str()
+        } else if text.is_empty() && has_photo {
             "What's in this image?"
         } else {
             text
@@ -3338,6 +3421,61 @@ async fn download_telegram_file(state: &AppState, file_id: &str) -> Result<Vec<u
     }
 
     Ok(bytes.to_vec())
+}
+
+/// Download a Telegram document attachment and extract its text content.
+///
+/// Supports PDF, DOCX, and plain text files. Returns the extracted text
+/// prefixed with the filename, or an error string.
+async fn extract_telegram_document(
+    state: &AppState,
+    file_id: &str,
+    file_name: &str,
+) -> Result<String, String> {
+    let bytes = download_telegram_file(state, file_id).await?;
+    let ext = file_name.rsplit('.').next().unwrap_or("").to_lowercase();
+
+    let tool_cfg = &state.config.chat.tools;
+    let max_chars = tool_cfg.max_pdf_pages as usize * 3000;
+
+    let content = match ext.as_str() {
+        "pdf" => {
+            // Write to temp file — pdf_extract requires a path
+            let tmp =
+                std::env::temp_dir().join(format!("broodlink-doc-{}.pdf", uuid::Uuid::new_v4()));
+            std::fs::write(&tmp, &bytes).map_err(|e| format!("temp write: {e}"))?;
+            let result = broodlink_fs::read_pdf_safe(&tmp, tool_cfg.max_pdf_pages);
+            let _ = std::fs::remove_file(&tmp);
+            result?
+        }
+        "docx" => {
+            let tmp =
+                std::env::temp_dir().join(format!("broodlink-doc-{}.docx", uuid::Uuid::new_v4()));
+            std::fs::write(&tmp, &bytes).map_err(|e| format!("temp write: {e}"))?;
+            let result = broodlink_fs::read_docx_safe(&tmp, max_chars);
+            let _ = std::fs::remove_file(&tmp);
+            result?
+        }
+        "txt" | "md" | "csv" | "json" | "xml" | "html" | "log" | "yaml" | "yml" | "toml"
+        | "ini" | "cfg" | "conf" | "sh" | "py" | "rs" | "js" | "ts" => {
+            // Plain text — just decode
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+        _ => {
+            return Err(format!(
+                "Unsupported file type: .{ext}. I can read PDF, DOCX, and text files."
+            ));
+        }
+    };
+
+    if content.len() > max_chars {
+        let truncated = &content[..max_chars];
+        Ok(format!(
+            "[Attached file: {file_name}]\n{truncated}\n[Truncated]"
+        ))
+    } else {
+        Ok(format!("[Attached file: {file_name}]\n{content}"))
+    }
 }
 
 // ---------------------------------------------------------------------------
