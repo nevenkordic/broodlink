@@ -47,9 +47,9 @@ def test_top_level_imports():
 
 
 def test_version_bumped():
-    """Version should be 0.12.0."""
+    """Version should be 0.11.0."""
     import broodlink_agent
-    assert broodlink_agent.__version__ == "0.12.0"
+    assert broodlink_agent.__version__ == "0.11.0"
 
 
 def test_main_entry_point():

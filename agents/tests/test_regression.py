@@ -2,7 +2,7 @@
 # Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Regression tests for bugs found during v0.12.0 audit.
+"""Regression tests for bugs found during v0.11.0 audit.
 
 Each test documents a specific bug that was fixed. If any of these
 fail, the corresponding bug has been reintroduced.

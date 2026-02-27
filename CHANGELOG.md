@@ -5,7 +5,7 @@ All notable changes to Broodlink are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 
-## [0.12.0] - 2026-02-28
+## [0.11.0] - 2026-02-28
 
 ### Added
 
@@ -42,7 +42,7 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 - **Python SDK Overhaul**: CLI rewritten from argparse to Click with
   subcommand groups: `agent list`, `memory search|store|recall|stats`,
   `tool call|list`. Backward-compatible `--listen` mode preserved.
-  Package version bumped to 0.12.0. Typed exports for all model classes
+  Package version bumped to 0.11.0. Typed exports for all model classes
   (`Memory`, `Task`, `Agent`, `Issue`, `Formula`, etc.) via `__all__`.
 - **Dashboard Redesign**: All 15 dashboard pages (everything except
   Verification) upgraded to consistent design system. Metric cards
@@ -123,11 +123,6 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 - **`fetchApi()` POST support**: Added optional `opts` parameter to
   `utils.js` `fetchApi()` for POST/PUT requests, matching the pattern
   used by the control panel.
-
-## [0.11.0] - 2026-02-27
-
-### Added
-
 - **Query Expansion**: Memory search calls Ollama to generate 2–3 alternative
   phrasings before embedding. Each variant runs through semantic/hybrid search
   in parallel; results are merged by max score. Skips queries < 3 words.
@@ -187,9 +182,6 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 - 7 new regression tests for onboarding (agent_id validation, JWT claims,
   tilde expansion, payload defaults, token path format).
 - 346 workspace unit tests (up from 271).
-
-### Fixed
-
 - **Onboarding POST broken**: `onboarding.js` used `fetchApi()` (GET-only)
   for the POST request. Replaced with proper `postApi()` helper matching
   the control panel pattern.

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "broodlink"
-version = "0.12.0"
+version = "0.11.0"
 description = "Python SDK for Broodlink multi-agent AI orchestration"
 readme = "README.md"
 license = "AGPL-3.0-or-later"

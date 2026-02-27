@@ -912,7 +912,7 @@ pub struct ChatConfig {
     pub streaming_edit_interval_ms: u64,
     #[serde(default = "default_streaming_min_tokens")]
     pub streaming_min_tokens: usize,
-    // v0.12.0: Multi-modal attachment storage
+    // v0.11.0: Multi-modal attachment storage
     #[serde(default = "default_attachments_dir")]
     pub attachments_dir: String,
     #[serde(default = "default_chat_transcription_model")]
@@ -1619,7 +1619,7 @@ api_key_name = "STATUS_API_KEY"
 
         let cfg = Config::load().unwrap();
 
-        // v0.12.0: Multi-modal attachment config defaults
+        // v0.11.0: Multi-modal attachment config defaults
         assert_eq!(
             cfg.chat.attachments_dir, "~/.broodlink/attachments",
             "attachments_dir default should be ~/.broodlink/attachments"

@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
-/* Verification Analytics — v0.12.0 */
+/* Verification Analytics — v0.11.0 */
 (function () {
   'use strict';
   var BL = window.Broodlink;

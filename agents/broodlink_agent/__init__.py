@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Broodlink Python SDK — typed clients, namespaces, and agent framework."""
 
-__version__ = "0.12.0"
+__version__ = "0.11.0"
 
 from .config import AgentConfig
 from .client import AsyncBroodlinkClient, BroodlinkClient

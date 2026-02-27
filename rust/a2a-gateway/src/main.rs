@@ -333,7 +333,7 @@ struct PendingWriteEntry {
     sender: tokio::sync::oneshot::Sender<bool>,
 }
 
-/// v0.12.0: Attachment metadata collected from platform messages before storage.
+/// v0.11.0: Attachment metadata collected from platform messages before storage.
 struct PendingAttachment {
     attachment_type: String,
     mime_type: Option<String>,
@@ -2111,7 +2111,7 @@ async fn handle_slack_event(state: &AppState, body: &str) -> Response {
                 let text = event.get("text").and_then(|t| t.as_str()).unwrap_or("");
                 let thread_ts = event.get("thread_ts").and_then(|t| t.as_str());
 
-                // v0.12.0: Extract files from Slack event
+                // v0.11.0: Extract files from Slack event
                 let slack_files = event
                     .get("files")
                     .and_then(|f| f.as_array())
@@ -2124,7 +2124,7 @@ async fn handle_slack_event(state: &AppState, body: &str) -> Response {
                     if text.starts_with("/broodlink") || text.starts_with("broodlink ") {
                         // Let the slash command handler deal with it
                     } else {
-                        // v0.12.0: Download Slack files and build PendingAttachments
+                        // v0.11.0: Download Slack files and build PendingAttachments
                         let mut pending_attachments: Vec<PendingAttachment> = Vec::new();
                         for file in &slack_files {
                             let url_private = file.get("url_private").and_then(|u| u.as_str());
@@ -2271,7 +2271,7 @@ async fn webhook_teams_handler(
         )
             .into_response()
     } else if state.config.chat.enabled && activity_type == "message" {
-        // v0.12.0: Extract Teams attachments (inline images, hosted content)
+        // v0.11.0: Extract Teams attachments (inline images, hosted content)
         let teams_attachments = payload
             .get("attachments")
             .and_then(|a| a.as_array())
@@ -2495,7 +2495,7 @@ async fn webhook_telegram_handler(
         .unwrap_or("document");
     let has_document = doc_file_id.is_some();
 
-    // v0.12.0: Extract voice/audio attachments
+    // v0.11.0: Extract voice/audio attachments
     let voice_file_id = message
         .get("voice")
         .and_then(|v| v.get("file_id"))
@@ -2650,7 +2650,7 @@ async fn webhook_telegram_handler(
             None
         };
 
-        // v0.12.0: Build pending attachments for storage
+        // v0.11.0: Build pending attachments for storage
         let mut pending_attachments: Vec<PendingAttachment> = Vec::new();
 
         // Download voice/audio and transcribe if enabled
@@ -2977,7 +2977,7 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
         .unwrap_or("document");
     let has_document = doc_file_id.is_some();
 
-    // v0.12.0: Extract voice/audio attachments
+    // v0.11.0: Extract voice/audio attachments
     let voice_file_id = message
         .get("voice")
         .and_then(|v| v.get("file_id"))
@@ -3100,7 +3100,7 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
             None
         };
 
-        // v0.12.0: Build pending attachments for storage
+        // v0.11.0: Build pending attachments for storage
         let mut pending_attachments: Vec<PendingAttachment> = Vec::new();
 
         // Download voice/audio and transcribe if enabled
@@ -3660,7 +3660,7 @@ async fn handle_chat_message(
         }
     };
 
-    // v0.12.0: Store attachments if present
+    // v0.11.0: Store attachments if present
     if let (Some(msg_id), Some(atts)) = (message_id, attachments) {
         for att in atts {
             if let Err(e) = store_chat_attachment(state, &sid, msg_id, att).await {
@@ -4228,7 +4228,7 @@ async fn extract_telegram_document(
 }
 
 // ---------------------------------------------------------------------------
-// v0.12.0: Attachment storage and transcription
+// v0.11.0: Attachment storage and transcription
 // ---------------------------------------------------------------------------
 
 /// Classify attachment MIME type into a category string.
@@ -8384,7 +8384,7 @@ mod tests {
         );
     }
 
-    // ── v0.12.0: Multi-modal regression tests ──────────────────────────
+    // ── v0.11.0: Multi-modal regression tests ──────────────────────────
 
     #[test]
     fn test_classify_attachment_type_image() {

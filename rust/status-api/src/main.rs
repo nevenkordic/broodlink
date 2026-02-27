@@ -577,7 +577,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             post(handler_chat_assign),
         )
         .route("/chat/stats", get(handler_chat_stats))
-        // v0.12.0 attachment endpoints
+        // v0.11.0 attachment endpoints
         .route(
             "/chat/sessions/:session_id/attachments",
             get(handler_session_attachments),
@@ -3525,7 +3525,7 @@ async fn handler_chat_messages(
     .fetch_all(&state.pg)
     .await?;
 
-    // v0.12.0: Fetch attachments for these messages in one query
+    // v0.11.0: Fetch attachments for these messages in one query
     let msg_ids: Vec<i64> = rows.iter().map(|(id, ..)| *id).collect();
     let att_rows: Vec<(
         String,
@@ -3702,7 +3702,7 @@ async fn handler_chat_assign(
 }
 
 // ---------------------------------------------------------------------------
-// v0.12.0: Attachment endpoints
+// v0.11.0: Attachment endpoints
 // ---------------------------------------------------------------------------
 
 async fn handler_session_attachments(

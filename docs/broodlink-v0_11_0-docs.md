@@ -1,11 +1,11 @@
-# Broodlink v0.12.0 — Multi-Modal, SDK & Dashboard Redesign
+# Broodlink v0.11.0 — Multi-Modal, SDK & Dashboard Redesign
 
 > Multi-agent AI orchestration system
 > Copyright (C) 2025-2026 Neven Kordic <neven@broodlink.ai>
 > License: AGPL-3.0-or-later
 > Generated: 2026-02-27
 
-This document covers changes in v0.12.0. For previous versions, see the
+This document covers changes in v0.11.0. For previous versions, see the
 [CHANGELOG](../CHANGELOG.md).
 
 ---
@@ -28,13 +28,13 @@ This document covers changes in v0.12.0. For previous versions, see the
 
 ## 1. Overview
 
-v0.12.0 adds multi-modal attachment handling across all chat platforms,
+v0.11.0 adds multi-modal attachment handling across all chat platforms,
 rewrites the Python SDK with typed clients and a Click CLI, and redesigns
 the entire dashboard for structural consistency.
 
 **Key metrics:**
 
-| Metric | v0.11.0 | v0.12.0 |
+| Metric | Before | After |
 |--------|---------|---------|
 | beads-bridge tools | 96 | 96 |
 | a2a-gateway chat tools | 6 | 10 |
@@ -42,7 +42,7 @@ the entire dashboard for structural consistency.
 | Dashboard pages | 16 | 16 |
 | SQL migrations | 29 | 30 |
 | Postgres tables | 37 | 38 |
-| Python SDK version | 0.2.0 | 0.12.0 |
+| Python SDK version | 0.2.0 | 0.11.0 |
 
 ---
 
@@ -235,7 +235,7 @@ client library. Users had to make raw HTTP calls to beads-bridge.
 
 ```
 broodlink_agent/
-    __init__.py          # v0.12.0, typed exports, __all__
+    __init__.py          # v0.11.0, typed exports, __all__
     cli.py               # Click CLI with subcommands
     config.py            # AgentConfig (env-based)
     client.py            # BroodlinkClient + AsyncBroodlinkClient
@@ -333,7 +333,7 @@ All API responses are deserialized into typed models:
 
 | File | Changes |
 |------|---------|
-| `agents/broodlink_agent/__init__.py` | Version 0.12.0, typed exports |
+| `agents/broodlink_agent/__init__.py` | Version 0.11.0, typed exports |
 | `agents/broodlink_agent/cli.py` | Click CLI with agent/memory/tool subcommands |
 | `agents/broodlink_agent/client.py` | New: sync + async clients |
 | `agents/broodlink_agent/agent.py` | New: BaseAgent framework |
@@ -545,7 +545,7 @@ psql -h 127.0.0.1 -p 5432 -U broodlink -d broodlink \
 
 ## 9. Config Reference
 
-New fields added in v0.12.0:
+New fields added in v0.11.0:
 
 ```toml
 [chat]
@@ -636,7 +636,7 @@ backward compatibility, and end-to-end flows.
 | `rust/beads-bridge/src/main.rs` | Minor (attachment-related message threading) |
 | `rust/status-api/src/main.rs` | 3 attachment endpoints, verification fix, approval fix (+281 lines) |
 | `rust/status-api/Cargo.toml` | Added `broodlink-fs` |
-| `agents/broodlink_agent/__init__.py` | v0.12.0, typed exports |
+| `agents/broodlink_agent/__init__.py` | v0.11.0, typed exports |
 | `agents/broodlink_agent/cli.py` | Click CLI rewrite |
 | `agents/broodlink_agent/*.py` | New: client, agent, transport, nats_helper |
 | `agents/broodlink_agent/models/` | New: Pydantic models |
