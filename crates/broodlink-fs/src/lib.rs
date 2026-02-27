@@ -163,7 +163,7 @@ pub fn read_docx_safe(path: &Path, max_chars: usize) -> Result<String, String> {
             .map_err(|e| format!("read error: {e}"))?;
     }
 
-    let text = extract_text_from_docx_xml(&xml);
+    let text = sanitize_extracted_text(&extract_text_from_docx_xml(&xml));
 
     if text.len() > max_chars {
         let truncated = match text[..max_chars].rfind('\n') {
@@ -226,10 +226,18 @@ fn extract_text_from_docx_xml(xml: &str) -> String {
         .replace("&apos;", "'")
 }
 
+/// Strip null bytes and other problematic control characters from extracted text.
+/// PDF extraction commonly produces null bytes that Postgres UTF-8 columns reject.
+fn sanitize_extracted_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| *c != '\0' && (*c >= ' ' || *c == '\n' || *c == '\r' || *c == '\t'))
+        .collect()
+}
+
 /// Extract text from a PDF file, truncating to approximately `max_pages` pages.
 pub fn read_pdf_safe(path: &Path, max_pages: u32) -> Result<String, String> {
-    let text =
-        pdf_extract::extract_text(path).map_err(|e| format!("PDF extraction failed: {e}"))?;
+    let raw = pdf_extract::extract_text(path).map_err(|e| format!("PDF extraction failed: {e}"))?;
+    let text = sanitize_extracted_text(&raw);
 
     let max_chars = max_pages as usize * 3000;
     if text.len() > max_chars {
