@@ -26,6 +26,7 @@ After startup, you'll have:
 | URL | What |
 |-----|------|
 | http://localhost:1313 | Dashboard (Hugo) |
+| http://localhost:1313/workflows/ | Visual Workflow Editor |
 | http://localhost:1313/control/ | Control Panel (admin) |
 | http://localhost:3310/health | beads-bridge API |
 | http://localhost:3312/api/v1/health | status-api |
@@ -226,7 +227,7 @@ broodlink/
 │   ├── mcp-server/               # MCP protocol server
 │   └── a2a-gateway/              # A2A protocol gateway + webhook gateway
 ├── agents/                       # Python SDK: typed clients, Click CLI, BaseAgent framework, ML utilities
-├── status-site/                  # Hugo dashboard (WCAG 2.1 AA, 16 pages)
+├── status-site/                  # Hugo dashboard (WCAG 2.1 AA, 17 pages)
 │   └── themes/broodlink-status/
 ├── migrations/                   # SQL migrations (32 files, additive only)
 │   ├── 001_dolt_brain.sql
@@ -285,6 +286,17 @@ Located in `.beads/formulas/`:
 | `daily-review.formula.toml` | Daily ops review: metrics, blockers, summary |
 | `knowledge-gap.formula.toml` | Audit memory, prioritize gaps, research and fill |
 | `custom/incident-postmortem.formula.toml` | Gather evidence, root cause analysis, prevention plan, final report |
+
+### Visual Workflow Editor
+
+The dashboard includes a drag-and-drop visual editor at `/workflows/` for authoring and editing formulas. Built with custom SVG (no external JS dependencies):
+
+- **Canvas**: Zoom/pan, port-to-port edge drawing, node dragging, snap-to-grid, auto-layout (Kahn's topological sort)
+- **Node types**: Step (rect), Condition (diamond), Start/End (circles) with role badges and tool count indicators
+- **Property panel**: All FormulaStep fields including searchable tool multi-select, agent role, prompt, output schema, error handler
+- **Validation**: Real-time cycle detection (DFS), duplicate name checks, empty field warnings — blocks save on errors
+- **Serialization**: Bidirectional Formula ↔ graph conversion preserving all step fields, parallel groups, and conditional edges
+- **Persistence**: Node positions saved to localStorage keyed by formula name; undo/redo with debounced history stack
 
 ## Security
 

@@ -39,7 +39,7 @@ the entire dashboard for structural consistency.
 | beads-bridge tools | 96 | 96 |
 | a2a-gateway chat tools | 6 | 10 |
 | Unit tests | 346 | 346+ |
-| Dashboard pages | 16 | 16 |
+| Dashboard pages | 16 | 17 |
 | SQL migrations | 29 | 30 |
 | Postgres tables | 37 | 38 |
 | Python SDK version | 0.2.0 | 0.11.0 |
@@ -366,17 +366,16 @@ The Verification page (`/verification/`) was the gold standard. All other
 
 ### Sidebar Navigation
 
-Reorganised from a flat list to three semantic groups:
+Reorganised from a flat list to four semantic groups:
 
 ```
-INTELLIGENCE          OPERATIONS          SYSTEM
-  Overview              Tasks & Issues      Safety Rules
-  Conversations         Handoffs            Activity Log
-  Agents                Approvals           External Agents
-  Memory                                    Add Agent
-  Connections                               Version History
-  Decisions                                 Settings
-  Quality
+OVERVIEW              WORK                KNOWLEDGE           SYSTEM
+  Overview              Tasks & Issues      Memory              Safety Rules
+  Conversations         Workflows           Connections         Activity Log
+  Agents                Handoffs            Decisions           External Agents
+                        Quality                                 Add Agent
+                        Approvals                               Version History
+                                                                Settings
 ```
 
 Labels changed to plain English (e.g., "Beads" -> "Tasks & Issues",
@@ -384,7 +383,8 @@ Labels changed to plain English (e.g., "Beads" -> "Tasks & Issues",
 "Verification" -> "Quality", "Guardrails" -> "Safety Rules",
 "Audit" -> "Activity Log", "A2A" -> "External Agents",
 "Onboarding" -> "Add Agent", "Commits" -> "Version History",
-"Control" -> "Settings").
+"Control" -> "Settings"). Post-v0.11.0: "Workflows" added to Work group
+(visual workflow editor at `/workflows/`).
 
 ### Pages Updated
 

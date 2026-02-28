@@ -258,6 +258,28 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Visual Workflow Editor**: New standalone `/workflows/` dashboard page with
+  drag-and-drop SVG canvas for formula authoring. Zero external JS dependencies.
+  Features: port-to-port edge drawing, node dragging with snap-to-grid, scroll
+  zoom and drag pan, auto-layout (Kahn's topological sort), undo/redo with
+  debounced history, right-click context menu, keyboard shortcuts (Ctrl+Z/S,
+  Delete, Tab), real-time validation with DFS cycle detection, searchable tool
+  multi-select, node palette drag-and-drop, and position persistence via
+  localStorage. Bidirectional Formula ↔ graph serialization preserves all
+  FormulaStep fields (agent_role, tools, prompt, output, input, when, retries,
+  backoff, timeout_seconds, group, examples, system_prompt, output_schema,
+  model_domain). Four node types: Step (rect with role badge + tool count),
+  Condition (diamond), Start/End (circles). Parallel group backgrounds,
+  conditional edge styling, and error highlighting on validation failures.
+  Settings page formula edit/create now navigates to `/workflows/`. New
+  `{{ block "styles" }}` in baseof.html for page-specific CSS in `<head>`.
+  New files: `workflow-editor.js` (~1640 lines), `workflow-serializer.js`
+  (~263 lines), `workflow-editor.css` (~660 lines), `layouts/workflows/list.html`.
+  Modified: `sidebar.html`, `control.js`, `baseof.html`. Dashboard page count:
+  16 → 17.
+
 ## [0.10.0] - 2026-02-27
 
 ### Added
