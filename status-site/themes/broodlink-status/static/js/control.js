@@ -596,25 +596,11 @@
   }
 
   function viewFormula(name) {
-    BL.fetchApi('/api/v1/formulas/' + name).then(function (data) {
-      if (window.FormulaEditor) {
-        window.FormulaEditor.open(data);
-      } else {
-        // Fallback if editor JS not loaded
-        var defStr = JSON.stringify(data.definition, null, 2);
-        alert('Formula: ' + name + '\n\nDefinition:\n' + defStr);
-      }
-    }).catch(function (e) {
-      toast('Failed to load formula: ' + e, 'error');
-    });
+    window.location.href = '/workflows/?formula=' + encodeURIComponent(name);
   }
 
   function createFormula() {
-    if (window.FormulaEditor) {
-      window.FormulaEditor.openNew();
-    } else {
-      toast('Formula editor not available', 'error');
-    }
+    window.location.href = '/workflows/?new=1';
   }
 
   // -----------------------------------------------------------------------

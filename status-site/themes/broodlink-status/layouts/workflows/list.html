@@ -1,0 +1,120 @@
+{{ define "main" }}
+<div class="wfe-container">
+
+  <!-- Toolbar -->
+  <div class="wfe-toolbar">
+    <span class="wfe-toolbar-title" id="wfe-title">Workflow Editor</span>
+    <select id="wfe-formula-select" class="wfe-toolbar-select" aria-label="Select formula">
+      <option value="">— Select formula —</option>
+    </select>
+    <button class="btn btn-sm btn-primary" onclick="WorkflowEditor.loadNew()">New</button>
+
+    <span class="wfe-toolbar-divider"></span>
+
+    <button class="btn btn-sm" onclick="WorkflowEditor.addStep()" title="Add step node">
+      <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 2a1 1 0 011 1v4h4a1 1 0 110 2H9v4a1 1 0 11-2 0V9H3a1 1 0 010-2h4V3a1 1 0 011-1z"/></svg>
+      Step
+    </button>
+    <button class="btn btn-sm" onclick="WorkflowEditor.addCondition()" title="Add condition node">
+      <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><polygon points="8,1 15,8 8,15 1,8"/></svg>
+      Condition
+    </button>
+
+    <span class="wfe-toolbar-divider"></span>
+
+    <button class="btn btn-sm" onclick="WorkflowEditor.autoLayout()" title="Auto-arrange nodes">Layout</button>
+    <button class="btn btn-sm" onclick="WorkflowEditor.zoomToFit()" title="Zoom to fit all nodes">Fit</button>
+    <button class="btn btn-sm" onclick="WorkflowEditor.undo()" title="Undo (Ctrl+Z)">Undo</button>
+    <button class="btn btn-sm" onclick="WorkflowEditor.redo()" title="Redo (Ctrl+Shift+Z)">Redo</button>
+
+    <span class="wfe-toolbar-divider"></span>
+
+    <label class="wfe-toolbar-toggle" title="Snap nodes to grid">
+      <input type="checkbox" id="wfe-snap-toggle" onchange="WorkflowEditor.toggleSnap(this.checked)"> Grid
+    </label>
+    <span class="wfe-zoom-display" id="wfe-zoom-display">100%</span>
+
+    <span class="wfe-toolbar-divider"></span>
+
+    <button class="btn btn-sm btn-primary" onclick="WorkflowEditor.save()" title="Save formula (Ctrl+S)">Save</button>
+    <button class="btn btn-sm" onclick="WorkflowEditor.runFormula()" title="Run formula">Run</button>
+    <button class="btn btn-sm btn-danger" onclick="WorkflowEditor.deleteFormula()" title="Disable formula">Disable</button>
+  </div>
+
+  <!-- Body: palette + canvas + props -->
+  <div class="wfe-body">
+
+    <!-- Palette -->
+    <div class="wfe-palette" aria-label="Node palette">
+      <div class="wfe-palette-item" data-type="step" draggable="true" title="Drag to add step">
+        <svg width="24" height="18" viewBox="0 0 24 18" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect x="1" y="1" width="22" height="16" rx="4" stroke="var(--text-secondary)" stroke-width="1.5"/>
+        </svg>
+      </div>
+      <span class="wfe-palette-label">Step</span>
+
+      <div class="wfe-palette-item" data-type="condition" draggable="true" title="Drag to add condition">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <polygon points="10,1 19,10 10,19 1,10" stroke="var(--amber)" stroke-width="1.5" fill="none"/>
+        </svg>
+      </div>
+      <span class="wfe-palette-label">Condition</span>
+    </div>
+
+    <!-- SVG Canvas -->
+    <div class="wfe-canvas" id="wfe-canvas-container">
+      <svg id="wfe-svg" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <pattern id="wfe-grid" width="24" height="24" patternUnits="userSpaceOnUse">
+            <circle cx="12" cy="12" r="1" fill="var(--border)"/>
+          </pattern>
+          <marker id="wfe-arrowhead" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+            <polygon points="0 0, 8 3, 0 6" fill="var(--text-secondary)" opacity="0.6"/>
+          </marker>
+          <marker id="wfe-arrowhead-accent" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+            <polygon points="0 0, 8 3, 0 6" fill="var(--accent)"/>
+          </marker>
+          <marker id="wfe-arrowhead-red" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+            <polygon points="0 0, 8 3, 0 6" fill="var(--red)"/>
+          </marker>
+        </defs>
+        <rect width="100%" height="100%" fill="url(#wfe-grid)"/>
+        <g id="wfe-canvas-group"></g>
+      </svg>
+
+      <!-- Empty state -->
+      <div class="wfe-empty-state" id="wfe-empty-state">
+        <svg width="48" height="48" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect x="4" y="4" width="40" height="40" rx="8" stroke="var(--text-secondary)" stroke-width="2" stroke-dasharray="6 4"/>
+          <path d="M24 16v16M16 24h16" stroke="var(--text-secondary)" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+        <div class="wfe-empty-state-title">Drag a step to begin</div>
+        <div class="wfe-empty-state-desc">Or select a formula from the dropdown above</div>
+      </div>
+    </div>
+
+    <!-- Property Panel -->
+    <div id="wfe-props" class="wfe-props">
+      <p style="color:var(--text-secondary);font-size:0.85rem;">Select a node to edit its properties.</p>
+    </div>
+
+  </div>
+
+  <!-- Validation bar -->
+  <div id="wfe-validation" class="wfe-validation">Ready</div>
+
+  <!-- Context menu (hidden) -->
+  <div id="wfe-context-menu" class="wfe-context-menu" style="display:none"></div>
+
+</div>
+{{ end }}
+
+{{ define "styles" }}
+<link rel="stylesheet" href="/css/workflow-editor.css">
+{{ end }}
+
+{{ define "scripts" }}
+<script src="/js/auth.js"></script>
+<script src="/js/workflow-serializer.js"></script>
+<script src="/js/workflow-editor.js"></script>
+{{ end }}
