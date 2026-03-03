@@ -98,6 +98,65 @@ pub fn validate_write_path(
     Ok(canonical)
 }
 
+/// Validate a read path WITHOUT checking allowed directories (unrestricted mode).
+/// Still enforces: traversal rejection, blocked patterns, size limits, must be a file.
+pub fn validate_read_path_unrestricted(path: &str, max_size: u64) -> Result<PathBuf, String> {
+    let path = expand_tilde(path);
+    reject_traversal(&path)?;
+
+    let canonical =
+        std::fs::canonicalize(&path).map_err(|e| format!("cannot resolve path: {e}"))?;
+
+    check_blocked(&canonical)?;
+
+    let meta = std::fs::metadata(&canonical).map_err(|e| format!("cannot stat file: {e}"))?;
+    if !meta.is_file() {
+        return Err("path is not a regular file".to_string());
+    }
+    if meta.len() > max_size {
+        return Err(format!(
+            "file too large ({} bytes, max {})",
+            meta.len(),
+            max_size
+        ));
+    }
+
+    Ok(canonical)
+}
+
+/// Validate a write path WITHOUT checking allowed directories (unrestricted mode).
+/// Still enforces: traversal rejection, blocked patterns, size limits, parent must exist.
+pub fn validate_write_path_unrestricted(
+    path: &str,
+    content_size: u64,
+    max_size: u64,
+) -> Result<PathBuf, String> {
+    let path = expand_tilde(path);
+    reject_traversal(&path)?;
+
+    if content_size > max_size {
+        return Err(format!(
+            "content too large ({content_size} bytes, max {max_size})"
+        ));
+    }
+
+    let p = Path::new(&path);
+    let parent = p
+        .parent()
+        .ok_or_else(|| "invalid path: no parent directory".to_string())?;
+    let file_name = p
+        .file_name()
+        .ok_or_else(|| "invalid path: no file name".to_string())?;
+
+    let canonical_parent =
+        std::fs::canonicalize(parent).map_err(|e| format!("parent directory not found: {e}"))?;
+    let canonical = canonical_parent.join(file_name);
+
+    check_blocked(&canonical)?;
+
+    Ok(canonical)
+}
+
 // ---------------------------------------------------------------------------
 // File I/O
 // ---------------------------------------------------------------------------
@@ -465,6 +524,53 @@ mod tests {
         std::fs::write(&file, "SECRET=foo").unwrap();
         let allowed = vec![dir.path().to_string_lossy().to_string()];
         let result = validate_read_path(&file.to_string_lossy(), &allowed, 1_000_000);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("sensitive"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Unrestricted mode tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_read_unrestricted_allows_any_dir() {
+        // /etc/hosts exists on macOS/Linux and is outside any project dir
+        let result = validate_read_path_unrestricted("/etc/hosts", 1_000_000);
+        assert!(result.is_ok(), "unrestricted read should allow any dir");
+    }
+
+    #[test]
+    fn test_validate_read_unrestricted_blocks_sensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".env");
+        std::fs::write(&file, "SECRET=foo").unwrap();
+        let result = validate_read_path_unrestricted(&file.to_string_lossy(), 1_000_000);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("sensitive"));
+    }
+
+    #[test]
+    fn test_validate_read_unrestricted_blocks_traversal() {
+        let result = validate_read_path_unrestricted("../../../etc/passwd", 1_000_000);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("traversal"));
+    }
+
+    #[test]
+    fn test_validate_write_unrestricted_allows_any_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_canonical = std::fs::canonicalize(dir.path()).unwrap();
+        let file = dir_canonical.join("test.txt");
+        let result = validate_write_path_unrestricted(&file.to_string_lossy(), 10, 1024);
+        assert!(result.is_ok(), "unrestricted write should allow any dir");
+    }
+
+    #[test]
+    fn test_validate_write_unrestricted_blocks_sensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_canonical = std::fs::canonicalize(dir.path()).unwrap();
+        let file = dir_canonical.join(".env");
+        let result = validate_write_path_unrestricted(&file.to_string_lossy(), 10, 1024);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("sensitive"));
     }

@@ -322,15 +322,9 @@ async fn run_cycle(state: &AppState) -> Result<(), BroodlinkError> {
     }
 
     // -----------------------------------------------------------------------
-    // 3. Sync Beads issues
+    // 3. Sync Beads issues (skipped — issues managed via API, bd CLI not needed)
     // -----------------------------------------------------------------------
-    let beads_synced = match sync_beads(&state.dolt, &state.config.beads.bd_binary).await {
-        Ok(n) => n,
-        Err(e) => {
-            warn!(error = %e, "beads sync failed");
-            0
-        }
-    };
+    let beads_synced: usize = 0;
 
     // -----------------------------------------------------------------------
     // 4. Update daily summary

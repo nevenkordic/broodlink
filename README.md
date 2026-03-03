@@ -11,14 +11,15 @@ Broodlink lets multiple AI agents work together. Instead of one AI working alone
 ## Quick Start
 
 ```bash
-# Option A: One-shot bootstrap (installs everything from scratch)
-bash scripts/bootstrap.sh
+# Recommended: use broodctl to manage the stack
+./broodctl up          # Start everything (infrastructure + services)
+./broodctl status      # Check full stack status
+./broodctl health      # Verify all health endpoints
+./broodctl rebuild     # Build from source + restart
+./broodctl down        # Stop everything
 
-# Option B: Step by step
-bash scripts/secrets-init.sh              # Generate keys + secrets
-bash scripts/db-setup.sh                  # Create databases + tables
-bash scripts/build.sh                     # Build all Rust services + Hugo site
-bash scripts/start-services.sh            # Start all 7 services
+# First-time setup from scratch
+bash scripts/bootstrap.sh
 ```
 
 After startup, you'll have:
@@ -86,7 +87,7 @@ After startup, you'll have:
 8. **Conversational gateway** (v0.7.0) -- a2a-gateway receives Slack/Teams/Telegram messages → creates chat sessions → routes to coordinator for task creation → delivers replies via platform-specific APIs -- `list_chat_sessions`/`reply_to_chat` tools for agent interaction -- direct Ollama LLM chat with 10 tools: web_search (Brave), fetch_webpage (direct HTTP GET), remember, schedule_task, list_scheduled_tasks, cancel_scheduled_task, read_file, write_file, read_pdf, read_docx -- **auto-fetch from history** (v0.11.0): DB query finds URLs from past messages beyond the context window, fetches the most recent, injects content into system prompt — no tool calling needed -- **retry with reduced tools** (v0.11.0): when model exhausts thinking budget, retries with 3-tool set and last 6 conversation turns -- **streaming responses** (v0.11.0): Telegram messages stream progressively via `editMessageText` (~1 edit/800ms, 30-token minimum), tool calls pause stream and show indicator -- **multi-Ollama load balancing** (v0.11.0): `OllamaPool` distributes inference across multiple instances (least-loaded healthy, 30s health probe, auto-recovery) -- **multi-modal attachments** (v0.11.0): Slack file uploads (via `url_private` + bot token), Telegram photos/documents (via `getFile` API), and Teams attachments are downloaded, classified (image/audio/video/document), stored to `attachments_dir`, and persisted in `chat_attachments` table -- efficiency safeguards: concurrency semaphore, Brave search result cache (5-min TTL), duplicate message suppression (30s dedup), typing indicator refresh (4s) -- busy/dedup replies excluded from conversation history -- Telegram access code authentication -- cascade delete on bot disconnect -- NATS-based credential cache invalidation -- **self-healing model failover**: on OOM, tries recovery (unload → retry), if still failing enters degraded mode (fallback model answers questions directly), probes primary model every 5 min -- **verification timeout caveat** (v0.11.0): timed-out verifications append `[Unverified]` instead of silently passing
 9. **Formula registry** (v0.7.0) -- bidirectional sync between TOML files and Postgres `formula_registry` -- system formulas (`.beads/formulas/*.formula.toml`) synced to Postgres by heartbeat (TOML wins, `definition_hash` skip when unchanged) -- user formulas written through to `custom/` TOML on every create/update -- custom TOML backfilled to Postgres on startup (insert only, never overwrite) -- heartbeat safety net rewrites missing user formula TOMLs within one cycle -- system formulas are immutable via API (must copy to new name) -- name collision guard prevents user formulas from shadowing system names -- `list_formulas`/`get_formula`/`create_formula`/`update_formula` tools for CRUD
 10. **Dashboard auth** (v0.7.0) -- session-based RBAC (viewer/operator/admin) -- bcrypt passwords, session tokens in Postgres -- API key fallback when auth disabled -- role enforcement in JS control panel
-11. **Heartbeat cycle** (every 5 min) -- Dolt commit, Beads issue sync, agent metrics computation, daily summary generation, stale agent deactivation, memory search index sync (Dolt → Postgres), knowledge graph backfill, KG entity/edge expiry with weight decay, daily budget replenishment, chat session expiry, dashboard session cleanup, formula registry sync (system TOML → Postgres, custom TOML backfill, hash backfill, disk safety net), **notification rule evaluation** (service_event_error, dlq_spike, budget_low conditions with cooldown and auto-postmortem)
+11. **Heartbeat cycle** (every 5 min) -- Dolt commit, agent metrics computation, daily summary generation, stale agent deactivation, memory search index sync (Dolt → Postgres), knowledge graph backfill, KG entity/edge expiry with weight decay, daily budget replenishment, chat session expiry, dashboard session cleanup, formula registry sync (system TOML → Postgres, custom TOML backfill, hash backfill, disk safety net), **notification rule evaluation** (service_event_error, dlq_spike, budget_low conditions with cooldown and auto-postmortem)
 12. **Scheduled task promotion** -- coordinator polls `scheduled_tasks` every 60 seconds -- promotes due tasks into `task_queue` -- supports one-shot (disable after fire) and recurring (`next_run_at += recurrence_secs`) -- optional formula execution -- publishes NATS `task_available` for immediate routing
 13. **Notification dispatch** -- `send_notification` tool inserts `notification_log` + publishes NATS `notification.send` -- a2a-gateway subscribes and delivers to Telegram (bot API) or Slack (incoming webhook) -- delivery status tracked as pending/sent/failed
 
@@ -104,7 +105,7 @@ After startup, you'll have:
 |---------|------|-----------|---------|
 | beads-bridge | 3310 | HTTP + NATS | Universal tool API (96 tools), JWT RS256 auth with kid-based multi-key validation, rate limiting, budget enforcement, circuit breakers, JWKS endpoint, SSE streaming, task negotiation tools (decline/context request) |
 | coordinator | -- | NATS only | Smart task routing with weighted scoring, atomic claiming, exponential backoff, dead-letter queue with auto-retry, workflow orchestration with conditional steps, parallel groups, per-step retries, timeouts, and error handlers, multi-agent task decomposition, scheduled task promotion (60s polling), task negotiation protocol (decline/redirect/context request with max-decline dead-letter) |
-| heartbeat | -- | NATS + DB | 5-min sync cycle: Dolt commit, Beads sync, agent metrics, daily summary, stale agent deactivation, KG entity/edge expiry with weight decay, daily budget replenishment, formula registry sync, notification rule evaluation |
+| heartbeat | -- | NATS + DB | 5-min sync cycle: Dolt commit, agent metrics, daily summary, stale agent deactivation, KG entity/edge expiry with weight decay, daily budget replenishment, formula registry sync, notification rule evaluation |
 | embedding-worker | -- | NATS + DB | Outbox poll -- Ollama `nomic-embed-text` embeddings -- Qdrant upsert -- LLM entity extraction for knowledge graph, circuit breakers, smart chunk boundaries (heading/code-fence/paragraph-aware splitting) |
 | status-api | 3312 | HTTP | Dashboard API with API key + session auth (RBAC on all mutations), CORS, security headers (HSTS, CSP, X-Frame-Options), SSE stream proxy, control panel endpoints (agent toggle, budget set, task cancel, webhook CRUD, guardrails, DLQ), chat session management, chat attachment retrieval and thumbnails, formula registry CRUD, user management, agent onboarding with JWT generation, verification analytics |
 | mcp-server | 3311 | HTTP + stdio | MCP protocol server (streamable HTTP + legacy stdio), proxies bridge tools |
@@ -141,7 +142,7 @@ All configuration lives in `config.toml`. Every field can be overridden with env
 ## Testing
 
 ```bash
-cargo test --workspace                    # 346 unit tests
+cargo test --workspace                    # 367 unit tests
 bash tests/run-all.sh                     # 22 integration test suites
 bash tests/e2e.sh                         # 124 end-to-end tests (requires running services)
 bash tests/v060-regression.sh             # 164 v0.6.0 regression tests
@@ -155,13 +156,25 @@ Measured on Mac Studio — Apple M4 Max, 16 cores (12P + 4E), 128 GB unified mem
 
 ### Ollama Models
 
-| Model | Role | Size | Prompt | Generation |
-|-------|------|------|--------|------------|
-| qwen3:30b-a3b | Primary chat | 18 GB | 104 tok/s | 95.7 tok/s |
-| deepseek-r1:14b | Verifier | 9 GB | 156 tok/s | 46.2 tok/s |
-| qwen3:1.7b | Fallback | 1.4 GB | 606 tok/s | 191.2 tok/s |
-| gemma3:27b | Vision | 17 GB | 78 tok/s | 25.1 tok/s |
-| nomic-embed-text | Embeddings | 274 MB | — | 13.9 emb/s |
+| Model | Role | Size | Generation | Accuracy |
+|-------|------|------|------------|----------|
+| qwen3.5:35b | Primary chat | 23 GB | 43 tok/s | 100% (13/13 bench) |
+| qwen3-coder:30b | Code | 18 GB | 72 tok/s | 100% (4/4 bench) |
+| qwen3.5:4b | Fallback/expansion | 3.4 GB | 54 tok/s | 78% (7/9 bench) |
+| deepseek-r1:32b | Verifier | 19 GB | 9-22 tok/s | 75% (3/4 bench) |
+| gemma3:27b | Vision | 17 GB | 25 tok/s | — |
+| nomic-embed-text | Embeddings | 274 MB | 13.9 emb/s | — |
+
+### vs Cloud Models (published benchmarks)
+
+| Model | MMLU | HumanEval | MATH | SWE-bench |
+|-------|------|-----------|------|-----------|
+| Claude Opus 4.6 | 88.7% | 94.5% | 78.3% | 80%+ |
+| GPT-4o | 87.2% | 90.2% | 76.6% | 33.2% |
+| **qwen3.5:35b (local)** | ~82% | ~85% | ~73% | 76.4% |
+| **qwen3-coder:30b (local)** | — | ~88% | — | ~70% |
+
+Local models achieve ~85-95% of cloud quality at zero cost, zero latency, full privacy.
 
 ### Services & Databases
 
@@ -191,6 +204,7 @@ Measured on Mac Studio — Apple M4 Max, 16 cores (12P + 4E), 128 GB unified mem
 
 | Script | Purpose |
 |--------|---------|
+| `broodctl` | **Stack manager**: `up`/`down`/`restart`/`rebuild`/`status`/`health`/`logs`/`doctor` — single command for everything |
 | `scripts/bootstrap.sh` | One-shot setup: prerequisites check, infrastructure, secrets, databases, build, onboard, start |
 | `scripts/start-services.sh` | Start/stop all 7 Rust services + Hugo (`--stop` to stop) |
 | `scripts/build.sh` | cargo deny + tests + release build + Hugo |
@@ -229,7 +243,8 @@ broodlink/
 ├── agents/                       # Python SDK: typed clients, Click CLI, BaseAgent framework, ML utilities
 ├── status-site/                  # Hugo dashboard (WCAG 2.1 AA, 17 pages)
 │   └── themes/broodlink-status/
-├── migrations/                   # SQL migrations (32 files, additive only)
+├── broodctl                      # Stack manager (up/down/status/rebuild/doctor)
+├── migrations/                   # SQL migrations (33 files, additive only)
 │   ├── 001_dolt_brain.sql
 │   ├── 002_postgres_hotpaths.sql
 │   ├── 003_postgres_functions.sql
@@ -261,7 +276,8 @@ broodlink/
 │   ├── 027_service_events.sql
 │   ├── 028_proactive_skills.sql
 │   ├── 029_negotiation_protocol.sql
-│   └── 030_chat_attachments.sql
+│   ├── 030_chat_attachments.sql
+│   └── 031_runtime_settings.sql
 ├── tests/                        # Integration + E2E test suites
 ├── templates/                    # System prompt template for agent onboarding
 ├── scripts/                      # Build, setup, onboarding, and dev scripts

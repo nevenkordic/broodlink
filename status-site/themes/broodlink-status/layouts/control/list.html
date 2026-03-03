@@ -37,6 +37,7 @@
   <button role="tab" aria-selected="false" aria-controls="panel-formulas" id="tab-formulas" class="tab" data-tab="formulas">Formulas</button>
   <button role="tab" aria-selected="false" aria-controls="panel-users" id="tab-users" class="tab" data-tab="users">Users</button>
   <button role="tab" aria-selected="false" aria-controls="panel-services" id="tab-services" class="tab" data-tab="services">Services</button>
+  <button role="tab" aria-selected="false" aria-controls="panel-schedules" id="tab-schedules" class="tab" data-tab="schedules">Schedules</button>
   <button role="tab" aria-selected="false" aria-controls="panel-telegram" id="tab-telegram" class="tab" data-tab="telegram">Telegram</button>
 </nav>
 
@@ -119,7 +120,34 @@
 
 <!-- Guardrails Tab -->
 <section role="tabpanel" id="panel-guardrails" aria-labelledby="tab-guardrails" hidden>
-  <div class="ctrl-section-header">
+  <!-- Security Overrides -->
+  <div class="ctrl-section-header"><h3>Security Overrides</h3></div>
+  <div id="ctrl-security-overrides">
+    <div class="ctrl-override-card" id="ucm-card">
+      <div class="ctrl-override-info">
+        <div class="ctrl-override-label">
+          <strong>Unrestricted Code Mode</strong>
+          <span id="ucm-badge" class="ctrl-badge ctrl-badge-offline">OFF</span>
+        </div>
+        <p class="ctrl-override-desc">
+          AI can write files and run commands in any directory.
+          Blocked patterns, size limits, and write approval still apply.
+        </p>
+      </div>
+      <div class="ctrl-override-action ctrl-write-action">
+        <label class="ctrl-toggle">
+          <input type="checkbox" id="ucm-toggle" onchange="Ctrl.toggleSetting('unrestricted_code_mode', this.checked)">
+          <span class="ctrl-toggle-slider"></span>
+        </label>
+      </div>
+    </div>
+    <div id="ucm-warning" class="alert alert-error" style="display:none">
+      <strong>Unrestricted Code Mode is active.</strong>
+      AI agents can write to any directory. Last changed by <span id="ucm-changed-by"></span>.
+    </div>
+  </div>
+
+  <div class="ctrl-section-header" style="margin-top:1.5rem">
     <h3>Guardrail Policies</h3>
   </div>
   <div class="table-container">
@@ -330,6 +358,30 @@
         </tr>
       </thead>
       <tbody id="ctrl-service-events-tbody" aria-live="polite"></tbody>
+    </table>
+  </div>
+</section>
+
+<!-- Schedules Tab -->
+<section role="tabpanel" id="panel-schedules" aria-labelledby="tab-schedules" hidden>
+  <div class="ctrl-section-header">
+    <h3>Scheduled Tasks</h3>
+    <span id="ctrl-schedules-summary" style="color:var(--muted)"></span>
+  </div>
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Title</th>
+          <th scope="col">Next Run</th>
+          <th scope="col">Recurrence</th>
+          <th scope="col">Runs</th>
+          <th scope="col">Created By</th>
+          <th scope="col">Enabled</th>
+          <th scope="col">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="ctrl-schedules-tbody" aria-live="polite"></tbody>
     </table>
   </div>
 </section>

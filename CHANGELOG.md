@@ -5,6 +5,65 @@ All notable changes to Broodlink are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.12.1] - 2026-03-03
+
+### Added
+
+- **Scheduled Tasks Dashboard**: New "Schedules" tab in the control panel
+  showing all scheduled tasks with title, next run, recurrence, run count,
+  and enable/disable toggle. New status-api endpoints:
+  `GET /api/v1/scheduled-tasks`, `POST /api/v1/scheduled-tasks/:id/toggle`.
+- **broodctl**: Single command to manage the entire Broodlink stack.
+  Commands: `up`, `down`, `restart`, `rebuild`, `status`, `health`, `logs`,
+  `doctor`. Replaces the need to manually manage LaunchAgents and Podman.
+- **think:false Retry**: When qwen3.5's thinking chain exhausts the entire
+  `num_predict` budget (producing empty content), the system automatically
+  retries with `think: false` for a direct response. Eliminates the ~15%
+  empty response rate on complex prompts.
+
+### Changed
+
+- **Model Upgrade**: Switched from Qwen3 to Qwen3.5 generation.
+  `chat_model`: qwen3:30b-a3b → qwen3.5:35b,
+  `chat_fallback_model`: qwen3:1.7b → qwen3.5:4b,
+  `kg_extraction_model` and `query_expansion_model`: qwen3:1.7b → qwen3.5:4b.
+  Ollama upgraded from 0.17.0 → 0.17.5 (required for qwen3.5 support).
+- **num_predict Increase**: Bumped from 512 → 4096 for all response paths
+  (8192 when tools are active). Qwen3.5's thinking chains are 3000-6000+
+  tokens; the old 512 budget left <100 tokens for visible content.
+- **num_ctx Increase**: 4096 → 8192 in config. The system prompt + tools +
+  conversation history was consuming most of the old 4096 budget.
+- **System Prompt**: Changed from "Be extremely brief: 1-3 short sentences"
+  to "Be concise but thorough: give complete, useful answers" — allows the
+  model to give detailed help on complex tasks.
+
+### Fixed
+
+- **Memory Agent Isolation**: `recall_memory` now filters by calling agent's
+  `agent_name` (was returning ALL agents' memories due to unused `_agent_id`
+  parameter). `delete_memory` now scopes Dolt DELETE by `agent_name` (was
+  allowing any agent to delete any memory by topic). `semantic_search` and
+  `hybrid_search` now auto-filter by calling agent when `agent_id` param is
+  not explicitly provided.
+- **Schedule Timezone**: `schedule_task` now converts `DateTime<FixedOffset>`
+  to UTC with `.with_timezone(&chrono::Utc)` before binding to Postgres
+  TIMESTAMPTZ. Previously, non-UTC offsets could cause tasks to trigger at
+  wrong times.
+- **qwen3-coder think:true Crash**: `qwen3-coder:30b` does not support
+  thinking mode. The a2a-gateway now detects `-coder` in the model name and
+  disables `think` for those models. Previously, every code-routed chat
+  failed with an Ollama error.
+- **Agent Dispatch**: `a2a-gateway` agent was `active: false` in the agent
+  registry, preventing the coordinator from dispatching tasks to it. Test
+  agents (`cors-test`, `test-browser`, `test-ui`) were `active: true`,
+  stealing task claims without executing them. Fixed: a2a-gateway activated,
+  test agents deactivated. Cleaned up 108 stuck tasks.
+- **Heartbeat bd CLI Noise**: Removed the `sync_beads()` call that tried to
+  run the never-installed `bd` binary every 5 minutes. Issues are managed
+  via direct DB operations; the CLI is vestigial.
+- **Timezone unwrap**: Replaced `.unwrap()` with `.expect("AEST +11")` on
+  `FixedOffset::east_opt()` calls in a2a-gateway for better diagnostics.
+
 ## [0.11.0] - 2026-02-28
 
 ### Added

@@ -368,6 +368,55 @@
   }
 
   // -----------------------------------------------------------------------
+  // Runtime settings (Security Overrides)
+  // -----------------------------------------------------------------------
+  function loadSettings() {
+    BL.fetchApi('/api/v1/settings').then(function (data) {
+      var settings = data.settings || [];
+      settings.forEach(function (s) {
+        if (s.key === 'unrestricted_code_mode') {
+          var enabled = s.value === true;
+          var toggle = document.getElementById('ucm-toggle');
+          var badge = document.getElementById('ucm-badge');
+          var warning = document.getElementById('ucm-warning');
+          var card = document.getElementById('ucm-card');
+          var changedBy = document.getElementById('ucm-changed-by');
+
+          if (toggle) toggle.checked = enabled;
+          if (badge) {
+            badge.textContent = enabled ? 'ON' : 'OFF';
+            badge.className = 'ctrl-badge ' + (enabled ? 'ctrl-badge-failed' : 'ctrl-badge-offline');
+          }
+          if (warning) warning.style.display = enabled ? 'block' : 'none';
+          if (card) card.className = 'ctrl-override-card' + (enabled ? ' active' : '');
+          if (changedBy && s.changed_by) changedBy.textContent = BL.escapeHtml(s.changed_by);
+        }
+      });
+    }).catch(function () {});
+  }
+
+  function toggleSetting(key, checked) {
+    var msg = checked
+      ? 'ENABLE Unrestricted Code Mode? AI agents will be able to write files and run commands in ANY directory.'
+      : 'Disable Unrestricted Code Mode? AI agents will be restricted to configured directories only.';
+    if (!confirm(msg)) {
+      var toggle = document.getElementById('ucm-toggle');
+      if (toggle) toggle.checked = !checked;
+      return;
+    }
+    postApi('/api/v1/settings/' + encodeURIComponent(key) + '/toggle')
+      .then(function () {
+        toast('Setting "' + key + '" ' + (checked ? 'enabled' : 'disabled'), checked ? 'error' : 'success');
+        loadSettings();
+      })
+      .catch(function (err) {
+        toast('Toggle failed: ' + (err.message || err), 'error');
+        var toggle = document.getElementById('ucm-toggle');
+        if (toggle) toggle.checked = !checked;
+      });
+  }
+
+  // -----------------------------------------------------------------------
   // DLQ tab
   // -----------------------------------------------------------------------
   function loadDlq() {
@@ -699,6 +748,9 @@
     var Auth = window.BLAuth;
     if (!Auth) return;
 
+    // Skip role enforcement when dashboard auth is disabled (API-key-only mode)
+    if (!Auth.isAuthenticated()) return;
+
     // Hide Users tab if not admin
     var usersTab = document.querySelector('[data-tab="users"]');
     if (usersTab && !Auth.isAdmin()) {
@@ -886,19 +938,73 @@
   }
 
   // -----------------------------------------------------------------------
+  // Scheduled Tasks
+  // -----------------------------------------------------------------------
+  function formatRecurrence(secs) {
+    if (!secs) return 'One-shot';
+    if (secs < 60) return secs + 's';
+    if (secs < 3600) return Math.round(secs / 60) + ' min';
+    if (secs < 86400) return Math.round(secs / 3600) + ' hr';
+    return Math.round(secs / 86400) + ' day';
+  }
+
+  function loadSchedules() {
+    fetchApi('/scheduled-tasks').then(function (data) {
+      var summary = document.getElementById('ctrl-schedules-summary');
+      if (summary) summary.textContent = data.active + ' active / ' + data.total + ' total';
+
+      var tb = document.getElementById('ctrl-schedules-tbody');
+      if (!tb) return;
+      if (!data.tasks || data.tasks.length === 0) {
+        tb.innerHTML = '<tr><td colspan="7" style="color:var(--muted)">No scheduled tasks</td></tr>';
+        return;
+      }
+      tb.innerHTML = data.tasks.map(function (t) {
+        var statusClass = t.enabled ? 'badge badge-ok' : 'badge badge-warn';
+        var statusText = t.enabled ? 'Active' : 'Disabled';
+        var runs = t.run_count + (t.max_runs ? '/' + t.max_runs : '');
+        return '<tr>' +
+          '<td><strong>' + BL.escapeHtml(t.title) + '</strong>' +
+            (t.description ? '<br><small style="color:var(--muted)">' + BL.escapeHtml(t.description).substring(0, 80) + '</small>' : '') +
+          '</td>' +
+          '<td>' + BL.escapeHtml(t.next_run_at || '-') + '</td>' +
+          '<td>' + formatRecurrence(t.recurrence_secs) + '</td>' +
+          '<td>' + runs + '</td>' +
+          '<td>' + BL.escapeHtml(t.created_by || '-') + '</td>' +
+          '<td><span class="' + statusClass + '">' + statusText + '</span></td>' +
+          '<td><button class="btn btn-sm" onclick="Ctrl.toggleSchedule(' + t.id + ')">' +
+            (t.enabled ? 'Disable' : 'Enable') + '</button></td>' +
+          '</tr>';
+      }).join('');
+    }).catch(function (err) {
+      var tb = document.getElementById('ctrl-schedules-tbody');
+      if (tb) tb.innerHTML = '<tr><td colspan="7" style="color:var(--red)">Failed: ' + BL.escapeHtml(err.message) + '</td></tr>';
+    });
+  }
+
+  function toggleSchedule(taskId) {
+    postApi('/scheduled-tasks/' + taskId + '/toggle').then(function () {
+      loadSchedules();
+    }).catch(function (err) {
+      alert('Toggle failed: ' + err.message);
+    });
+  }
+
+  // -----------------------------------------------------------------------
   function loadTab(name) {
     switch (name) {
       case 'agents': loadAgents(); break;
       case 'budgets': loadBudgets(); break;
       case 'tasks': loadTasks(); break;
       case 'workflows': loadWorkflows(); break;
-      case 'guardrails': loadGuardrails(); break;
+      case 'guardrails': loadGuardrails(); loadSettings(); break;
       case 'webhooks': loadWebhooks(); break;
       case 'dlq': loadDlq(); break;
       case 'chat': loadChat(); break;
       case 'formulas': loadFormulas(); break;
       case 'users': loadUsers(); break;
       case 'services': loadServices(); break;
+      case 'schedules': loadSchedules(); break;
       case 'telegram': loadTelegram(); break;
     }
   }
@@ -925,7 +1031,9 @@
     toggleUser: toggleUser,
     resetPassword: resetPassword,
     registerBot: registerBot,
-    disconnectBot: disconnectBot
+    disconnectBot: disconnectBot,
+    toggleSetting: toggleSetting,
+    toggleSchedule: toggleSchedule
   };
 
   // Initial load

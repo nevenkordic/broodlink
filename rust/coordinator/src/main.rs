@@ -505,13 +505,18 @@ fn determine_model_hint(
     description: Option<&str>,
     config: &Config,
 ) -> Option<String> {
-    // 1. Check formula metadata model_domain (from TOML file)
+    // 1. Check formula metadata model_domain (from TOML file — system then custom dir)
     if let Some(name) = formula_name {
-        let path = format!("{}/{}.formula.toml", config.beads.formulas_dir, name);
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            if let Ok(ff) = toml::from_str::<FormulaFile>(&contents) {
-                if let Some(domain) = &ff.formula.model_domain {
-                    return Some(domain.clone());
+        for dir in [
+            &config.beads.formulas_dir,
+            &config.beads.formulas_custom_dir,
+        ] {
+            let path = format!("{}/{}.formula.toml", dir, name);
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                if let Ok(ff) = toml::from_str::<FormulaFile>(&contents) {
+                    if let Some(domain) = &ff.formula.model_domain {
+                        return Some(domain.clone());
+                    }
                 }
             }
         }
@@ -2576,12 +2581,12 @@ async fn check_scheduled_tasks(state: &AppState) -> Result<u64, BroodlinkError> 
         i64,
         String,
         String,
-        i32,
+        Option<i32>,
         Option<String>,
         Option<serde_json::Value>,
         Option<i64>,
         Option<i32>,
-        i32,
+        Option<i32>,
     )> = sqlx::query_as(
         "SELECT id, title, COALESCE(description, ''), priority, formula_name, params,
                 recurrence_secs, max_runs, run_count
@@ -2599,7 +2604,7 @@ async fn check_scheduled_tasks(state: &AppState) -> Result<u64, BroodlinkError> 
         sched_id,
         title,
         description,
-        priority,
+        priority_opt,
         formula_name,
         _params,
         recurrence_secs,
@@ -2618,7 +2623,7 @@ async fn check_scheduled_tasks(state: &AppState) -> Result<u64, BroodlinkError> 
         .bind(&trace_id)
         .bind(title)
         .bind(description)
-        .bind(priority)
+        .bind(priority_opt.unwrap_or(0))
         .bind(formula_name)
         .execute(&state.pg)
         .await?;
@@ -2639,7 +2644,7 @@ async fn check_scheduled_tasks(state: &AppState) -> Result<u64, BroodlinkError> 
         }
 
         // Update scheduled_task
-        let new_count = run_count + 1;
+        let new_count = run_count.unwrap_or(0) + 1;
         match recurrence_secs {
             Some(interval_secs) if *interval_secs > 0 => {
                 // Recurring: advance next_run_at, check max_runs

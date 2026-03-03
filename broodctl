@@ -1,0 +1,496 @@
+#!/usr/bin/env bash
+# Broodlink — Multi-agent AI orchestration
+# Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# broodctl — single command to manage the entire Broodlink stack.
+#
+# Usage:
+#   ./broodctl up       — start everything (infra + services)
+#   ./broodctl down     — stop everything
+#   ./broodctl restart  — restart all services (rebuild first)
+#   ./broodctl status   — show full stack status
+#   ./broodctl health   — check all health endpoints
+#   ./broodctl logs [svc] — tail logs (all or specific service)
+#   ./broodctl build    — rebuild all Rust binaries
+#   ./broodctl doctor   — diagnose common problems
+set -euo pipefail
+
+BROOD_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOG_DIR="$HOME/logs/broodlink"
+PLIST_DIR="$HOME/Library/LaunchAgents"
+CONFIG="${BROODLINK_CONFIG:-$BROOD_DIR/config.toml}"
+SERVICES=(beads-bridge status-api coordinator heartbeat embedding-worker mcp-server a2a-gateway)
+CONTAINERS=(broodlink-postgres broodlink-nats broodlink-qdrant broodlink-jaeger)
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+ok()   { printf "  ${GREEN}✓${NC} %s\n" "$1"; }
+fail() { printf "  ${RED}✗${NC} %s\n" "$1"; }
+warn() { printf "  ${YELLOW}!${NC} %s\n" "$1"; }
+info() { printf "  ${CYAN}→${NC} %s\n" "$1"; }
+
+header() {
+  echo ""
+  printf "${BOLD}=== %s ===${NC}\n" "$1"
+}
+
+# ============================================================================
+# Infrastructure (Podman containers, Dolt, Ollama)
+# ============================================================================
+start_infra() {
+  header "Infrastructure"
+
+  # Podman containers
+  for ctr in "${CONTAINERS[@]}"; do
+    local status
+    status=$(podman inspect --format '{{.State.Status}}' "$ctr" 2>/dev/null || echo "missing")
+    if [[ "$status" == "running" ]]; then
+      ok "$ctr already running"
+    elif [[ "$status" == "exited" ]] || [[ "$status" == "created" ]]; then
+      podman start "$ctr" >/dev/null 2>&1
+      ok "$ctr started"
+    else
+      warn "$ctr not found — run 'podman-compose up -d' from $BROOD_DIR first"
+    fi
+  done
+
+  # Dolt
+  if pgrep -f "dolt sql-server" >/dev/null 2>&1; then
+    ok "Dolt already running"
+  else
+    info "Starting Dolt..."
+    cd "$HOME/.broodlink/dolt-data" 2>/dev/null || cd "$BROOD_DIR"
+    nohup dolt sql-server --host 127.0.0.1 --port 3307 > /tmp/broodlink-dolt.log 2>&1 &
+    ok "Dolt started (PID $!)"
+  fi
+
+  # Ollama
+  if pgrep -x ollama >/dev/null 2>&1; then
+    ok "Ollama already running"
+  else
+    info "Starting Ollama..."
+    brew services start ollama >/dev/null 2>&1 || ollama serve >/dev/null 2>&1 &
+    ok "Ollama started"
+  fi
+
+  # Wait for ports
+  info "Waiting for infrastructure ports..."
+  local all_ready=true
+  for attempt in 1 2 3 4 5; do
+    all_ready=true
+    for port in 3307 5432 4222 6333 11434; do
+      if ! nc -z localhost "$port" 2>/dev/null; then
+        all_ready=false
+      fi
+    done
+    if $all_ready; then break; fi
+    sleep 2
+  done
+
+  if $all_ready; then
+    ok "All infrastructure ports ready"
+  else
+    for port_name in "3307:Dolt" "5432:Postgres" "4222:NATS" "6333:Qdrant" "11434:Ollama"; do
+      local port="${port_name%%:*}"
+      local name="${port_name##*:}"
+      if nc -z localhost "$port" 2>/dev/null; then
+        ok "$name (:$port)"
+      else
+        fail "$name (:$port) not responding"
+      fi
+    done
+  fi
+}
+
+stop_infra() {
+  header "Stopping Infrastructure"
+  for ctr in "${CONTAINERS[@]}"; do
+    podman stop "$ctr" >/dev/null 2>&1 && ok "Stopped $ctr" || true
+  done
+  pkill -f "dolt sql-server" 2>/dev/null && ok "Stopped Dolt" || true
+  # Don't stop Ollama — it's a system service used by other things
+  info "Ollama left running (system service)"
+}
+
+# ============================================================================
+# Services (LaunchAgents)
+# ============================================================================
+start_services() {
+  header "Services"
+  mkdir -p "$LOG_DIR"
+
+  for svc in "${SERVICES[@]}"; do
+    local label="com.broodlink.$svc"
+    local plist="$PLIST_DIR/$label.plist"
+
+    if ! [[ -f "$plist" ]]; then
+      warn "$svc: no plist at $plist — skipping (run scripts/launchagents.sh install)"
+      continue
+    fi
+
+    # Check if already running
+    local pid
+    pid=$(launchctl list 2>/dev/null | grep "$label" | awk '{print $1}')
+    if [[ -n "$pid" ]] && [[ "$pid" != "-" ]]; then
+      ok "$svc already running (PID $pid)"
+    else
+      # Boot the agent
+      launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null || \
+        launchctl load "$plist" 2>/dev/null || true
+      sleep 0.5
+      pid=$(launchctl list 2>/dev/null | grep "$label" | awk '{print $1}')
+      if [[ -n "$pid" ]] && [[ "$pid" != "-" ]]; then
+        ok "$svc started (PID $pid)"
+      else
+        fail "$svc failed to start"
+      fi
+    fi
+  done
+}
+
+stop_services() {
+  header "Stopping Services"
+  for svc in "${SERVICES[@]}"; do
+    local label="com.broodlink.$svc"
+    local plist="$PLIST_DIR/$label.plist"
+    if [[ -f "$plist" ]]; then
+      launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || \
+        launchctl unload "$plist" 2>/dev/null || true
+      ok "Stopped $svc"
+    fi
+  done
+}
+
+restart_services() {
+  stop_services
+  sleep 2
+  start_services
+}
+
+# ============================================================================
+# Status
+# ============================================================================
+show_status() {
+  header "Infrastructure"
+  for ctr in "${CONTAINERS[@]}"; do
+    local status
+    status=$(podman inspect --format '{{.State.Status}}' "$ctr" 2>/dev/null || echo "missing")
+    if [[ "$status" == "running" ]]; then
+      ok "$ctr"
+    else
+      fail "$ctr ($status)"
+    fi
+  done
+
+  if pgrep -f "dolt sql-server" >/dev/null 2>&1; then ok "Dolt"; else fail "Dolt"; fi
+  if pgrep -x ollama >/dev/null 2>&1; then ok "Ollama"; else fail "Ollama"; fi
+
+  header "Ports"
+  for port_name in "3307:Dolt" "3310:beads-bridge" "3311:mcp-server" "3312:status-api" "3313:a2a-gateway" "4222:NATS" "5432:Postgres" "6333:Qdrant" "11434:Ollama" "16686:Jaeger"; do
+    local port="${port_name%%:*}"
+    local name="${port_name##*:}"
+    if nc -z localhost "$port" 2>/dev/null; then
+      ok "$name (:$port)"
+    else
+      fail "$name (:$port)"
+    fi
+  done
+
+  header "Services (LaunchAgents)"
+  for svc in "${SERVICES[@]}"; do
+    local label="com.broodlink.$svc"
+    local pid exit_code
+    pid=$(launchctl list 2>/dev/null | grep "$label" | awk '{print $1}')
+    exit_code=$(launchctl list 2>/dev/null | grep "$label" | awk '{print $2}')
+    if [[ -n "$pid" ]] && [[ "$pid" != "-" ]]; then
+      ok "$svc (PID $pid)"
+    elif [[ -n "$exit_code" ]]; then
+      fail "$svc (exit $exit_code)"
+    else
+      fail "$svc (not loaded)"
+    fi
+  done
+
+  header "Ollama Models"
+  if curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
+    curl -s http://localhost:11434/api/tags | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+for m in data.get('models',[]):
+    size = m.get('size',0)/1e9
+    print(f'  {m[\"name\"]:40s} {size:.1f} GB')
+" 2>/dev/null || warn "Could not list models"
+  else
+    fail "Ollama not responding"
+  fi
+
+  header "Binary Build Times"
+  for svc in "${SERVICES[@]}"; do
+    local bin="$BROOD_DIR/target/release/$svc"
+    if [[ -f "$bin" ]]; then
+      local mtime
+      mtime=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M" "$bin" 2>/dev/null || stat -c "%y" "$bin" 2>/dev/null | cut -d'.' -f1)
+      info "$svc: $mtime"
+    else
+      fail "$svc: not built"
+    fi
+  done
+}
+
+# ============================================================================
+# Health checks
+# ============================================================================
+check_health() {
+  header "Health Endpoints"
+  for port_svc in "3310:beads-bridge:/health" "3312:status-api:/api/v1/health" "3311:mcp-server:/health" "3313:a2a-gateway:/health"; do
+    local port="${port_svc%%:*}"
+    local rest="${port_svc#*:}"
+    local svc="${rest%%:*}"
+    local path="${rest#*:}"
+    local resp
+    resp=$(curl -sf -o /dev/null -w "%{http_code}" "http://127.0.0.1:${port}${path}" 2>/dev/null || echo "000")
+    if [[ "$resp" == "200" ]]; then
+      ok "$svc (:$port) — 200 OK"
+    else
+      fail "$svc (:$port) — HTTP $resp"
+    fi
+  done
+
+  header "Database Connectivity"
+  if nc -z localhost 3307 2>/dev/null; then ok "Dolt (:3307) reachable"; else fail "Dolt (:3307)"; fi
+  if nc -z localhost 5432 2>/dev/null; then ok "Postgres (:5432) reachable"; else fail "Postgres (:5432)"; fi
+  if curl -sf http://localhost:6333/collections >/dev/null 2>&1; then
+    ok "Qdrant (:6333) reachable"
+  else
+    fail "Qdrant (:6333)"
+  fi
+  if curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
+    ok "Ollama (:11434) reachable"
+  else
+    fail "Ollama (:11434)"
+  fi
+}
+
+# ============================================================================
+# Logs
+# ============================================================================
+show_logs() {
+  local target="${1:-all}"
+  if [[ "$target" == "all" ]]; then
+    tail -f "$LOG_DIR"/*.stdout.log
+  else
+    local logfile="$LOG_DIR/${target}.stdout.log"
+    if [[ -f "$logfile" ]]; then
+      tail -f "$logfile"
+    else
+      echo "No log found at $logfile"
+      echo "Available: $(ls "$LOG_DIR"/*.stdout.log 2>/dev/null | xargs -I{} basename {} .stdout.log | tr '\n' ' ')"
+    fi
+  fi
+}
+
+# ============================================================================
+# Build
+# ============================================================================
+do_build() {
+  header "Building Rust services (release)"
+  cd "$BROOD_DIR"
+  cargo build --release 2>&1
+  ok "Build complete"
+
+  header "New binary timestamps"
+  for svc in "${SERVICES[@]}"; do
+    local bin="$BROOD_DIR/target/release/$svc"
+    if [[ -f "$bin" ]]; then
+      local mtime
+      mtime=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M" "$bin" 2>/dev/null)
+      info "$svc: $mtime"
+    fi
+  done
+}
+
+# ============================================================================
+# Doctor — diagnose common problems
+# ============================================================================
+do_doctor() {
+  header "Diagnosing Broodlink stack"
+
+  # Check binaries exist
+  for svc in "${SERVICES[@]}"; do
+    if [[ -f "$BROOD_DIR/target/release/$svc" ]]; then
+      ok "Binary: $svc"
+    else
+      fail "Binary missing: $svc — run './broodctl build'"
+    fi
+  done
+
+  # Check config
+  if [[ -f "$CONFIG" ]]; then
+    ok "Config: $CONFIG"
+  else
+    fail "Config missing: $CONFIG"
+  fi
+
+  # Check secrets
+  if [[ -f "$BROOD_DIR/secrets.enc.json" ]]; then
+    ok "Encrypted secrets present"
+  else
+    warn "No secrets.enc.json — run 'scripts/secrets-init.sh'"
+  fi
+
+  # Check JWT tokens
+  for agent in claude qwen3 a2a-gateway mcp-server; do
+    if [[ -f "$HOME/.broodlink/jwt-${agent}.token" ]]; then
+      ok "JWT token: $agent"
+    else
+      warn "JWT token missing: $agent"
+    fi
+  done
+
+  # Check Podman machine
+  if podman info >/dev/null 2>&1; then
+    ok "Podman machine running"
+  else
+    fail "Podman machine not running — run 'podman machine start'"
+  fi
+
+  # Check LaunchAgent plists
+  for svc in "${SERVICES[@]}"; do
+    if [[ -f "$PLIST_DIR/com.broodlink.$svc.plist" ]]; then
+      ok "LaunchAgent plist: $svc"
+    else
+      fail "LaunchAgent plist missing: $svc — run 'scripts/launchagents.sh install'"
+    fi
+  done
+
+  # Check recent errors in logs
+  header "Recent Errors (last 24h)"
+  local has_errors=false
+  for svc in "${SERVICES[@]}"; do
+    local logfile="$LOG_DIR/${svc}.stdout.log"
+    if [[ -f "$logfile" ]]; then
+      local errors
+      errors=$(grep -c '"level":"ERROR"' "$logfile" 2>/dev/null || echo "0")
+      if [[ "$errors" -gt 0 ]]; then
+        warn "$svc: $errors ERROR entries in log"
+        has_errors=true
+      fi
+    fi
+  done
+  for svc in "${SERVICES[@]}"; do
+    local logfile="$LOG_DIR/${svc}.stderr.log"
+    if [[ -f "$logfile" ]] && [[ -s "$logfile" ]]; then
+      local panics
+      panics=$(grep -c "panicked" "$logfile" 2>/dev/null || echo "0")
+      if [[ "$panics" -gt 0 ]]; then
+        fail "$svc: $panics PANICS in stderr"
+        has_errors=true
+      fi
+    fi
+  done
+  if ! $has_errors; then
+    ok "No errors found"
+  fi
+
+  # Check disk space
+  local avail
+  avail=$(df -g "$BROOD_DIR" | tail -1 | awk '{print $4}')
+  if [[ "$avail" -lt 5 ]]; then
+    fail "Low disk space: ${avail}GB available"
+  else
+    ok "Disk space: ${avail}GB available"
+  fi
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+case "${1:-help}" in
+  up)
+    echo ""
+    printf "${BOLD}Starting Broodlink stack${NC}\n"
+    start_infra
+    start_services
+    sleep 3
+    check_health
+    echo ""
+    printf "${GREEN}${BOLD}Stack is up.${NC}\n"
+    echo "  Dashboard:    http://localhost:1313"
+    echo "  Logs:         ./broodctl logs [service]"
+    echo "  Status:       ./broodctl status"
+    echo ""
+    ;;
+  down)
+    echo ""
+    printf "${BOLD}Stopping Broodlink stack${NC}\n"
+    stop_services
+    stop_infra
+    echo ""
+    printf "${YELLOW}Stack stopped.${NC} Run ${BOLD}./broodctl up${NC} to restart.\n"
+    echo ""
+    ;;
+  restart)
+    echo ""
+    printf "${BOLD}Restarting Broodlink services${NC}\n"
+    restart_services
+    sleep 3
+    check_health
+    echo ""
+    ;;
+  rebuild)
+    echo ""
+    printf "${BOLD}Rebuilding and restarting${NC}\n"
+    do_build
+    restart_services
+    sleep 3
+    check_health
+    echo ""
+    ;;
+  status)
+    show_status
+    echo ""
+    ;;
+  health)
+    check_health
+    echo ""
+    ;;
+  logs)
+    show_logs "${2:-all}"
+    ;;
+  build)
+    do_build
+    ;;
+  doctor)
+    do_doctor
+    echo ""
+    ;;
+  *)
+    echo ""
+    echo "Broodlink Stack Manager"
+    echo ""
+    echo "Usage: ./broodctl <command>"
+    echo ""
+    echo "Commands:"
+    echo "  up        Start everything (infrastructure + services)"
+    echo "  down      Stop everything"
+    echo "  restart   Restart all services (keeps infrastructure)"
+    echo "  rebuild   Build from source, then restart services"
+    echo "  status    Show full stack status"
+    echo "  health    Check all health endpoints"
+    echo "  logs      Tail all logs (or: logs <service>)"
+    echo "  build     Build Rust binaries (no restart)"
+    echo "  doctor    Diagnose common problems"
+    echo ""
+    echo "Examples:"
+    echo "  ./broodctl up           # start the whole stack"
+    echo "  ./broodctl logs a2a-gateway   # tail a2a-gateway log"
+    echo "  ./broodctl rebuild      # rebuild + restart"
+    echo ""
+    ;;
+esac

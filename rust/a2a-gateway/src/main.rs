@@ -323,6 +323,10 @@ struct AppState {
     code_model_degraded_since: tokio::sync::RwLock<Option<std::time::Instant>>,
     // v0.10.0: Pending write approvals — approval_id → (path, content, oneshot::Sender)
     pending_writes: tokio::sync::RwLock<HashMap<String, PendingWriteEntry>>,
+    // v0.12.0: Pending command approvals — approval_id → (command, dir, oneshot::Sender)
+    pending_commands: tokio::sync::RwLock<HashMap<String, PendingCommandEntry>>,
+    // v0.12.0: Cached runtime setting — unrestricted code mode (10s TTL)
+    unrestricted_code_mode: tokio::sync::RwLock<Option<(bool, std::time::Instant)>>,
 }
 
 /// v0.10.0: Pending write approval waiting for user confirmation.
@@ -330,6 +334,15 @@ struct AppState {
 struct PendingWriteEntry {
     path: std::path::PathBuf,
     content: String,
+    sender: tokio::sync::oneshot::Sender<bool>,
+}
+
+/// v0.12.0: Pending command approval waiting for user confirmation.
+#[allow(dead_code)]
+struct PendingCommandEntry {
+    command: String,
+    working_dir: std::path::PathBuf,
+    timeout_secs: u64,
     sender: tokio::sync::oneshot::Sender<bool>,
 }
 
@@ -550,6 +563,8 @@ async fn async_main() {
         code_model_degraded: AtomicBool::new(false),
         code_model_degraded_since: tokio::sync::RwLock::new(None),
         pending_writes: tokio::sync::RwLock::new(HashMap::new()),
+        pending_commands: tokio::sync::RwLock::new(HashMap::new()),
+        unrestricted_code_mode: tokio::sync::RwLock::new(None),
     });
 
     // Spawn chat reply delivery loop
@@ -2458,7 +2473,7 @@ async fn webhook_telegram_handler(
 
     // v0.10.0: Handle callback queries (write approval inline buttons)
     if let Some(callback) = payload.get("callback_query") {
-        handle_write_callback(&state, callback).await;
+        handle_approval_callback(&state, callback).await;
         return (StatusCode::OK, "").into_response();
     }
 
@@ -2940,7 +2955,7 @@ async fn webhook_telegram_handler(
 async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -> Option<String> {
     // v0.10.0: Handle callback queries (write approval buttons)
     if let Some(callback) = update.get("callback_query") {
-        handle_write_callback(state, callback).await;
+        handle_approval_callback(state, callback).await;
         return None;
     }
 
@@ -3450,7 +3465,7 @@ async fn telegram_polling_loop(state: Arc<AppState>) {
 
             // v0.10.0: Handle callback queries in polling mode
             if let Some(callback) = update.get("callback_query") {
-                handle_write_callback(&state, callback).await;
+                handle_approval_callback(&state, callback).await;
                 continue;
             }
 
@@ -4602,7 +4617,7 @@ async fn handle_ollama_recovery(
         "think": !is_vision_model,
         "options": {
             "temperature": 0.7,
-            "num_predict": 512,
+            "num_predict": 4096_u32,
             "num_ctx": num_ctx,
         }
     });
@@ -4770,7 +4785,7 @@ async fn fallback_chat(
         "think": true,
         "options": {
             "temperature": 0.7,
-            "num_predict": 512,
+            "num_predict": 4096_u32,
             "num_ctx": num_ctx,
         }
     });
@@ -4921,7 +4936,7 @@ async fn request_write_approval(
 
     match ctx.platform.as_str() {
         "telegram" => {
-            send_telegram_inline_keyboard(state, &ctx.chat_id, &msg, &approval_id).await;
+            send_telegram_inline_keyboard(state, &ctx.chat_id, &msg, &approval_id, "write").await;
         }
         _ => {
             // For platforms without inline buttons, auto-reject
@@ -4960,12 +4975,126 @@ async fn request_write_approval(
     }
 }
 
+/// v0.12.0: Request user approval for a command execution via the chat platform.
+async fn request_command_approval(
+    state: &AppState,
+    chat_ctx: Option<&ChatContext>,
+    command: &str,
+    working_dir: &std::path::Path,
+    timeout_secs: u64,
+) -> String {
+    let ctx = match chat_ctx {
+        Some(c) => c,
+        None => return "Command approval requires a chat context (Telegram/Slack).".to_string(),
+    };
+
+    let approval_id = Uuid::new_v4().to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+
+    // Store pending command
+    {
+        let entry = PendingCommandEntry {
+            command: command.to_string(),
+            working_dir: working_dir.to_path_buf(),
+            timeout_secs,
+            sender: tx,
+        };
+        let mut guard = state.pending_commands.write().await;
+        guard.insert(approval_id.clone(), entry);
+    }
+
+    let msg = format!(
+        "AI wants to run:\n`{}`\nIn: `{}`\nTimeout: {}s",
+        command,
+        working_dir.display(),
+        timeout_secs,
+    );
+
+    match ctx.platform.as_str() {
+        "telegram" => {
+            send_telegram_inline_keyboard(state, &ctx.chat_id, &msg, &approval_id, "cmd").await;
+        }
+        _ => {
+            let mut guard = state.pending_commands.write().await;
+            guard.remove(&approval_id);
+            return "Command approval not supported on this platform.".to_string();
+        }
+    }
+
+    let timeout =
+        std::time::Duration::from_secs(state.config.chat.tools.command_approval_timeout_secs);
+
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(true)) => {
+            // Approved — execute command
+            info!(command = %command, dir = %working_dir.display(), "command approved, executing");
+            match run_shell_command(command, working_dir, timeout_secs).await {
+                Ok(output) => output,
+                Err(e) => format!("Command execution failed: {e}"),
+            }
+        }
+        Ok(Ok(false)) | Ok(Err(_)) => "Command rejected by user.".to_string(),
+        Err(_) => {
+            let mut guard = state.pending_commands.write().await;
+            guard.remove(&approval_id);
+            "Command approval timed out.".to_string()
+        }
+    }
+}
+
+/// Execute a shell command with timeout and output capture.
+async fn run_shell_command(
+    command: &str,
+    working_dir: &std::path::Path,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    let child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(working_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn command: {e}"))?;
+
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let exit_code = output.status.code().unwrap_or(-1);
+            let mut result = format!("Exit code: {exit_code}\n");
+            if !stdout.is_empty() {
+                result.push_str("stdout:\n");
+                result.push_str(&stdout);
+            }
+            if !stderr.is_empty() {
+                if !stdout.is_empty() {
+                    result.push('\n');
+                }
+                result.push_str("stderr:\n");
+                result.push_str(&stderr);
+            }
+            // Truncate to 4000 chars for model context
+            if result.len() > 4000 {
+                result.truncate(result.floor_char_boundary(4000));
+                result.push_str("\n... (truncated)");
+            }
+            Ok(result)
+        }
+        Ok(Err(e)) => Err(format!("Command failed: {e}")),
+        Err(_) => Err(format!("Command timed out after {timeout_secs}s")),
+    }
+}
+
 /// Send a Telegram message with Approve/Reject inline buttons.
+/// `prefix` controls the callback_data prefix (e.g., "write" → "write_approve:", "cmd" → "cmd_approve:").
 async fn send_telegram_inline_keyboard(
     state: &AppState,
     chat_id: &str,
     text: &str,
     approval_id: &str,
+    prefix: &str,
 ) {
     let (tg_token, _, _, _) = get_telegram_creds(state).await;
     let token = match tg_token {
@@ -4980,36 +5109,50 @@ async fn send_telegram_inline_keyboard(
         "parse_mode": "Markdown",
         "reply_markup": {
             "inline_keyboard": [[
-                {"text": "Approve", "callback_data": format!("write_approve:{approval_id}")},
-                {"text": "Reject", "callback_data": format!("write_reject:{approval_id}")},
+                {"text": "Approve", "callback_data": format!("{prefix}_approve:{approval_id}")},
+                {"text": "Reject", "callback_data": format!("{prefix}_reject:{approval_id}")},
             ]]
         }
     });
 
     if let Err(e) = state.http_client.post(&url).json(&payload).send().await {
-        warn!(error = %e, "failed to send write approval message");
+        warn!(error = %e, "failed to send approval message");
     }
 }
 
-/// Handle a Telegram callback query (inline button press) for write approval.
-async fn handle_write_callback(state: &AppState, callback: &serde_json::Value) {
+/// Handle a Telegram callback query (inline button press) for write/command approval.
+async fn handle_approval_callback(state: &AppState, callback: &serde_json::Value) {
     let data = callback.get("data").and_then(|d| d.as_str()).unwrap_or("");
     let callback_id = callback.get("id").and_then(|id| id.as_str()).unwrap_or("");
 
-    let (approved, approval_id) = if let Some(id) = data.strip_prefix("write_approve:") {
-        (true, id)
-    } else if let Some(id) = data.strip_prefix("write_reject:") {
-        (false, id)
-    } else {
+    // Write approvals
+    if let Some(id) = data.strip_prefix("write_approve:") {
+        resolve_write_approval(state, id, true).await;
+        answer_callback(state, callback_id, "Write approved").await;
         return;
-    };
+    }
+    if let Some(id) = data.strip_prefix("write_reject:") {
+        resolve_write_approval(state, id, false).await;
+        answer_callback(state, callback_id, "Write rejected").await;
+        return;
+    }
+    // Command approvals
+    if let Some(id) = data.strip_prefix("cmd_approve:") {
+        resolve_command_approval(state, id, true).await;
+        answer_callback(state, callback_id, "Command approved").await;
+        return;
+    }
+    if let Some(id) = data.strip_prefix("cmd_reject:") {
+        resolve_command_approval(state, id, false).await;
+        answer_callback(state, callback_id, "Command rejected").await;
+    }
+}
 
-    // Resolve the pending write
+async fn resolve_write_approval(state: &AppState, approval_id: &str, approved: bool) {
     let sender = {
         let mut guard = state.pending_writes.write().await;
         guard.remove(approval_id).map(|entry| entry.sender)
     };
-
     if let Some(tx) = sender {
         let _ = tx.send(approved);
         info!(
@@ -5018,16 +5161,27 @@ async fn handle_write_callback(state: &AppState, callback: &serde_json::Value) {
             "write approval resolved"
         );
     }
+}
 
-    // Answer the callback query (removes loading indicator)
+async fn resolve_command_approval(state: &AppState, approval_id: &str, approved: bool) {
+    let sender = {
+        let mut guard = state.pending_commands.write().await;
+        guard.remove(approval_id).map(|entry| entry.sender)
+    };
+    if let Some(tx) = sender {
+        let _ = tx.send(approved);
+        info!(
+            approval_id = approval_id,
+            approved = approved,
+            "command approval resolved"
+        );
+    }
+}
+
+async fn answer_callback(state: &AppState, callback_id: &str, text: &str) {
     let (tg_token, _, _, _) = get_telegram_creds(state).await;
     if let Some(token) = tg_token.filter(|t| !t.is_empty()) {
         let url = format!("https://api.telegram.org/bot{}/answerCallbackQuery", token);
-        let text = if approved {
-            "Write approved"
-        } else {
-            "Write rejected"
-        };
         let _ = state
             .http_client
             .post(&url)
@@ -5267,7 +5421,7 @@ async fn verify_response(
         "think": true,
         "options": {
             "temperature": 0.1,
-            "num_predict": 512,
+            "num_predict": 4096_u32,
             "num_ctx": num_ctx,
         }
     });
@@ -5312,6 +5466,34 @@ async fn verify_response(
     }
 }
 
+/// Check if unrestricted code mode is enabled.  Caches for 10 seconds.
+/// Fail-closed: returns false on DB error, missing row, or non-boolean.
+async fn is_unrestricted_code_mode(state: &AppState) -> bool {
+    {
+        let guard = state.unrestricted_code_mode.read().await;
+        if let Some((enabled, fetched)) = guard.as_ref() {
+            if fetched.elapsed() < std::time::Duration::from_secs(10) {
+                return *enabled;
+            }
+        }
+    }
+
+    let enabled: bool = sqlx::query_as::<_, (serde_json::Value,)>(
+        "SELECT value FROM runtime_settings WHERE key = 'unrestricted_code_mode'",
+    )
+    .fetch_optional(&state.pg)
+    .await
+    .ok()
+    .flatten()
+    .and_then(|(v,)| v.as_bool())
+    .unwrap_or(false);
+
+    let mut guard = state.unrestricted_code_mode.write().await;
+    *guard = Some((enabled, std::time::Instant::now()));
+
+    enabled
+}
+
 async fn call_ollama_chat(
     state: &AppState,
     history: &[(String, String)],
@@ -5349,15 +5531,16 @@ async fn call_ollama_chat(
         .get("a2a-gateway")
         .and_then(|a| a.system_prompt.as_deref())
         .unwrap_or(
-            "You are Broodlink, a knowledgeable AI assistant. You can help with any topic — \
+            "You are Broodlink, a capable AI assistant. You can help with any topic — \
              general knowledge, coding, analysis, creative writing, math, science, and more. \
-             Be extremely brief: 1-3 short sentences, no markdown headers, no bullet lists. \
-             Answer directly like a text message.",
+             Be concise but thorough: give complete, useful answers. Use short paragraphs. \
+             For simple questions, keep it brief. For complex tasks, give detailed help. \
+             Always use your tools when they would help — don't just describe what you'd do, do it.",
         );
     let mut system_prompt = String::from(base_prompt);
     // Inject current date/time so the model always knows "today"
     let now_aest =
-        chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(11 * 3600).unwrap());
+        chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(11 * 3600).expect("AEST +11"));
     system_prompt.push_str(&format!(
         "\n\nCurrent date/time: {} (AEST, UTC+11).",
         now_aest.format("%Y-%m-%dT%H:%M:%S+11:00, %A %d %B %Y")
@@ -5375,7 +5558,8 @@ async fn call_ollama_chat(
          - **list_scheduled_tasks**: Show all active scheduled tasks.\n\
          - **cancel_scheduled_task**: Cancel a scheduled task by ID.\n\
          - **read_file / write_file / view_image**: Read, write, or analyze local files.\n\
-         - **read_pdf / read_docx**: Extract text from PDF or Word documents.\n\n\
+         - **read_pdf / read_docx**: Extract text from PDF or Word documents.\n\
+         - **run_command**: Execute a shell command (requires user approval). Use for builds, tests, git.\n\n\
          ## Monitoring pattern\n\
          When the user asks you to check or monitor a URL on a schedule:\n\
          1. First use fetch_webpage to check the URL NOW so you can confirm it works and show the user what you found.\n\
@@ -5402,13 +5586,63 @@ async fn call_ollama_chat(
             ));
         }
     }
+    if tool_cfg.command_tools_enabled && !tool_cfg.allowed_command_dirs.is_empty() {
+        system_prompt.push_str(&format!(
+            " Command directories: {}.",
+            tool_cfg.allowed_command_dirs.join(", ")
+        ));
+    }
 
-    // Extract the last user message (used for memory search and verification)
+    // v0.12.0: Explicitly assert coding capability when file/command tools are available
+    if tool_cfg.file_tools_enabled || tool_cfg.command_tools_enabled {
+        system_prompt.push_str(
+            "\n\n## You CAN help with coding\n\
+             You are fully capable of programming, code review, debugging, and software engineering. \
+             When asked to code, write code, or help with programming:\n\
+             - Use read_file to read source files\n\
+             - Use write_file to create or edit code\n\
+             - Use run_command to run builds, tests, linters, and git commands\n\
+             Never say you cannot code — you absolutely can.",
+        );
+    }
+
+    // Extract the last user message (used for memory search, classification, and verification)
     let last_user_msg = history
         .iter()
         .rev()
         .find(|(role, _)| role == "user")
         .map(|(_, content)| content.as_str());
+
+    // v0.12.0: Early domain classification for system prompt + model routing
+    let detected_domain = last_user_msg
+        .filter(|_| !chat_cfg.chat_code_model.is_empty())
+        .map(|text| classify_model_domain(text))
+        .unwrap_or("general");
+
+    // v0.12.0: Code-specific system prompt when code domain is detected
+    if detected_domain == "code" {
+        system_prompt.push_str(
+            "\n\n## Code mode active\n\
+             You are a senior software engineer. Follow these rules:\n\
+             - ALWAYS read files before modifying them. Use read_file first.\n\
+             - Use tools assertively — call read_file, write_file, run_command. \
+               Never just describe changes; make them.\n\
+             - After writing a file, verify by running tests or reading the result.\n\
+             - Write clean, minimal code. Don't over-engineer or add unnecessary abstractions.\n\
+             - If a build or test fails, read the error output carefully, diagnose the root cause, \
+               and fix it — don't retry the same thing.\n\
+             - Prefer editing existing files over creating new ones.\n\
+             - When debugging, narrow down the issue systematically: check logs, read relevant code, \
+               form a hypothesis, then verify.",
+        );
+        if tool_cfg.command_tools_enabled {
+            system_prompt.push_str(
+                "\n- Use run_command for: `cargo test`, `cargo build`, `cargo clippy`, `git diff`, \
+                 `git status`, `npm test`, and other verification commands.\n\
+                 - After making code changes, ALWAYS run the relevant test command to verify.",
+            );
+        }
+    }
 
     // Enrich system prompt with relevant memories from the agent-ledger
     let mut memory_ctx = String::new();
@@ -5654,6 +5888,34 @@ async fn call_ollama_chat(
             }
         }));
     }
+    // v0.12.0: Command execution tool
+    if tool_cfg.command_tools_enabled {
+        tools_vec.push(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "run_command",
+                "description": "Execute a shell command. The user will be asked to approve before execution. Use for running tests, builds, linters, git commands. The command runs in a sandboxed directory with a timeout.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["command"],
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Shell command to execute (e.g., 'cargo test', 'git diff', 'npm run lint')"
+                        },
+                        "working_dir": {
+                            "type": "string",
+                            "description": "Working directory for the command (must be within allowed directories)"
+                        },
+                        "timeout_seconds": {
+                            "type": "integer",
+                            "description": "Max execution time in seconds (default: 60)"
+                        }
+                    }
+                }
+            }
+        }));
+    }
     // Web fetch tool — always available (direct HTTP)
     if tools_available {
         tools_vec.push(serde_json::json!({
@@ -5816,20 +6078,9 @@ async fn call_ollama_chat(
         }
         _ => {
             let code_model = &chat_cfg.chat_code_model;
-            if !code_model.is_empty() {
-                let last_user_text = history
-                    .iter()
-                    .rev()
-                    .find(|(role, _)| role == "user")
-                    .map(|(_, content)| content.as_str())
-                    .unwrap_or("");
-                let domain = classify_model_domain(last_user_text);
-                if domain == "code" {
-                    info!(domain = "code", model = %code_model, "auto-classified as code task");
-                    code_model.clone()
-                } else {
-                    chat_cfg.chat_model.clone()
-                }
+            if !code_model.is_empty() && detected_domain == "code" {
+                info!(domain = "code", model = %code_model, "auto-classified as code task");
+                code_model.clone()
             } else {
                 chat_cfg.chat_model.clone()
             }
@@ -5916,15 +6167,21 @@ async fn call_ollama_chat(
         }
     }
 
+    // Some models don't support thinking mode (vision models, qwen3-coder)
+    let is_think_capable = !params.images.is_some()
+        && !model.starts_with("gemma")
+        && !model.contains("-coder");
+
     for round in 0..=max_rounds {
         // Include tools only on rounds where the model can still call them.
         // Vision models (gemma3) don't support tools or thinking.
         let is_vision = params.images.is_some();
         let include_tools = !is_vision && round < max_rounds && tools_def.is_some();
-        let use_think = !is_vision;
-        // Tool calls need more output budget: thinking tokens eat into num_predict,
-        // and the tool-call JSON itself can be 50-100+ tokens.
-        let predict_limit = if include_tools { 4096 } else { 512 };
+        let use_think = is_think_capable;
+        // With think:true, thinking tokens eat into num_predict budget.
+        // qwen3.5 thinking chains can use 3000-6000+ tokens alone.
+        // Must give enough room for thinking + full content.
+        let predict_limit: u32 = if include_tools { 8192 } else { 4096 };
         let mut payload = serde_json::json!({
             "model": model,
             "messages": messages,
@@ -6197,11 +6454,20 @@ async fn call_ollama_chat(
                             if path.is_empty() {
                                 "Error: path is required.".to_string()
                             } else {
-                                match broodlink_fs::validate_read_path(
-                                    path,
-                                    &tool_cfg.allowed_read_dirs,
-                                    tool_cfg.max_read_size_bytes,
-                                ) {
+                                let unrestricted = is_unrestricted_code_mode(state).await;
+                                let validation = if unrestricted {
+                                    broodlink_fs::validate_read_path_unrestricted(
+                                        path,
+                                        tool_cfg.max_read_size_bytes,
+                                    )
+                                } else {
+                                    broodlink_fs::validate_read_path(
+                                        path,
+                                        &tool_cfg.allowed_read_dirs,
+                                        tool_cfg.max_read_size_bytes,
+                                    )
+                                };
+                                match validation {
                                     Ok(canonical) => {
                                         match broodlink_fs::read_file_safe(
                                             &canonical,
@@ -6239,12 +6505,22 @@ async fn call_ollama_chat(
                             if path.is_empty() || content.is_empty() {
                                 "Error: path and content are required.".to_string()
                             } else {
-                                match broodlink_fs::validate_write_path(
-                                    &path,
-                                    &tool_cfg.allowed_write_dirs,
-                                    content.len() as u64,
-                                    tool_cfg.max_write_size_bytes,
-                                ) {
+                                let unrestricted = is_unrestricted_code_mode(state).await;
+                                let validation = if unrestricted {
+                                    broodlink_fs::validate_write_path_unrestricted(
+                                        &path,
+                                        content.len() as u64,
+                                        tool_cfg.max_write_size_bytes,
+                                    )
+                                } else {
+                                    broodlink_fs::validate_write_path(
+                                        &path,
+                                        &tool_cfg.allowed_write_dirs,
+                                        content.len() as u64,
+                                        tool_cfg.max_write_size_bytes,
+                                    )
+                                };
+                                match validation {
                                     Ok(canonical) => {
                                         request_write_approval(
                                             state,
@@ -6273,11 +6549,20 @@ async fn call_ollama_chat(
                             if path.is_empty() {
                                 "Error: path is required.".to_string()
                             } else {
-                                match broodlink_fs::validate_read_path(
-                                    path,
-                                    &tool_cfg.allowed_read_dirs,
-                                    tool_cfg.max_read_size_bytes,
-                                ) {
+                                let unrestricted = is_unrestricted_code_mode(state).await;
+                                let validation = if unrestricted {
+                                    broodlink_fs::validate_read_path_unrestricted(
+                                        path,
+                                        tool_cfg.max_read_size_bytes,
+                                    )
+                                } else {
+                                    broodlink_fs::validate_read_path(
+                                        path,
+                                        &tool_cfg.allowed_read_dirs,
+                                        tool_cfg.max_read_size_bytes,
+                                    )
+                                };
+                                match validation {
                                     Ok(canonical) => {
                                         match broodlink_fs::read_pdf_safe(
                                             &canonical,
@@ -6306,11 +6591,20 @@ async fn call_ollama_chat(
                             if path.is_empty() {
                                 "Error: path is required.".to_string()
                             } else {
-                                match broodlink_fs::validate_read_path(
-                                    path,
-                                    &tool_cfg.allowed_read_dirs,
-                                    tool_cfg.max_read_size_bytes,
-                                ) {
+                                let unrestricted = is_unrestricted_code_mode(state).await;
+                                let validation = if unrestricted {
+                                    broodlink_fs::validate_read_path_unrestricted(
+                                        path,
+                                        tool_cfg.max_read_size_bytes,
+                                    )
+                                } else {
+                                    broodlink_fs::validate_read_path(
+                                        path,
+                                        &tool_cfg.allowed_read_dirs,
+                                        tool_cfg.max_read_size_bytes,
+                                    )
+                                };
+                                match validation {
                                     Ok(canonical) => {
                                         let max_chars = tool_cfg.max_pdf_pages as usize * 3000;
                                         match broodlink_fs::read_docx_safe(&canonical, max_chars) {
@@ -6342,11 +6636,20 @@ async fn call_ollama_chat(
                                     "Image analysis not available. No vision model configured."
                                         .to_string()
                                 } else {
-                                    match broodlink_fs::validate_read_path(
-                                        path,
-                                        &tool_cfg.allowed_read_dirs,
-                                        tool_cfg.max_read_size_bytes,
-                                    ) {
+                                    let unrestricted = is_unrestricted_code_mode(state).await;
+                                    let validation = if unrestricted {
+                                        broodlink_fs::validate_read_path_unrestricted(
+                                            path,
+                                            tool_cfg.max_read_size_bytes,
+                                        )
+                                    } else {
+                                        broodlink_fs::validate_read_path(
+                                            path,
+                                            &tool_cfg.allowed_read_dirs,
+                                            tool_cfg.max_read_size_bytes,
+                                        )
+                                    };
+                                    match validation {
                                         Ok(canonical) => match std::fs::read(&canonical) {
                                             Ok(bytes) => {
                                                 use base64::Engine;
@@ -6363,6 +6666,85 @@ async fn call_ollama_chat(
                                             Err(e) => format!("Error reading image: {e}"),
                                         },
                                         Err(e) => format!("Access denied: {e}"),
+                                    }
+                                }
+                            }
+                        }
+                        "run_command" => {
+                            let parsed = args_raw
+                                .and_then(|a| {
+                                    if let Some(s) = a.as_str() {
+                                        serde_json::from_str::<serde_json::Value>(s).ok()
+                                    } else {
+                                        Some(a.clone())
+                                    }
+                                })
+                                .unwrap_or_default();
+                            let command = parsed
+                                .get("command")
+                                .and_then(|c| c.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let working_dir = parsed
+                                .get("working_dir")
+                                .and_then(|w| w.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let timeout_secs = parsed
+                                .get("timeout_seconds")
+                                .and_then(|t| t.as_u64())
+                                .unwrap_or(tool_cfg.max_command_timeout_secs)
+                                .min(tool_cfg.max_command_timeout_secs);
+
+                            if command.is_empty() {
+                                "Error: command is required.".to_string()
+                            } else {
+                                // Safety: check against blocked commands
+                                let cmd_lower = command.to_lowercase();
+                                let blocked = tool_cfg
+                                    .blocked_commands
+                                    .iter()
+                                    .any(|b| cmd_lower.contains(&b.to_lowercase()));
+                                if blocked {
+                                    "Error: this command is blocked for safety reasons.".to_string()
+                                } else {
+                                    // Resolve working directory
+                                    let dir = if working_dir.is_empty() {
+                                        tool_cfg
+                                            .allowed_command_dirs
+                                            .first()
+                                            .cloned()
+                                            .unwrap_or_else(|| ".".to_string())
+                                    } else {
+                                        working_dir.clone()
+                                    };
+                                    let dir_path = std::path::Path::new(&dir);
+
+                                    // Validate working dir is within allowed dirs
+                                    let dir_canonical =
+                                        std::fs::canonicalize(dir_path).unwrap_or_default();
+                                    let unrestricted = is_unrestricted_code_mode(state).await;
+                                    let allowed =
+                                        unrestricted || tool_cfg.allowed_command_dirs.iter().any(|d| {
+                                            let Ok(allowed_canon) = std::fs::canonicalize(d) else {
+                                                return false;
+                                            };
+                                            dir_canonical.starts_with(&allowed_canon)
+                                        });
+                                    if !allowed {
+                                        format!(
+                                            "Access denied: {} is not within allowed command directories.",
+                                            dir
+                                        )
+                                    } else {
+                                        request_command_approval(
+                                            state,
+                                            params.chat_ctx.as_ref(),
+                                            &command,
+                                            &dir_canonical,
+                                            timeout_secs,
+                                        )
+                                        .await
                                     }
                                 }
                             }
@@ -6554,9 +6936,39 @@ async fn call_ollama_chat(
                 "empty content after stripping think tags"
             );
 
-            // If the model produced thinking but no content, retry with ONLY
-            // the scheduling tools and a simplified prompt — the full tool list
-            // overwhelms qwen3 MoE, causing it to think without acting.
+            // Strategy: retry WITHOUT thinking mode — the model overthought itself
+            // into empty output. A direct generation usually succeeds.
+            if !thinking.is_empty() && round < max_rounds {
+                info!("retrying with think:false (thinking exhausted budget)");
+                let no_think_payload = serde_json::json!({
+                    "model": model,
+                    "messages": messages,
+                    "stream": false,
+                    "think": false,
+                    "options": {
+                        "temperature": 0.7,
+                        "num_predict": 2048_u32,
+                        "num_ctx": state.config.ollama.num_ctx,
+                    }
+                });
+                if let Ok(no_think_body) = send_ollama_request(
+                    &state.ollama_client, &url, &no_think_payload, timeout_secs,
+                ).await {
+                    if let Some(nt_content) = no_think_body
+                        .get("message")
+                        .and_then(|m| m.get("content"))
+                        .and_then(|c| c.as_str())
+                    {
+                        let nt_text = strip_think_tags(nt_content.trim());
+                        if !nt_text.is_empty() {
+                            info!(len = nt_text.len(), "no-think retry produced content");
+                            return strip_confidence_tag(&nt_text);
+                        }
+                    }
+                }
+            }
+
+            // Fallback: retry with reduced tool set for scheduling-type tasks
             if !thinking.is_empty() && round < max_rounds {
                 info!("retrying with reduced tool set (schedule only)");
                 let schedule_tools = serde_json::json!([
@@ -6609,7 +7021,7 @@ async fn call_ollama_chat(
                 ]);
                 // Rebuild messages with a focused system prompt
                 let now_melb = chrono::Utc::now()
-                    .with_timezone(&chrono::FixedOffset::east_opt(11 * 3600).unwrap());
+                    .with_timezone(&chrono::FixedOffset::east_opt(11 * 3600).expect("AEST +11"));
                 let retry_system = format!(
                     "You are a helpful assistant. You MUST use the tools provided to fulfill the user's request. \
                      Current date/time: {} (AEST, UTC+11). Use this timezone for all scheduling.\n\n\
@@ -6790,7 +7202,7 @@ async fn call_ollama_chat(
                                     "think": true,
                                     "options": {
                                         "temperature": 0.3,
-                                        "num_predict": 1024,
+                                        "num_predict": 4096_u32,
                                         "num_ctx": state.config.ollama.num_ctx,
                                     }
                                 });

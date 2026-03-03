@@ -956,6 +956,17 @@ pub struct ChatToolsConfig {
     pub pdf_tools_enabled: bool,
     #[serde(default = "default_max_pdf_pages")]
     pub max_pdf_pages: u32,
+    // v0.12.0: Command execution tools
+    #[serde(default)]
+    pub command_tools_enabled: bool,
+    #[serde(default)]
+    pub allowed_command_dirs: Vec<String>,
+    #[serde(default = "default_max_command_timeout")]
+    pub max_command_timeout_secs: u64,
+    #[serde(default = "default_blocked_commands")]
+    pub blocked_commands: Vec<String>,
+    #[serde(default = "default_command_approval_timeout")]
+    pub command_approval_timeout_secs: u64,
 }
 
 impl Default for ChatToolsConfig {
@@ -975,6 +986,11 @@ impl Default for ChatToolsConfig {
             write_approval_timeout_secs: default_write_approval_timeout(),
             pdf_tools_enabled: false,
             max_pdf_pages: default_max_pdf_pages(),
+            command_tools_enabled: false,
+            allowed_command_dirs: Vec::new(),
+            max_command_timeout_secs: default_max_command_timeout(),
+            blocked_commands: default_blocked_commands(),
+            command_approval_timeout_secs: default_command_approval_timeout(),
         }
     }
 }
@@ -1022,6 +1038,24 @@ fn default_write_approval_timeout() -> u64 {
 }
 fn default_max_pdf_pages() -> u32 {
     100
+}
+fn default_max_command_timeout() -> u64 {
+    60
+}
+fn default_blocked_commands() -> Vec<String> {
+    vec![
+        "rm -rf /".into(),
+        "shutdown".into(),
+        "reboot".into(),
+        "mkfs".into(),
+        "dd if=".into(),
+        ":(){".into(),
+        "> /dev/sd".into(),
+        "chmod -R 777 /".into(),
+    ]
+}
+fn default_command_approval_timeout() -> u64 {
+    120
 }
 
 fn default_verifier_timeout_seconds() -> u64 {
@@ -1302,6 +1336,9 @@ impl Config {
             *dir = expand_tilde(dir);
         }
         for dir in &mut cfg.chat.tools.allowed_write_dirs {
+            *dir = expand_tilde(dir);
+        }
+        for dir in &mut cfg.chat.tools.allowed_command_dirs {
             *dir = expand_tilde(dir);
         }
 

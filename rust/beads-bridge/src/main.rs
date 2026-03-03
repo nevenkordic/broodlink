@@ -1980,7 +1980,7 @@ async fn tool_store_memory(
 
 async fn tool_recall_memory(
     state: &AppState,
-    _agent_id: &str,
+    agent_id: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
     let topic_search = param_str_opt(params, "topic_search");
@@ -1990,8 +1990,9 @@ async fn tool_recall_memory(
         let pattern = format!("%{search}%");
         sqlx::query_as::<_, (i64, String, String, String, Option<serde_json::Value>, String, String)>(
             "SELECT id, topic, content, agent_name, tags, CAST(created_at AS CHAR), CAST(updated_at AS CHAR)
-             FROM agent_memory WHERE topic LIKE ? ORDER BY updated_at DESC LIMIT ?",
+             FROM agent_memory WHERE agent_name = ? AND topic LIKE ? ORDER BY updated_at DESC LIMIT ?",
         )
+        .bind(agent_id)
         .bind(&pattern)
         .bind(limit)
         .fetch_all(&state.dolt)
@@ -1999,8 +2000,9 @@ async fn tool_recall_memory(
     } else {
         sqlx::query_as::<_, (i64, String, String, String, Option<serde_json::Value>, String, String)>(
             "SELECT id, topic, content, agent_name, tags, CAST(created_at AS CHAR), CAST(updated_at AS CHAR)
-             FROM agent_memory ORDER BY updated_at DESC LIMIT ?",
+             FROM agent_memory WHERE agent_name = ? ORDER BY updated_at DESC LIMIT ?",
         )
+        .bind(agent_id)
         .bind(limit)
         .fetch_all(&state.dolt)
         .await?
@@ -2031,8 +2033,9 @@ async fn tool_delete_memory(
 ) -> Result<serde_json::Value, BroodlinkError> {
     let topic = param_str_short(params, "topic")?;
 
-    let result = sqlx::query("DELETE FROM agent_memory WHERE topic = ?")
+    let result = sqlx::query("DELETE FROM agent_memory WHERE topic = ? AND agent_name = ?")
         .bind(topic)
+        .bind(agent_id)
         .execute(&state.dolt)
         .await?;
 
@@ -2190,7 +2193,7 @@ async fn expand_query(
 
 async fn tool_semantic_search(
     state: &AppState,
-    _agent_id: &str,
+    agent_id: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
     state
@@ -2204,7 +2207,8 @@ async fn tool_semantic_search(
 
     let query = param_str(params, "query")?;
     let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(5));
-    let agent_filter = param_str_opt(params, "agent_id");
+    // Auto-filter by calling agent unless explicitly overridden
+    let agent_filter = Some(param_str_opt(params, "agent_id").unwrap_or(agent_id));
     let date_from = param_str_opt(params, "date_from");
     let date_to = param_str_opt(params, "date_to");
     let mem_cfg = &state.config.memory_search;
@@ -2647,12 +2651,13 @@ struct HybridCandidate {
 
 async fn tool_hybrid_search(
     state: &AppState,
-    _caller_agent_id: &str,
+    caller_agent_id: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, BroodlinkError> {
     let query = param_str(params, "query")?;
     let limit = clamp_limit(param_i64_opt(params, "limit").unwrap_or(10));
-    let agent_filter = param_str_opt(params, "agent_id");
+    // Auto-filter by calling agent unless explicitly overridden
+    let agent_filter = Some(param_str_opt(params, "agent_id").unwrap_or(caller_agent_id));
     let semantic_weight = param_f64_opt(params, "semantic_weight").unwrap_or(0.6);
     let keyword_weight = param_f64_opt(params, "keyword_weight").unwrap_or(0.4);
     let decay_enabled = param_bool_opt(params, "decay").unwrap_or(true);
@@ -4753,13 +4758,13 @@ async fn tool_schedule_task(
     let recurrence_secs = param_i64_opt(params, "recurrence_secs");
     let max_runs = param_i64_opt(params, "max_runs");
 
-    // Parse ISO 8601 datetime
-    let run_at = chrono::DateTime::parse_from_rfc3339(run_at_str).map_err(|e| {
-        BroodlinkError::Validation {
+    // Parse ISO 8601 datetime and convert to UTC for Postgres TIMESTAMPTZ
+    let run_at = chrono::DateTime::parse_from_rfc3339(run_at_str)
+        .map_err(|e| BroodlinkError::Validation {
             field: "run_at".into(),
             message: format!("invalid ISO 8601 datetime: {e}"),
-        }
-    })?;
+        })?
+        .with_timezone(&chrono::Utc);
 
     let row: (i64,) = sqlx::query_as(
         "INSERT INTO scheduled_tasks (title, description, priority, formula_name, next_run_at,

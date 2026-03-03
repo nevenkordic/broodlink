@@ -1,23 +1,45 @@
 # Broodlink — Multi-agent AI orchestration
 # Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
 # SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Auto-generated from formula registry. Do not edit directly.
 
 [formula]
 name = "debug-incident"
 version = "1.0.0"
 description = "Debug a production incident: gather evidence, trace root cause, propose fix"
+model_domain = "code"
+
+[formula.parameters.incident_description]
+type = "string"
+required = true
+description = "Description of the incident or error"
+
+[formula.parameters.service]
+type = "string"
+required = false
+description = "Affected service name"
+default = "unknown"
 
 [[steps]]
 name = "gather_evidence"
 agent_role = "analyst"
-tools = ["recall_memory", "semantic_search", "get_work_log"]
+tools = [
+    "recall_memory",
+    "semantic_search",
+    "get_work_log",
+]
 prompt = "Gather all evidence related to the incident: {{incident_description}}. Check work logs, recent decisions, and memory for related changes."
 output = "evidence"
 
 [[steps]]
 name = "trace_root_cause"
 agent_role = "analyst"
-tools = ["semantic_search", "recall_memory", "get_decisions"]
+tools = [
+    "semantic_search",
+    "recall_memory",
+    "get_decisions",
+]
 prompt = "Analyze the evidence to identify the root cause. Check for recent deployments, configuration changes, or dependency issues that correlate with the incident timeline."
 input = "evidence"
 output = "root_cause"
@@ -25,11 +47,10 @@ output = "root_cause"
 [[steps]]
 name = "propose_fix"
 agent_role = "architect"
-tools = ["log_decision", "store_memory"]
+tools = [
+    "log_decision",
+    "store_memory",
+]
 prompt = "Propose a fix for the root cause. Include: immediate mitigation, permanent fix, and preventive measures. Log the decision and store the incident as a memory for future reference."
 input = "root_cause"
 output = "fix_proposal"
-
-[formula.parameters]
-incident_description = { type = "string", required = true, description = "Description of the incident or error" }
-service = { type = "string", required = false, description = "Affected service name", default = "unknown" }

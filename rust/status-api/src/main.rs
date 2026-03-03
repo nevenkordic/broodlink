@@ -622,6 +622,15 @@ fn build_router(state: Arc<AppState>) -> Router {
         // v0.11.0 agent onboarding
         .route("/agents/onboard", post(handler_agent_onboard))
         .route("/agents/tokens", get(handler_agent_tokens))
+        // v0.12.0 runtime settings
+        .route("/settings", get(handler_list_settings))
+        .route("/settings/:key/toggle", post(handler_toggle_setting))
+        // scheduled tasks
+        .route("/scheduled-tasks", get(handler_scheduled_tasks))
+        .route(
+            "/scheduled-tasks/:task_id/toggle",
+            post(handler_toggle_scheduled_task),
+        )
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
@@ -5067,6 +5076,207 @@ async fn handler_telegram_disconnect(
         "ok": true,
         "disconnected": true,
         "sessions_deleted": sessions_deleted,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// v0.12.0 Runtime settings
+// ---------------------------------------------------------------------------
+
+async fn handler_list_settings(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let rows: Vec<(String, serde_json::Value, String, Option<String>, String)> =
+        sqlx::query_as(
+            "SELECT key, value, description, changed_by, CAST(changed_at AS TEXT) \
+             FROM runtime_settings ORDER BY key",
+        )
+        .fetch_all(&state.pg)
+        .await?;
+
+    let settings: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(key, value, desc, changed_by, changed_at)| {
+            serde_json::json!({
+                "key": key,
+                "value": value,
+                "description": desc,
+                "changed_by": changed_by,
+                "changed_at": changed_at,
+            })
+        })
+        .collect();
+
+    Ok(ok_response(serde_json::json!({ "settings": settings })))
+}
+
+async fn handler_toggle_setting(
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+    req: Request<axum::body::Body>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Admin)?;
+
+    // Whitelist of toggleable settings
+    const ALLOWED_KEYS: &[&str] = &["unrestricted_code_mode"];
+    if !ALLOWED_KEYS.contains(&key.as_str()) {
+        return Err(StatusApiError::BadRequest(format!(
+            "unknown or non-toggleable setting: {key}"
+        )));
+    }
+
+    let result = sqlx::query(
+        "UPDATE runtime_settings \
+         SET value = to_jsonb(NOT (value::text)::boolean), \
+             changed_by = $1, changed_at = NOW() \
+         WHERE key = $2",
+    )
+    .bind(ctx.username.as_deref().or(ctx.user_id.as_deref()))
+    .bind(&key)
+    .execute(&state.pg)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(StatusApiError::NotFound(format!(
+            "setting not found: {key}"
+        )));
+    }
+
+    let (new_value,): (serde_json::Value,) =
+        sqlx::query_as("SELECT value FROM runtime_settings WHERE key = $1")
+            .bind(&key)
+            .fetch_one(&state.pg)
+            .await?;
+
+    Ok(ok_response(serde_json::json!({
+        "key": key,
+        "value": new_value,
+        "toggled": true,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/scheduled-tasks
+// ---------------------------------------------------------------------------
+
+async fn handler_scheduled_tasks(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let tasks = sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            String,
+            Option<i32>,
+            Option<String>,
+            bool,
+            String,
+            Option<i64>,
+            Option<i32>,
+            i32,
+            Option<String>,
+            String,
+        ),
+    >(
+        "SELECT id, title, COALESCE(description, ''), priority,
+                formula_name, enabled, next_run_at::text,
+                recurrence_secs, max_runs, run_count,
+                created_by, created_at::text
+         FROM scheduled_tasks ORDER BY enabled DESC, next_run_at ASC",
+    )
+    .fetch_all(&state.pg)
+    .await?;
+
+    let items: Vec<serde_json::Value> = tasks
+        .into_iter()
+        .map(
+            |(
+                id,
+                title,
+                description,
+                priority,
+                formula_name,
+                enabled,
+                next_run_at,
+                recurrence_secs,
+                max_runs,
+                run_count,
+                created_by,
+                created_at,
+            )| {
+                serde_json::json!({
+                    "id": id,
+                    "title": title,
+                    "description": description,
+                    "priority": priority,
+                    "formula_name": formula_name,
+                    "enabled": enabled,
+                    "next_run_at": next_run_at,
+                    "recurrence_secs": recurrence_secs,
+                    "max_runs": max_runs,
+                    "run_count": run_count,
+                    "created_by": created_by,
+                    "created_at": created_at,
+                })
+            },
+        )
+        .collect();
+
+    let active = items.iter().filter(|t| t["enabled"] == true).count();
+    let total = items.len();
+
+    Ok(ok_response(serde_json::json!({
+        "total": total,
+        "active": active,
+        "tasks": items,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/scheduled-tasks/:task_id/toggle
+// ---------------------------------------------------------------------------
+
+async fn handler_toggle_scheduled_task(
+    State(state): State<Arc<AppState>>,
+    Path(task_id): Path<i64>,
+    req: Request<axum::body::Body>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Operator)?;
+
+    let result = sqlx::query(
+        "UPDATE scheduled_tasks SET enabled = NOT enabled WHERE id = $1",
+    )
+    .bind(task_id)
+    .execute(&state.pg)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(StatusApiError::NotFound(format!(
+            "scheduled task not found: {task_id}"
+        )));
+    }
+
+    let (enabled,): (bool,) =
+        sqlx::query_as("SELECT enabled FROM scheduled_tasks WHERE id = $1")
+            .bind(task_id)
+            .fetch_one(&state.pg)
+            .await?;
+
+    Ok(ok_response(serde_json::json!({
+        "id": task_id,
+        "enabled": enabled,
+        "toggled": true,
     })))
 }
 
