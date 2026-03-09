@@ -7,10 +7,300 @@
 (function () {
   'use strict';
 
+  var BL = window.Broodlink;
+
+  // ── Native Chat UI ──────────────────────────────────────────────────
+  var chatMessages = document.getElementById('chat-messages');
+  var chatInput = document.getElementById('chat-input');
+  var chatSendBtn = document.getElementById('chat-send-btn');
+  var chatNewBtn = document.getElementById('chat-new-btn');
+  var chatModelSelect = document.getElementById('chat-model');
+  var chatHistoryList = document.getElementById('chat-history-list');
+  var chatEmpty = document.getElementById('chat-empty');
+
+  var STORAGE_KEY = 'broodlink_chat_history';
+  var conversations = loadConversations();
+  var activeConversationId = null;
+  var isGenerating = false;
+
+  function loadConversations() {
+    try {
+      return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  function saveConversations() {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(conversations));
+    } catch (e) { /* quota exceeded — silently ignore */ }
+  }
+
+  function generateId() {
+    return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  }
+
+  // Load available models from Ollama
+  function loadModels() {
+    if (!chatModelSelect) return;
+    fetch('/api/ollama/api/tags')
+      .then(function (res) { return res.json(); })
+      .then(function (data) {
+        var models = (data.models || []).sort(function (a, b) {
+          return a.name.localeCompare(b.name);
+        });
+        chatModelSelect.innerHTML = '';
+        if (models.length === 0) {
+          chatModelSelect.innerHTML = '<option value="">No models found</option>';
+          return;
+        }
+        var savedModel = localStorage.getItem('broodlink_chat_model') || '';
+        models.forEach(function (m) {
+          var opt = document.createElement('option');
+          opt.value = m.name;
+          opt.textContent = m.name;
+          if (m.name === savedModel) opt.selected = true;
+          chatModelSelect.appendChild(opt);
+        });
+        // If no saved model matched, first option is already selected
+      })
+      .catch(function () {
+        chatModelSelect.innerHTML = '<option value="">Ollama unavailable</option>';
+      });
+  }
+
+  if (chatModelSelect) {
+    chatModelSelect.addEventListener('change', function () {
+      localStorage.setItem('broodlink_chat_model', chatModelSelect.value);
+    });
+  }
+
+  // Render conversation history sidebar
+  function renderHistory() {
+    if (!chatHistoryList) return;
+    var ids = Object.keys(conversations).sort(function (a, b) {
+      var ta = conversations[a].updatedAt || 0;
+      var tb = conversations[b].updatedAt || 0;
+      return tb - ta;
+    });
+    if (ids.length === 0) {
+      chatHistoryList.innerHTML = '<p style="opacity:0.5;font-size:0.8rem;padding:0.5rem;">No conversations yet.</p>';
+      return;
+    }
+    chatHistoryList.innerHTML = ids.map(function (id) {
+      var c = conversations[id];
+      var title = BL.escapeHtml(c.title || 'Untitled');
+      var active = id === activeConversationId ? ' active' : '';
+      return '<div class="chat-history-item' + active + '" data-id="' + id + '">' +
+        '<span class="chat-history-title">' + title + '</span>' +
+        '<button class="chat-history-delete" data-id="' + id + '" title="Delete">&times;</button>' +
+      '</div>';
+    }).join('');
+
+    // Click handlers
+    chatHistoryList.querySelectorAll('.chat-history-item').forEach(function (el) {
+      el.addEventListener('click', function (e) {
+        if (e.target.classList.contains('chat-history-delete')) return;
+        switchConversation(el.getAttribute('data-id'));
+      });
+    });
+    chatHistoryList.querySelectorAll('.chat-history-delete').forEach(function (btn) {
+      btn.addEventListener('click', function (e) {
+        e.stopPropagation();
+        var id = btn.getAttribute('data-id');
+        delete conversations[id];
+        saveConversations();
+        if (id === activeConversationId) {
+          activeConversationId = null;
+          renderMessages();
+        }
+        renderHistory();
+      });
+    });
+  }
+
+  function switchConversation(id) {
+    activeConversationId = id;
+    renderMessages();
+    renderHistory();
+  }
+
+  function renderMessages() {
+    if (!chatMessages) return;
+    if (!activeConversationId || !conversations[activeConversationId]) {
+      chatMessages.innerHTML = '<div class="chat-empty-state" id="chat-empty">' +
+        '<p>Start a conversation with your AI models.</p>' +
+        '<p style="opacity:0.6;font-size:0.85rem;">Messages are processed locally via Ollama.</p>' +
+      '</div>';
+      return;
+    }
+    var msgs = conversations[activeConversationId].messages || [];
+    if (msgs.length === 0) {
+      chatMessages.innerHTML = '<div class="chat-empty-state">' +
+        '<p>Send a message to begin.</p>' +
+      '</div>';
+      return;
+    }
+    chatMessages.innerHTML = msgs.map(function (m) {
+      var cls = m.role === 'user' ? 'user' : 'assistant';
+      return '<div class="chat-bubble ' + cls + '">' +
+        '<div class="chat-bubble-content">' + formatMessageContent(m.content) + '</div>' +
+      '</div>';
+    }).join('');
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+  }
+
+  function formatMessageContent(text) {
+    if (!text) return '';
+    // Escape HTML, then convert code blocks and newlines
+    var escaped = BL.escapeHtml(text);
+    // Fenced code blocks
+    escaped = escaped.replace(/```(\w*)\n?([\s\S]*?)```/g, function (_, lang, code) {
+      return '<pre><code>' + code.trim() + '</code></pre>';
+    });
+    // Inline code
+    escaped = escaped.replace(/`([^`]+)`/g, '<code>$1</code>');
+    // Bold
+    escaped = escaped.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    // Newlines
+    escaped = escaped.replace(/\n/g, '<br>');
+    return escaped;
+  }
+
+  function newConversation() {
+    activeConversationId = generateId();
+    conversations[activeConversationId] = {
+      title: 'New Chat',
+      messages: [],
+      model: chatModelSelect ? chatModelSelect.value : '',
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    };
+    saveConversations();
+    renderHistory();
+    renderMessages();
+    if (chatInput) chatInput.focus();
+  }
+
+  function sendMessage() {
+    if (isGenerating) return;
+    var text = chatInput ? chatInput.value.trim() : '';
+    if (!text) return;
+
+    var model = chatModelSelect ? chatModelSelect.value : '';
+    if (!model) {
+      alert('No model selected. Please select a model or ensure Ollama is running.');
+      return;
+    }
+
+    // Create conversation if none active
+    if (!activeConversationId || !conversations[activeConversationId]) {
+      newConversation();
+    }
+
+    var conv = conversations[activeConversationId];
+    conv.messages.push({ role: 'user', content: text });
+
+    // Set title from first message
+    if (conv.messages.length === 1) {
+      conv.title = text.length > 40 ? text.substring(0, 40) + '…' : text;
+    }
+    conv.model = model;
+    conv.updatedAt = Date.now();
+    saveConversations();
+
+    chatInput.value = '';
+    chatInput.style.height = 'auto';
+    renderMessages();
+    renderHistory();
+
+    // Show typing indicator
+    isGenerating = true;
+    updateSendButton();
+    var typingEl = document.createElement('div');
+    typingEl.className = 'chat-bubble assistant typing';
+    typingEl.innerHTML = '<div class="chat-bubble-content"><span class="chat-typing-dots"><span>.</span><span>.</span><span>.</span></span></div>';
+    chatMessages.appendChild(typingEl);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+
+    // Build messages array for Ollama
+    var ollamaMessages = conv.messages.map(function (m) {
+      return { role: m.role, content: m.content };
+    });
+
+    fetch('/api/ollama/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: model,
+        messages: ollamaMessages,
+        stream: false
+      })
+    })
+    .then(function (res) {
+      if (!res.ok) throw new Error('Ollama returned ' + res.status);
+      return res.json();
+    })
+    .then(function (data) {
+      var content = (data.message && data.message.content) || '';
+      conv.messages.push({ role: 'assistant', content: content });
+      conv.updatedAt = Date.now();
+      saveConversations();
+      renderMessages();
+    })
+    .catch(function (err) {
+      conv.messages.push({ role: 'assistant', content: 'Error: ' + err.message });
+      conv.updatedAt = Date.now();
+      saveConversations();
+      renderMessages();
+    })
+    .finally(function () {
+      isGenerating = false;
+      updateSendButton();
+    });
+  }
+
+  function updateSendButton() {
+    if (!chatSendBtn) return;
+    chatSendBtn.disabled = isGenerating;
+    chatSendBtn.textContent = isGenerating ? '...' : 'Send';
+  }
+
+  // Auto-resize textarea
+  if (chatInput) {
+    chatInput.addEventListener('input', function () {
+      this.style.height = 'auto';
+      this.style.height = Math.min(this.scrollHeight, 150) + 'px';
+    });
+    chatInput.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+  }
+
+  if (chatSendBtn) chatSendBtn.addEventListener('click', sendMessage);
+  if (chatNewBtn) chatNewBtn.addEventListener('click', newConversation);
+
+  // Initialize chat UI
+  loadModels();
+  renderHistory();
+  renderMessages();
+
+  // If no conversations exist, show empty state
+  if (Object.keys(conversations).length > 0) {
+    // Auto-select most recent conversation
+    var sorted = Object.keys(conversations).sort(function (a, b) {
+      return (conversations[b].updatedAt || 0) - (conversations[a].updatedAt || 0);
+    });
+    switchConversation(sorted[0]);
+  }
+
+  // ── Agent Conversation Monitoring ───────────────────────────────────
   var sessionsEl = document.getElementById('chat-sessions');
   if (!sessionsEl) return;
-
-  var BL = window.Broodlink;
 
   var platformFilter = document.getElementById('chat-platform-filter');
   var statusFilter = document.getElementById('chat-status-filter');
@@ -182,7 +472,7 @@
     closeSession: closeSession
   };
 
-  // Initial load + auto-refresh
+  // Initial load + auto-refresh for agent conversations
   loadStats();
   loadSessions();
   setInterval(function () { loadStats(); loadSessions(); }, BL.REFRESH_INTERVAL || 10000);

@@ -1,0 +1,121 @@
+{{ define "main" }}
+<h2>Setup Wizard</h2>
+<p class="page-desc">Get Broodlink running in a few clicks. No terminal needed.</p>
+
+<!-- Progress bar -->
+<div class="card" style="margin-bottom:1.5rem;">
+  <div style="display:flex;gap:0.5rem;align-items:center;" id="step-indicators">
+    <span class="step-pill active" data-step="0">1. Dependencies</span>
+    <span class="step-pill" data-step="1">2. Databases</span>
+    <span class="step-pill" data-step="2">3. AI Models</span>
+    <span class="step-pill" data-step="3">4. Launch</span>
+  </div>
+</div>
+
+<!-- Step 1: Dependencies -->
+<div class="card setup-step" id="step-0">
+  <h3>Install Dependencies</h3>
+  <p class="page-desc">Broodlink needs a few services. We'll install what's missing.</p>
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Service</th>
+          <th scope="col">Purpose</th>
+          <th scope="col">Status</th>
+          <th scope="col">Action</th>
+        </tr>
+      </thead>
+      <tbody id="deps-tbody" aria-live="polite">
+        <tr><td colspan="4" class="loading-cell">Checking system...</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div style="margin-top:1rem;display:flex;gap:0.5rem;">
+    <button class="btn btn-primary" id="install-all-btn" disabled>Install Missing</button>
+    <button class="btn btn-primary" id="next-1-btn" disabled>Next</button>
+  </div>
+</div>
+
+<!-- Step 2: Databases -->
+<div class="card setup-step" id="step-1" style="display:none;">
+  <h3>Create Databases</h3>
+  <p class="page-desc">Setting up the agent memory ledger and task database.</p>
+  <div id="db-status" aria-live="polite">
+    <p>Click below to create and initialize the databases.</p>
+  </div>
+  <div style="margin-top:1rem;display:flex;gap:0.5rem;">
+    <button class="btn" id="prev-2-btn">Back</button>
+    <button class="btn btn-primary" id="init-db-btn">Create Databases</button>
+    <button class="btn btn-primary" id="next-2-btn" disabled>Next</button>
+  </div>
+</div>
+
+<!-- Step 3: AI Models -->
+<div class="card setup-step" id="step-2" style="display:none;">
+  <h3>Download AI Models</h3>
+  <p class="page-desc">Choose which models to install. Required models are pre-selected.</p>
+  <div id="models-list" aria-live="polite">
+    <p class="loading-cell">Loading recommended models...</p>
+  </div>
+  <div style="margin-top:1rem;display:flex;gap:0.5rem;">
+    <button class="btn" id="prev-3-btn">Back</button>
+    <button class="btn btn-primary" id="pull-models-btn">Download Selected</button>
+    <button class="btn btn-primary" id="next-3-btn" disabled>Next</button>
+    <button class="btn" id="skip-3-btn">Skip for now</button>
+  </div>
+  <div id="pull-progress" style="margin-top:1rem;display:none;" aria-live="polite"></div>
+</div>
+
+<!-- Step 4: Launch -->
+<div class="card setup-step" id="step-3" style="display:none;">
+  <h3>Ready to Launch</h3>
+  <div id="launch-status" aria-live="polite">
+    <p>Everything is configured. Start all Broodlink services.</p>
+  </div>
+  <div style="margin-top:1rem;display:flex;gap:0.5rem;">
+    <button class="btn" id="prev-4-btn">Back</button>
+    <button class="btn btn-primary" id="launch-btn">Start Broodlink</button>
+  </div>
+</div>
+
+{{ end }}
+
+{{ define "styles" }}
+<style>
+  .step-pill {
+    padding: 0.4rem 0.8rem;
+    border-radius: 1rem;
+    font-size: 0.85rem;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    transition: all 0.2s;
+  }
+  .step-pill.active {
+    background: var(--accent);
+    color: #fff;
+  }
+  .step-pill.done {
+    background: var(--green);
+    color: #fff;
+  }
+  .model-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.6rem 0;
+    border-bottom: 1px solid var(--bg-tertiary);
+  }
+  .model-row:last-child { border-bottom: none; }
+  .model-row label { flex: 1; cursor: pointer; }
+  .model-row .model-size { color: var(--text-secondary); font-size: 0.85rem; min-width: 5rem; text-align: right; }
+  .model-row .model-role { font-size: 0.75rem; padding: 0.15rem 0.5rem; border-radius: 0.5rem; background: var(--bg-tertiary); color: var(--text-secondary); }
+  .model-row .model-role.required { background: var(--accent); color: #fff; }
+  .progress-bar { height: 6px; background: var(--bg-tertiary); border-radius: 3px; overflow: hidden; margin: 0.5rem 0; }
+  .progress-bar-fill { height: 100%; background: var(--accent); transition: width 0.3s; border-radius: 3px; }
+</style>
+{{ end }}
+
+{{ define "scripts" }}
+<script src="/js/setup.js"></script>
+{{ end }}

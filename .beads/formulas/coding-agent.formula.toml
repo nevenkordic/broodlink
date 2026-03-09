@@ -1,0 +1,91 @@
+# Broodlink — Multi-agent AI orchestration
+# Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[formula]
+name = "coding-agent"
+version = "1.0.0"
+description = "Offline Claude Code replacement: read codebase, plan edits, apply changes, run tests, iterate"
+model_domain = "code"
+
+[[steps]]
+name = "understand"
+agent_role = "developer"
+tools = ["recall_memory", "semantic_search"]
+prompt = """Analyze the codebase context for task: {{task_description}}
+
+1. Read relevant files in {{target_path}}
+2. Identify the files that need modification
+3. Understand existing patterns, conventions, and dependencies
+4. Summarize the current architecture relevant to this task
+
+Output a structured understanding with: files_to_modify, dependencies, conventions, risks."""
+output = "codebase_context"
+
+[[steps]]
+name = "plan"
+agent_role = "architect"
+tools = ["log_decision", "recall_memory"]
+prompt = """Given the codebase context, create a detailed implementation plan for: {{task_description}}
+
+Requirements:
+- List each file to create or modify with the specific changes needed
+- Order changes to avoid breaking intermediate states
+- Identify test files to create or update
+- Note any new dependencies needed
+
+Be precise — each step should be independently executable.
+Log the architectural decision."""
+input = "codebase_context"
+output = "implementation_plan"
+
+[[steps]]
+name = "implement"
+agent_role = "developer"
+tools = ["store_memory", "log_work"]
+prompt = """Execute the implementation plan step by step.
+
+For each planned change:
+1. Read the target file
+2. Apply the edit precisely
+3. Verify the edit doesn't break syntax
+
+Work through the plan in order. Log each file modified.
+If you encounter an issue, adapt the plan and document why."""
+input = "implementation_plan"
+output = "implementation_result"
+
+[[steps]]
+name = "test"
+agent_role = "tester"
+tools = ["store_memory", "log_work"]
+prompt = """Validate the implementation:
+
+1. Run existing tests to check for regressions: {{test_command}}
+2. If tests were part of the plan, verify they pass
+3. If no tests exist, create basic smoke tests
+4. Report: tests_passed, tests_failed, tests_added, coverage_notes"""
+input = "implementation_result"
+output = "test_results"
+
+[[steps]]
+name = "iterate"
+agent_role = "developer"
+tools = ["store_memory", "log_work", "complete_task"]
+prompt = """Review test results and fix any failures.
+
+If tests_failed > 0:
+1. Analyze each failure
+2. Apply targeted fixes
+3. Re-run tests
+4. Repeat until green or max 3 iterations
+
+When done, produce a summary: files_changed, tests_status, notes.
+Mark the task complete."""
+input = "test_results"
+output = "final_result"
+
+[formula.parameters]
+task_description = { type = "string", required = true, description = "What to build, fix, or change" }
+target_path = { type = "string", required = false, default = ".", description = "Directory or file to focus on" }
+test_command = { type = "string", required = false, default = "cargo test", description = "Command to run tests" }

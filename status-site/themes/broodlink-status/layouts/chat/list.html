@@ -1,5 +1,33 @@
 {{ define "main" }}
-<h2>Conversations</h2>
+<h2>Chat</h2>
+<p class="page-desc">Chat with your local AI models. Conversations are powered by Ollama.</p>
+
+<div class="chat-container" id="chat-container">
+  <div class="chat-sidebar">
+    <button class="btn btn-primary" id="chat-new-btn" style="width:100%;margin-bottom:0.75rem;">New Chat</button>
+    <div class="chat-model-select">
+      <label for="chat-model">Model:</label>
+      <select id="chat-model"><option value="">Loading...</option></select>
+    </div>
+    <div id="chat-history-list" class="chat-history-list">
+      <!-- Populated by JS -->
+    </div>
+  </div>
+  <div class="chat-main">
+    <div class="chat-messages" id="chat-messages" aria-live="polite" role="log">
+      <div class="chat-empty-state" id="chat-empty">
+        <p>Start a conversation with your AI models.</p>
+        <p style="opacity:0.6;font-size:0.85rem;">Messages are processed locally via Ollama.</p>
+      </div>
+    </div>
+    <div class="chat-input-area">
+      <textarea id="chat-input" placeholder="Type a message..." rows="2" aria-label="Chat message"></textarea>
+      <button class="btn btn-primary" id="chat-send-btn" aria-label="Send message">Send</button>
+    </div>
+  </div>
+</div>
+
+<h3 style="margin-top:2rem;">Agent Conversations</h3>
 <p class="page-desc">Live chats between users and agents across Slack, Teams, and Telegram.</p>
 
 <div class="card-grid" aria-label="Chat metrics">

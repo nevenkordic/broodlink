@@ -534,6 +534,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/approvals/:gate_id/review", post(handler_approval_review))
         .route("/agent-metrics", get(handler_agent_metrics))
         .route("/delegations", get(handler_delegations))
+        .route("/negotiations", get(handler_negotiations))
         .route("/guardrails", get(handler_guardrails))
         .route("/violations", get(handler_violations))
         .route("/streams", get(handler_streams))
@@ -3120,6 +3121,44 @@ async fn handler_delegations(
 
     Ok(ok_response(
         serde_json::json!({ "delegations": delegations }),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/negotiations
+// Task negotiation events — declines, context requests, redirects (Postgres)
+
+async fn handler_negotiations(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let rows = sqlx::query_as::<_, (i64, String, String, String, Option<String>, Option<String>, Option<serde_json::Value>, String)>(
+        "SELECT id, task_id, agent_id, action, reason, suggested_agent, questions,
+                created_at::text
+         FROM task_negotiations ORDER BY created_at DESC LIMIT 200",
+    )
+    .fetch_all(&state.pg)
+    .await?;
+
+    let negotiations: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(
+            |(id, task_id, agent_id, action, reason, suggested_agent, questions, created_at)| {
+                serde_json::json!({
+                    "id": id,
+                    "task_id": task_id,
+                    "agent_id": agent_id,
+                    "action": action,
+                    "reason": reason,
+                    "suggested_agent": suggested_agent,
+                    "questions": questions,
+                    "created_at": created_at,
+                })
+            },
+        )
+        .collect();
+
+    Ok(ok_response(
+        serde_json::json!({ "negotiations": negotiations }),
     ))
 }
 

@@ -2860,6 +2860,7 @@ async fn webhook_telegram_handler(
                 let state_bg = Arc::clone(&state);
                 let dedup_key_bg = dedup_key.clone();
                 let session_id_bg = session_id.clone();
+                let chat_text_bg = chat_text.to_string();
                 tokio::spawn(async move {
                     let llm_reply = call_ollama_chat(&state_bg, &history, &chat_params).await;
                     // Final edit with complete response
@@ -2873,6 +2874,13 @@ async fn webhook_telegram_handler(
                     {
                         let mut guard = state_bg.inflight_chats.write().await;
                         guard.remove(&dedup_key_bg);
+                    }
+                    // Auto-memory: extract and store memorable facts in background
+                    if state_bg.config.chat.auto_memory_enabled {
+                        let s = Arc::clone(&state_bg);
+                        let um = chat_text_bg.clone();
+                        let ar = llm_reply.clone();
+                        tokio::spawn(async move { extract_and_store_memory(s, um, ar).await; });
                     }
                     // Store outbound reply
                     if let Some(ref sid) = session_id_bg {
@@ -2918,6 +2926,14 @@ async fn webhook_telegram_handler(
             guard.remove(&dedup_key);
         }
 
+        // Auto-memory: extract and store memorable facts in background
+        if !is_busy && state.config.chat.auto_memory_enabled {
+            let s = Arc::clone(&state);
+            let um = chat_text.to_string();
+            let ar = llm_reply.clone();
+            tokio::spawn(async move { extract_and_store_memory(s, um, ar).await; });
+        }
+
         // Store outbound reply (skip transient busy messages)
         if !is_busy {
             if let Some(ref sid) = session_id {
@@ -2952,7 +2968,7 @@ async fn webhook_telegram_handler(
 // ---------------------------------------------------------------------------
 
 /// Process a single Telegram update object.  Returns an optional reply text.
-async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -> Option<String> {
+async fn process_telegram_update(state: &Arc<AppState>, update: &serde_json::Value) -> Option<String> {
     // v0.10.0: Handle callback queries (write approval buttons)
     if let Some(callback) = update.get("callback_query") {
         handle_approval_callback(state, callback).await;
@@ -3319,6 +3335,14 @@ async fn process_telegram_update(state: &AppState, update: &serde_json::Value) -
                     }
                 } => unreachable!(),
             };
+
+            // Auto-memory: extract and store memorable facts in background
+            if state.config.chat.auto_memory_enabled {
+                let s = Arc::clone(state);
+                let um = chat_text.to_string();
+                let ar = reply_text.clone();
+                tokio::spawn(async move { extract_and_store_memory(s, um, ar).await; });
+            }
 
             // Final edit if streaming — already delivered via edit, so return None
             if let Some(ref ctx) = streaming_ctx {
@@ -4854,6 +4878,122 @@ async fn fetch_memory_context(state: &AppState, query: &str, limit: u32) -> Stri
         Err(e) => {
             warn!(error = %e, "memory context fetch failed, continuing without memory");
             String::new()
+        }
+    }
+}
+
+/// After each assistant response, extract memorable facts and persist them via store_memory.
+/// Runs as a background task — does not block response delivery.
+async fn extract_and_store_memory(state: Arc<AppState>, user_msg: String, assistant_reply: String) {
+    if user_msg.len() < 30 {
+        return;
+    }
+
+    let model = state.config.chat.chat_fallback_model.clone();
+    if model.is_empty() {
+        return;
+    }
+
+    let prompt = format!(
+        "Extract memorable long-term facts from this conversation exchange.\n\
+         Return ONLY a JSON array of {{\"topic\": \"kebab-case-key\", \"content\": \"1-2 sentence fact\"}}.\n\
+         Return [] if nothing is worth remembering long-term.\n\
+         Remember: user preferences, project context, tech stack, stated habits, strong opinions.\n\
+         Ignore: one-time questions, transient debugging, greetings.\n\n\
+         User: {user_msg}\nAssistant: {assistant_reply}"
+    );
+
+    let ollama_url = state
+        .ollama_pool
+        .instances
+        .iter()
+        .find(|i| i.healthy.load(std::sync::atomic::Ordering::Relaxed))
+        .or_else(|| state.ollama_pool.instances.first())
+        .map(|i| i.url.clone())
+        .unwrap_or_default();
+
+    if ollama_url.is_empty() {
+        return;
+    }
+
+    let payload = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": false,
+        "think": false,
+        "options": {"num_predict": 512, "temperature": 0.1, "num_ctx": 2048}
+    });
+
+    let resp = match state
+        .ollama_client
+        .post(format!("{ollama_url}/api/chat"))
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "auto-memory: ollama call failed");
+            return;
+        }
+    };
+
+    let body: serde_json::Value = match resp.json().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, "auto-memory: response parse failed");
+            return;
+        }
+    };
+
+    let raw = body
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+
+    // Strip markdown code fences if present
+    let json_str = raw
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+
+    let facts: Vec<serde_json::Value> = match serde_json::from_str(json_str) {
+        Ok(f) => f,
+        Err(_) => return, // model returned non-JSON — skip silently
+    };
+
+    for fact in &facts {
+        let topic = fact
+            .get("topic")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let content = fact
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if topic.is_empty() || content.is_empty() {
+            continue;
+        }
+        match bridge_call(
+            &state,
+            "store_memory",
+            serde_json::json!({
+                "topic": topic,
+                "content": content,
+                "tags": "auto-extracted,chat"
+            }),
+        )
+        .await
+        {
+            Ok(_) => info!(topic = %topic, "auto-memory: stored fact"),
+            Err(e) => warn!(error = %e, topic = %topic, "auto-memory: store failed"),
         }
     }
 }

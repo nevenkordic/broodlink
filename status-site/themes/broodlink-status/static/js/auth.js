@@ -91,6 +91,8 @@
   }
 
   function requireAuth() {
+    // Skip auth when running through the broodlink binary (SELF mode — single-user local app)
+    if (BL.STATUS_API_URL === '') return;
     // Skip auth check on login page
     if (window.location.pathname === '/login/' || window.location.pathname === '/login') {
       return;

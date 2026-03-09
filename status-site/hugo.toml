@@ -4,11 +4,11 @@ title            = "Broodlink Operations"
 theme            = "broodlink-status"
 
 [params]
-  statusApiUrl    = "http://localhost:3312"
-  statusApiKey    = "dev-api-key"  # set via BROODLINK_STATUS_API_KEY in production
+  statusApiUrl    = "SELF"  # "SELF" = same-origin proxy (binary mode). Override with real URL for hugo dev server.
+  statusApiKey    = ""      # not needed when using binary proxy
   refreshInterval = 10000
   company         = "Broodlink"
-  version         = "0.11.0"
+  version         = "0.12.2"
 
 [build]
   [build.environment]

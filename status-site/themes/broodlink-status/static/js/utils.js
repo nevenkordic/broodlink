@@ -24,17 +24,13 @@
 
   var cfg = window.BroodlinkConfig || {};
 
-  var STATUS_API_URL = (
-    metaContent('broodlink:statusApiUrl') ||
-    cfg.statusApiUrl ||
-    'http://localhost:3312'
-  ).replace(/\/+$/, ''); // strip trailing slash
+  var rawApiUrl = metaContent('broodlink:statusApiUrl') || cfg.statusApiUrl || '';
+  // "SELF" or empty = same origin (binary reverse-proxies to status-api with auth)
+  var STATUS_API_URL = (!rawApiUrl || rawApiUrl === 'SELF')
+    ? ''
+    : rawApiUrl.replace(/\/+$/, '');
 
-  var STATUS_API_KEY = (
-    metaContent('broodlink:statusApiKey') ||
-    cfg.statusApiKey ||
-    ''
-  );
+  var STATUS_API_KEY = metaContent('broodlink:statusApiKey') || cfg.statusApiKey || '';
 
   var REFRESH_INTERVAL = parseInt(
     metaContent('broodlink:refreshInterval') ||

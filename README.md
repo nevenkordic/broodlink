@@ -81,7 +81,7 @@ After startup, you'll have:
 2. **Memory + embeddings + search** -- `store_memory` inserts to Dolt + Postgres full-text index + outbox row -- embedding-worker polls outbox every 2s -- smart chunk splitting at heading/code-fence/paragraph boundaries -- Ollama generates vector per chunk -- Qdrant upsert -- extracts entities/relationships via LLM and stores in knowledge graph (Postgres `kg_entities`/`kg_edges` + Qdrant `broodlink_kg_entities`) -- `hybrid_search` and `semantic_search` expand queries via Ollama (2-3 alternative phrasings), run each variant in parallel, merge by max score -- BM25 (Postgres tsvector) + vector (Qdrant) fusion with temporal decay and optional reranking -- `graph_search`/`graph_traverse` query the knowledge graph -- graceful degradation to BM25-only or vector-only if a backend is down -- `delete_memory` cleans up Dolt, Postgres, and Qdrant vectors
 3. **Task routing** -- `create_task` writes to Postgres + publishes NATS -- coordinator scores all eligible agents (success rate, load, cost, recency), excludes declined agents -- claims atomically -- dispatches to winning agent -- agents can `decline_task` (re-routes, max 3 declines then dead-letter) or `request_task_context` (pauses task, publishes questions, auto-resets on timeout) -- failed tasks land in dead-letter queue with auto-retry (exponential backoff)
 4. **Workflow orchestration** -- `start_workflow` creates a `workflow_runs` row + publishes NATS -- coordinator loads formula TOML -- supports conditional steps (`when` expressions), per-step retries, parallel step groups, step timeouts, and `on_failure` error handlers -- all step results collected in `step_results` JSONB
-5. **Multi-agent collaboration** -- `decompose_task` splits work into sub-tasks with merge strategies (concatenate, vote, best) -- `create_workspace` + `workspace_read`/`workspace_write` for shared context -- coordinator tracks child completions and auto-merges results
+5. **Multi-agent collaboration** -- coordinator auto-decomposes complex tasks into sub-tasks via LLM before routing (configurable, fail-open) -- agents can delegate sub-tasks to other agents through the coordinator (request/accept/decline/complete lifecycle) -- completed task outputs are automatically verified by LLM (pass/fail with feedback/skip) -- parent tasks auto-complete when all children finish -- `create_workspace` + `workspace_read`/`workspace_write` for shared context
 6. **Budget enforcement** -- `check_budget` middleware deducts tokens per tool call -- `set_budget`/`get_budget` tools for management -- daily replenishment via heartbeat -- `BudgetExhausted` error (402) blocks calls when depleted
 7. **Webhook gateway** -- a2a-gateway receives Slack slash commands, Teams bot messages, Telegram updates -- parses `/broodlink <command>` into tool calls -- outbound notifications for agent.offline, task.failed, budget.low, workflow events, guardrail violations
 8. **Conversational gateway** (v0.7.0) -- a2a-gateway receives Slack/Teams/Telegram messages → creates chat sessions → routes to coordinator for task creation → delivers replies via platform-specific APIs -- `list_chat_sessions`/`reply_to_chat` tools for agent interaction -- direct Ollama LLM chat with 10 tools: web_search (Brave), fetch_webpage (direct HTTP GET), remember, schedule_task, list_scheduled_tasks, cancel_scheduled_task, read_file, write_file, read_pdf, read_docx -- **auto-fetch from history** (v0.11.0): DB query finds URLs from past messages beyond the context window, fetches the most recent, injects content into system prompt — no tool calling needed -- **retry with reduced tools** (v0.11.0): when model exhausts thinking budget, retries with 3-tool set and last 6 conversation turns -- **streaming responses** (v0.11.0): Telegram messages stream progressively via `editMessageText` (~1 edit/800ms, 30-token minimum), tool calls pause stream and show indicator -- **multi-Ollama load balancing** (v0.11.0): `OllamaPool` distributes inference across multiple instances (least-loaded healthy, 30s health probe, auto-recovery) -- **multi-modal attachments** (v0.11.0): Slack file uploads (via `url_private` + bot token), Telegram photos/documents (via `getFile` API), and Teams attachments are downloaded, classified (image/audio/video/document), stored to `attachments_dir`, and persisted in `chat_attachments` table -- efficiency safeguards: concurrency semaphore, Brave search result cache (5-min TTL), duplicate message suppression (30s dedup), typing indicator refresh (4s) -- busy/dedup replies excluded from conversation history -- Telegram access code authentication -- cascade delete on bot disconnect -- NATS-based credential cache invalidation -- **self-healing model failover**: on OOM, tries recovery (unload → retry), if still failing enters degraded mode (fallback model answers questions directly), probes primary model every 5 min -- **verification timeout caveat** (v0.11.0): timed-out verifications append `[Unverified]` instead of silently passing
@@ -103,8 +103,9 @@ After startup, you'll have:
 
 | Service | Port | Transport | Purpose |
 |---------|------|-----------|---------|
+| broodlink | 3310* | HTTP | Unified binary: setup wizard, process manager (starts all services + infrastructure), reverse proxy to status-api and Ollama, native chat UI, model management API. Embeds the full Hugo dashboard via `rust-embed`. *Default port; configurable via `--port`. |
 | beads-bridge | 3310 | HTTP + NATS | Universal tool API (96 tools), JWT RS256 auth with kid-based multi-key validation, rate limiting, budget enforcement, circuit breakers, JWKS endpoint, SSE streaming, task negotiation tools (decline/context request) |
-| coordinator | -- | NATS only | Smart task routing with weighted scoring, atomic claiming, exponential backoff, dead-letter queue with auto-retry, workflow orchestration with conditional steps, parallel groups, per-step retries, timeouts, and error handlers, multi-agent task decomposition, scheduled task promotion (60s polling), task negotiation protocol (decline/redirect/context request with max-decline dead-letter) |
+| coordinator | -- | NATS only | Smart task routing with weighted scoring, atomic claiming, exponential backoff, dead-letter queue with auto-retry, workflow orchestration with conditional steps, parallel groups, per-step retries, timeouts, and error handlers, LLM-powered sub-task decomposition (configurable, fail-open), agent-to-agent delegation protocol (request/accept/decline/complete lifecycle), automated verification pipeline on task completion (pass/fail/skip), scheduled task promotion (60s polling), task negotiation protocol (decline/redirect/context request with max-decline dead-letter) |
 | heartbeat | -- | NATS + DB | 5-min sync cycle: Dolt commit, agent metrics, daily summary, stale agent deactivation, KG entity/edge expiry with weight decay, daily budget replenishment, formula registry sync, notification rule evaluation |
 | embedding-worker | -- | NATS + DB | Outbox poll -- Ollama `nomic-embed-text` embeddings -- Qdrant upsert -- LLM entity extraction for knowledge graph, circuit breakers, smart chunk boundaries (heading/code-fence/paragraph-aware splitting) |
 | status-api | 3312 | HTTP | Dashboard API with API key + session auth (RBAC on all mutations), CORS, security headers (HSTS, CSP, X-Frame-Options), SSE stream proxy, control panel endpoints (agent toggle, budget set, task cancel, webhook CRUD, guardrails, DLQ), chat session management, chat attachment retrieval and thumbnails, formula registry CRUD, user management, agent onboarding with JWT generation, verification analytics |
@@ -142,7 +143,7 @@ All configuration lives in `config.toml`. Every field can be overridden with env
 ## Testing
 
 ```bash
-cargo test --workspace                    # 367 unit tests
+cargo test --workspace                    # 381 unit tests
 bash tests/run-all.sh                     # 22 integration test suites
 bash tests/e2e.sh                         # 124 end-to-end tests (requires running services)
 bash tests/v060-regression.sh             # 164 v0.6.0 regression tests
@@ -187,12 +188,16 @@ Local models achieve ~85-95% of cloud quality at zero cost, zero latency, full p
 | Postgres queries (402–8233 rows) | 0.3–1.1ms |
 | Disk sequential write | 6.5 GB/s |
 
+## Platforms
+
+Pre-built binaries are available for macOS (ARM + Intel), Linux (x86_64 + ARM), and Windows (x86_64). Push a version tag (`git tag v0.12.2 && git push origin v0.12.2`) to trigger the release workflow, which builds all 5 targets and publishes them as a GitHub Release with SHA256 checksums.
+
 ## Prerequisites
 
 - Rust 1.75+ with `cargo-deny`
 - Hugo 0.120+ (extended edition)
 - age + SOPS (secrets management)
-- Podman + podman-compose
+- Podman + podman-compose (Linux/macOS) or Docker Desktop (Windows)
 - Dolt SQL server
 - PostgreSQL 15+
 - NATS 2.10+
@@ -233,16 +238,17 @@ broodlink/
 │   ├── broodlink-formulas/       # Formula TOML parsing, JSONB conversion, sync helpers
 │   └── broodlink-fs/             # File system helpers, attachment storage
 ├── rust/
+│   ├── broodlink/                # Unified binary: setup wizard, process manager, dashboard, chat UI
 │   ├── beads-bridge/             # Universal tool API (96 tools, task negotiation)
-│   ├── coordinator/              # NATS task routing + workflow orchestration
+│   ├── coordinator/              # NATS task routing + workflow orchestration + decomposition + delegation + verification
 │   ├── heartbeat/                # Periodic sync + health checks
 │   ├── embedding-worker/         # Outbox → Ollama → Qdrant pipeline + KG entity extraction
 │   ├── status-api/               # Dashboard API + control panel endpoints
 │   ├── mcp-server/               # MCP protocol server
 │   └── a2a-gateway/              # A2A protocol gateway + webhook gateway
 ├── agents/                       # Python SDK: typed clients, Click CLI, BaseAgent framework, ML utilities
-├── status-site/                  # Hugo dashboard (WCAG 2.1 AA, 17 pages)
-│   └── themes/broodlink-status/
+├── status-site/                  # Hugo dashboard (WCAG 2.1 AA, 18 pages)
+│   └── themes/broodlink-status/  # 18 pages
 ├── broodctl                      # Stack manager (up/down/status/rebuild/doctor)
 ├── migrations/                   # SQL migrations (33 files, additive only)
 │   ├── 001_dolt_brain.sql
@@ -301,6 +307,7 @@ Located in `.beads/formulas/`:
 | `build-feature.formula.toml` | End-to-end feature: plan, implement, test, document |
 | `daily-review.formula.toml` | Daily ops review: metrics, blockers, summary |
 | `knowledge-gap.formula.toml` | Audit memory, prioritize gaps, research and fill |
+| `coding-agent.formula.toml` | Code generation with planning, implementation, review, and testing |
 | `custom/incident-postmortem.formula.toml` | Gather evidence, root cause analysis, prevention plan, final report |
 
 ### Visual Workflow Editor

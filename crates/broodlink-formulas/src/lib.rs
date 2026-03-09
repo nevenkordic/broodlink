@@ -671,11 +671,12 @@ mod tests {
     #[test]
     fn test_load_system_formulas() {
         let formulas = load_toml_formulas("../../.beads/formulas");
-        assert_eq!(formulas.len(), 4);
+        assert_eq!(formulas.len(), 5);
         let names: Vec<&str> = formulas.iter().map(|f| f.name.as_str()).collect();
         assert!(names.contains(&"research"));
         assert!(names.contains(&"build-feature"));
         assert!(names.contains(&"daily-review"));
         assert!(names.contains(&"knowledge-gap"));
+        assert!(names.contains(&"coding-agent"));
     }
 }
