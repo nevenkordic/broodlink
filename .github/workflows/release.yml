@@ -21,7 +21,7 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             archive: tar.gz
           - os: ubuntu-latest
@@ -37,6 +37,15 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Build Hugo site
+        uses: peaceiris/actions-hugo@v3
+        with:
+          hugo-version: "latest"
+          extended: true
+
+      - name: Generate static assets
+        run: hugo --minify --source status-site
 
       - uses: dtolnay/rust-toolchain@stable
         with:
