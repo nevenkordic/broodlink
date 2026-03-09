@@ -110,6 +110,7 @@ struct StatusPayload {
 // Beads issue (parsed from `bd issue list --json`)
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 #[derive(serde::Deserialize, Debug)]
 struct BeadsIssue {
     #[serde(alias = "bead_id", alias = "id")]
@@ -701,6 +702,7 @@ async fn dolt_commit(dolt: &MySqlPool, message: &str) -> Result<(), BroodlinkErr
 
 /// Run `bd issue list --json`, parse the output, and upsert each issue
 /// into the `beads_issues` table in Dolt.
+#[allow(dead_code)]
 async fn sync_beads(dolt: &MySqlPool, bd_binary: &str) -> Result<usize, BroodlinkError> {
     let output = tokio::process::Command::new(bd_binary)
         .arg("issue")
