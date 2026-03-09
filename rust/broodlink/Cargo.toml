@@ -1,0 +1,47 @@
+# Broodlink — Multi-agent AI orchestration system
+# Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[package]
+name = "broodlink"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "broodlink"
+path = "src/main.rs"
+
+[dependencies]
+broodlink-config = { path = "../../crates/broodlink-config" }
+broodlink-secrets = { path = "../../crates/broodlink-secrets" }
+
+tokio       = { workspace = true }
+axum        = { workspace = true }
+tower       = { workspace = true }
+tower-http  = { workspace = true }
+axum-server = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+tracing     = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest     = { workspace = true }
+chrono      = { workspace = true }
+uuid        = { workspace = true }
+futures     = { workspace = true }
+tokio-stream = { workspace = true }
+toml        = { workspace = true }
+anyhow      = { workspace = true }
+
+async-stream = "0.3"
+clap        = { version = "4", features = ["derive"] }
+rust-embed  = { version = "8", features = ["compression"] }
+mime_guess  = "2"
+dirs        = "6"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

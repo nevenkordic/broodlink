@@ -5,6 +5,65 @@ All notable changes to Broodlink are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.12.2] - 2026-03-09
+
+### Added
+
+- **Sub-task Decomposition**: Coordinator can now decompose complex tasks into
+  sub-tasks using an LLM call before routing. Configurable via
+  `[collaboration.decomposition]` in config.toml (`enabled`, `model`,
+  `min_complexity_chars`, `timeout_secs`). Disabled by default. Fail-open
+  design: if Ollama is down or returns garbage, the original task routes
+  normally. Inserts into `task_decompositions` table with parent/child linking.
+- **Agent Delegation Protocol**: Agents can delegate sub-tasks to other agents
+  through the coordinator. Full lifecycle: request, accept/decline, execute,
+  return result. Two new NATS subscriptions
+  (`coordinator.delegation_request`, `coordinator.delegation_response`).
+  Notifies originating agent on completion. Parent tasks auto-complete when all
+  children finish.
+- **Verification Pipeline**: Completed task outputs are automatically reviewed
+  by an LLM before marking done. Three outcomes: pass (mark complete), fail
+  (return to agent with feedback), skip (continue without blocking). Logs all
+  results to `service_events` table. Fail-open: verification is best-effort and
+  never blocks task flow.
+- **Native Chat UI**: Full chat interface at `/chat/` powered by local Ollama
+  models. Model selector, conversation history in localStorage, markdown
+  rendering (code blocks, bold, inline code), typing indicator, auto-resize
+  textarea, Enter to send. Zero external dependencies — no Python, no Open
+  WebUI. Agent conversation monitoring preserved below the chat interface.
+- **Negotiations Endpoint**: New `GET /api/v1/negotiations` in status-api
+  returning task negotiation events (declines, context requests, redirects)
+  from the `task_negotiations` table. Handoffs dashboard page now includes a
+  Negotiations section with metrics and filtering.
+- **Download Model UI Overhaul**: Tabbed modal (Recommended / Custom) with
+  categorized model cards (Core Stack, Advanced). Real SSE progress streaming
+  from Ollama during downloads with byte-level progress bar. Installed models
+  shown as greyed-out badges. Concurrent download guard.
+- **Cross-Platform Release Workflow**: New `.github/workflows/release.yml`
+  triggered by version tags. Builds 5 targets in parallel: macOS ARM, macOS
+  Intel, Linux x86_64, Linux ARM (via `cross`), Windows x86_64. Each produces
+  a tarball/zip with all 8 binaries + SHA256 checksums. Creates a GitHub
+  Release with all artifacts.
+- **Windows Support**: All Broodlink binaries now compile and run on Windows.
+  `nix` crate replaced with `libc` (Unix) / `taskkill` (Windows) for process
+  management. `USERPROFILE` fallback for home directory. Browser opening via
+  `cmd /C start`. Setup wizard uses Chocolatey (`choco install`) and
+  PowerShell. Ollama installed via `OllamaSetup.exe`. Qdrant downloaded as
+  Windows MSVC binary. PostgreSQL detection checks Windows Program Files paths.
+
+### Changed
+
+- **Workspace version**: 0.11.0 → 0.12.2.
+- **Dashboard version**: hugo.toml version bumped to 0.12.2.
+- **`coding-agent` formula**: Added to system formulas (5 total, up from 4).
+
+### Fixed
+
+- **Stale negotiations artifact**: Removed orphaned `public/negotiations/`
+  Hugo build output that had no source template or sidebar link.
+- **Formula test count**: `test_load_system_formulas` updated from 4 → 5 to
+  match the `coding-agent` formula added in a prior release.
+
 ## [0.12.1] - 2026-03-03
 
 ### Added

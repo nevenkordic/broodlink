@@ -51,6 +51,56 @@
     </tbody>
   </table>
 </div>
+<h3 style="margin-top:2rem;">Negotiations</h3>
+<p class="page-desc">Task declines, context requests, and redirect suggestions from agents.</p>
+
+<div class="card-grid" id="negotiation-metrics">
+  <div class="card metric-card">
+    <div class="value" id="neg-total">--</div>
+    <div class="label">Total Events</div>
+  </div>
+  <div class="card metric-card">
+    <div class="value" id="neg-declined">--</div>
+    <div class="label">Declined</div>
+  </div>
+  <div class="card metric-card">
+    <div class="value" id="neg-context">--</div>
+    <div class="label">Context Requests</div>
+  </div>
+  <div class="card metric-card">
+    <div class="value" id="neg-redirected">--</div>
+    <div class="label">Redirected</div>
+  </div>
+</div>
+
+<div class="filter-bar">
+  <label for="neg-action-filter">Action:</label>
+  <select id="neg-action-filter">
+    <option value="">All</option>
+    <option value="declined">Declined</option>
+    <option value="context_requested">Context Requested</option>
+    <option value="context_provided">Context Provided</option>
+    <option value="redirected">Redirected</option>
+  </select>
+</div>
+
+<div class="table-container">
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">Task</th>
+        <th scope="col">Agent</th>
+        <th scope="col">Action</th>
+        <th scope="col">Reason</th>
+        <th scope="col">Suggested Agent</th>
+        <th scope="col">When</th>
+      </tr>
+    </thead>
+    <tbody id="negotiations-tbody" aria-live="polite">
+      <!-- Populated by JS -->
+    </tbody>
+  </table>
+</div>
 {{ end }}
 
 {{ define "scripts" }}

@@ -96,4 +96,75 @@
 
   load();
   setInterval(load, BL.REFRESH_INTERVAL || 10000);
+
+  // ── Negotiations section ──────────────────────────────────────────
+  var negTbody = document.getElementById('negotiations-tbody');
+  var negFilter = document.getElementById('neg-action-filter');
+  if (!negTbody) return;
+
+  var allNegotiations = [];
+
+  function actionBadge(action) {
+    var colors = {
+      declined: '#ef4444',
+      context_requested: '#f59e0b',
+      context_provided: '#3b82f6',
+      redirected: '#8b5cf6'
+    };
+    var color = colors[action] || '#6b7280';
+    var label = action.replace(/_/g, ' ');
+    return '<span style="display:inline-flex;align-items:center;gap:4px;">' +
+      '<svg width="8" height="8"><circle cx="4" cy="4" r="4" fill="' + color + '"/></svg>' +
+      BL.escapeHtml(label) + '</span>';
+  }
+
+  function updateNegMetrics(negs) {
+    var total = negs.length, declined = 0, context = 0, redirected = 0;
+    negs.forEach(function (n) {
+      if (n.action === 'declined') declined++;
+      else if (n.action === 'context_requested' || n.action === 'context_provided') context++;
+      else if (n.action === 'redirected') redirected++;
+    });
+    var el;
+    el = document.getElementById('neg-total'); if (el) el.textContent = total;
+    el = document.getElementById('neg-declined'); if (el) el.textContent = declined;
+    el = document.getElementById('neg-context'); if (el) el.textContent = context;
+    el = document.getElementById('neg-redirected'); if (el) el.textContent = redirected;
+  }
+
+  function renderNegotiations(negs) {
+    if (!negs || negs.length === 0) {
+      negTbody.innerHTML = '<tr><td colspan="6">No negotiation events found.</td></tr>';
+      return;
+    }
+    negTbody.innerHTML = negs.map(function (n) {
+      return '<tr>' +
+        '<td class="mono">' + BL.escapeHtml(n.task_id) + '</td>' +
+        '<td>' + BL.escapeHtml(n.agent_id) + '</td>' +
+        '<td>' + actionBadge(n.action) + '</td>' +
+        '<td>' + BL.escapeHtml(n.reason || '-') + '</td>' +
+        '<td>' + BL.escapeHtml(n.suggested_agent || '-') + '</td>' +
+        '<td>' + BL.formatRelativeTime(n.created_at) + '</td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  function loadNegotiations() {
+    BL.fetchApi('/api/v1/negotiations').then(function (data) {
+      allNegotiations = data.negotiations || [];
+      updateNegMetrics(allNegotiations);
+      var filtered = allNegotiations;
+      var actionVal = negFilter ? negFilter.value : '';
+      if (actionVal) {
+        filtered = allNegotiations.filter(function (n) { return n.action === actionVal; });
+      }
+      renderNegotiations(filtered);
+    }).catch(function () {
+      negTbody.innerHTML = '<tr><td colspan="6">Failed to load negotiations.</td></tr>';
+    });
+  }
+
+  if (negFilter) negFilter.addEventListener('change', loadNegotiations);
+  loadNegotiations();
+  setInterval(loadNegotiations, BL.REFRESH_INTERVAL || 10000);
 })();

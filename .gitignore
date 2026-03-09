@@ -42,9 +42,13 @@ Thumbs.db
 .claude/
 .cursor/
 *.swp
+.aider.chat.history.md
+.aider.input.history
 
 # Node (vendored JS only, no npm)
 node_modules/
 
 # Podman / Docker
 .docker/
+.beads/formulas/custom/e2e-*
+.aider.conf.yml

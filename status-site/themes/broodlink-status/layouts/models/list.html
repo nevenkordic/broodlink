@@ -1,0 +1,151 @@
+{{ define "main" }}
+<h2>AI Models</h2>
+<p class="page-desc">Manage your local AI models. Download, remove, and assign models to tasks.</p>
+
+<div class="card-grid" id="model-metrics">
+  <div class="card metric-card">
+    <div class="value" id="metric-total">—</div>
+    <div class="label">Installed</div>
+  </div>
+  <div class="card metric-card">
+    <div class="value" id="metric-size">—</div>
+    <div class="label">Total Size</div>
+  </div>
+  <div class="card metric-card">
+    <div class="value" id="metric-roles">—</div>
+    <div class="label">Roles Covered</div>
+  </div>
+</div>
+
+<div style="margin-bottom:1.5rem;display:flex;gap:0.5rem;">
+  <button class="btn btn-primary" id="show-pull-btn">Download New Model</button>
+  <button class="btn" id="refresh-btn">Refresh</button>
+</div>
+
+<!-- Pull modal -->
+<div id="pull-modal" class="modal" style="display:none;" role="dialog" aria-modal="true" aria-label="Download Model">
+  <div class="modal-content modal-lg">
+    <div class="modal-header">
+      <h3>Download Model</h3>
+      <button class="btn-close" id="close-pull-modal" aria-label="Close">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="pull-tabs" role="tablist">
+        <button class="pull-tab active" data-tab="recommended" role="tab" aria-selected="true">Recommended</button>
+        <button class="pull-tab" data-tab="custom" role="tab" aria-selected="false">Custom</button>
+      </div>
+
+      <div id="tab-recommended" class="pull-tab-panel">
+        <div class="pull-category">
+          <h4>Core Stack</h4>
+          <p class="pull-category-desc">Essential models for running Broodlink agents.</p>
+          <div id="rec-core" class="rec-grid"></div>
+        </div>
+        <div class="pull-category">
+          <h4>Advanced</h4>
+          <p class="pull-category-desc">Higher-quality models for users with more VRAM (16 GB+).</p>
+          <div id="rec-advanced" class="rec-grid"></div>
+        </div>
+      </div>
+
+      <div id="tab-custom" class="pull-tab-panel" style="display:none;">
+        <p style="color:var(--text-secondary);font-size:0.85rem;margin-bottom:0.75rem;">
+          Enter any model from the <a href="https://ollama.com/library" target="_blank" rel="noopener">Ollama library</a>:
+        </p>
+        <form id="pull-form" style="display:flex;gap:0.5rem;">
+          <input type="text" id="pull-name" placeholder="e.g. llama3:8b, mistral:7b, phi3:mini" style="flex:1;" required autocomplete="off">
+          <button type="submit" class="btn btn-primary">Download</button>
+        </form>
+      </div>
+
+      <div id="pull-progress" style="display:none;margin-top:1rem;" aria-live="polite">
+        <div class="pull-progress-header">
+          <strong id="pull-progress-name"></strong>
+          <span id="pull-progress-pct">0%</span>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-bar-fill" id="pull-progress-fill"></div>
+        </div>
+        <p id="pull-progress-status" class="pull-progress-detail"></p>
+      </div>
+
+      <div id="pull-result" style="display:none;margin-top:1rem;" aria-live="polite"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Model table -->
+<div class="table-container">
+  <table>
+    <caption>Installed AI models on this machine</caption>
+    <thead>
+      <tr>
+        <th scope="col">Model</th>
+        <th scope="col">Role</th>
+        <th scope="col">Size</th>
+        <th scope="col">Modified</th>
+        <th scope="col">Actions</th>
+      </tr>
+    </thead>
+    <tbody id="models-tbody" aria-live="polite">
+      <tr><td colspan="5" class="loading-cell">Loading models...</td></tr>
+    </tbody>
+  </table>
+</div>
+
+{{ end }}
+
+{{ define "styles" }}
+<style>
+  .role-badge {
+    font-size: 0.75rem;
+    padding: 0.15rem 0.5rem;
+    border-radius: 0.5rem;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+  }
+  .role-badge.code { background: #1e3a5f; color: #60a5fa; }
+  .role-badge.chat { background: #1a3a2a; color: #4ade80; }
+  .role-badge.reasoning { background: #3b1f4a; color: #c084fc; }
+  .role-badge.vision { background: #3a2f1a; color: #fbbf24; }
+  .role-badge.embedding { background: #1a2f3a; color: #67e8f9; }
+  .role-badge.medical { background: #3a1a1a; color: #f87171; }
+  .role-badge.frontend { background: #2a2a1a; color: #a3e635; }
+  .role-badge.reranker { background: #2a1a2a; color: #e879f9; }
+  .modal-lg .modal-body { max-height: 70vh; overflow-y: auto; }
+  .pull-tabs { display: flex; gap: 0; margin-bottom: 1rem; border-bottom: 2px solid var(--bg-tertiary); }
+  .pull-tab {
+    background: none; border: none; color: var(--text-secondary); padding: 0.5rem 1rem;
+    cursor: pointer; font-size: 0.9rem; border-bottom: 2px solid transparent; margin-bottom: -2px;
+  }
+  .pull-tab:hover { color: var(--text); }
+  .pull-tab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+  .pull-category { margin-bottom: 1.25rem; }
+  .pull-category h4 { margin: 0 0 0.2rem; font-size: 0.95rem; }
+  .pull-category-desc { color: var(--text-secondary); font-size: 0.8rem; margin: 0 0 0.5rem; }
+  .rec-grid { display: flex; flex-direction: column; gap: 0.4rem; }
+  .rec-card {
+    display: flex; align-items: center; gap: 0.75rem; padding: 0.6rem 0.75rem;
+    border: 1px solid var(--bg-tertiary); border-radius: var(--radius); cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .rec-card:hover { border-color: var(--accent); background: var(--bg-secondary, rgba(255,255,255,0.02)); }
+  .rec-card.installed { opacity: 0.55; cursor: default; }
+  .rec-card.installed:hover { border-color: var(--bg-tertiary); background: none; }
+  .rec-card.downloading { border-color: var(--accent); opacity: 1; }
+  .rec-card-info { flex: 1; min-width: 0; }
+  .rec-card-name { font-weight: 600; font-size: 0.9rem; }
+  .rec-card-desc { color: var(--text-secondary); font-size: 0.8rem; margin-top: 0.1rem; }
+  .rec-card-meta { text-align: right; flex-shrink: 0; font-size: 0.8rem; color: var(--text-secondary); }
+  .rec-card-status { font-size: 0.75rem; margin-top: 0.15rem; }
+  .rec-card-status.ok { color: var(--color-ok, #4caf50); }
+  .progress-bar { height: 8px; background: var(--bg-tertiary); border-radius: 4px; overflow: hidden; }
+  .progress-bar-fill { height: 100%; background: var(--accent); width: 0%; transition: width 0.3s; border-radius: 4px; }
+  .pull-progress-header { display: flex; justify-content: space-between; margin-bottom: 0.35rem; font-size: 0.9rem; }
+  .pull-progress-detail { color: var(--text-secondary); font-size: 0.8rem; margin-top: 0.35rem; }
+</style>
+{{ end }}
+
+{{ define "scripts" }}
+<script src="/js/models.js"></script>
+{{ end }}

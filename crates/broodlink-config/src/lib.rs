@@ -782,6 +782,8 @@ pub struct CollaborationConfig {
     pub max_declines_per_task: u32,
     #[serde(default = "default_context_request_timeout_minutes")]
     pub context_request_timeout_minutes: u32,
+    #[serde(default)]
+    pub decomposition: DecompositionConfig,
 }
 
 impl Default for CollaborationConfig {
@@ -792,8 +794,47 @@ impl Default for CollaborationConfig {
             task_claim_timeout_minutes: default_task_claim_timeout_minutes(),
             max_declines_per_task: default_max_declines_per_task(),
             context_request_timeout_minutes: default_context_request_timeout_minutes(),
+            decomposition: DecompositionConfig::default(),
         }
     }
+}
+
+/// Configuration for LLM-powered task decomposition.
+/// When enabled, the coordinator sends complex tasks to a local Ollama model
+/// to break them into sub-tasks before routing.
+#[derive(Deserialize, Clone, Debug)]
+pub struct DecompositionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_decompose_model")]
+    pub model: String,
+    #[serde(default = "default_decompose_min_complexity")]
+    pub min_complexity_chars: usize,
+    #[serde(default = "default_decompose_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for DecompositionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: default_decompose_model(),
+            min_complexity_chars: default_decompose_min_complexity(),
+            timeout_secs: default_decompose_timeout_secs(),
+        }
+    }
+}
+
+fn default_decompose_model() -> String {
+    "qwen3.5:4b".to_string()
+}
+
+fn default_decompose_min_complexity() -> usize {
+    200
+}
+
+fn default_decompose_timeout_secs() -> u64 {
+    30
 }
 
 fn default_max_sub_tasks() -> u32 {
@@ -923,6 +964,9 @@ pub struct ChatConfig {
     pub max_attachment_bytes: u64,
     #[serde(default)]
     pub voice_transcription_enabled: bool,
+    // auto-memory: extract and store memorable facts after each response
+    #[serde(default = "default_auto_memory_enabled")]
+    pub auto_memory_enabled: bool,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -1023,6 +1067,7 @@ impl Default for ChatConfig {
             transcription_url: default_transcription_url(),
             max_attachment_bytes: default_max_attachment_bytes(),
             voice_transcription_enabled: false,
+            auto_memory_enabled: default_auto_memory_enabled(),
         }
     }
 }
@@ -1143,6 +1188,10 @@ fn default_chat_memory_enabled() -> bool {
 
 fn default_chat_memory_max_results() -> u32 {
     3
+}
+
+fn default_auto_memory_enabled() -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------

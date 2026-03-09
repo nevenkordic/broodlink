@@ -191,6 +191,7 @@ struct AppState {
     pg: PgPool,
     nats: async_nats::Client,
     config: Arc<Config>,
+    http: reqwest::Client,
     start_time: std::time::Instant,
     // Atomic counters for metrics
     tasks_claimed: AtomicU64,
@@ -1060,6 +1061,86 @@ async fn handle_task_completed(
     state: &Arc<AppState>,
     payload: &TaskCompletedPayload,
 ) -> Result<(), BroodlinkError> {
+    // v0.12.2: Run verification pipeline on the completed output
+    {
+        let task_info = sqlx::query(
+            "SELECT title, description, parent_task_id FROM task_queue WHERE id = $1",
+        )
+        .bind(&payload.task_id)
+        .fetch_optional(&state.pg)
+        .await?;
+
+        if let Some(ti) = &task_info {
+            let title: String = ti.get("title");
+            let description: Option<String> = ti.get("description");
+            let parent: Option<String> = ti.get("parent_task_id");
+
+            let verdict = verify_task_output(
+                state,
+                &payload.task_id,
+                &title,
+                description.as_deref(),
+                payload.result_data.as_ref(),
+            ).await;
+
+            match verdict {
+                VerificationResult::Fail(feedback) => {
+                    // Log verification failure
+                    let _ = sqlx::query(
+                        "INSERT INTO service_events (service, event_type, severity, details, created_at)
+                         VALUES ('coordinator', 'verification_failed', 'warning', $1, NOW())",
+                    )
+                    .bind(serde_json::json!({
+                        "task_id": payload.task_id,
+                        "agent_id": payload.agent_id,
+                        "feedback": feedback,
+                    }))
+                    .execute(&state.pg)
+                    .await;
+
+                    // Notify the agent about the failure
+                    let notify_subject = format!(
+                        "{}.{}.agent.{}.verification_result",
+                        state.config.nats.subject_prefix, state.config.broodlink.env, payload.agent_id,
+                    );
+                    let notify = serde_json::json!({
+                        "task_id": payload.task_id,
+                        "verdict": "fail",
+                        "feedback": feedback,
+                    });
+                    if let Ok(bytes) = serde_json::to_vec(&notify) {
+                        let _ = state.nats.publish(notify_subject, bytes.into()).await;
+                    }
+
+                    warn!(
+                        task_id = %payload.task_id,
+                        agent = %payload.agent_id,
+                        "task failed verification — agent notified"
+                    );
+                    // Continue processing (don't block the pipeline — agents can optionally retry)
+                }
+                VerificationResult::Pass => {
+                    let _ = sqlx::query(
+                        "INSERT INTO service_events (service, event_type, severity, details, created_at)
+                         VALUES ('coordinator', 'verification_passed', 'info', $1, NOW())",
+                    )
+                    .bind(serde_json::json!({
+                        "task_id": payload.task_id,
+                        "agent_id": payload.agent_id,
+                    }))
+                    .execute(&state.pg)
+                    .await;
+                }
+                VerificationResult::Skip => {} // No-op
+            }
+
+            // Check if this is a sub-task and parent should be auto-completed
+            if let Some(ref parent_id) = parent {
+                check_parent_task_completion(state, parent_id).await?;
+            }
+        }
+    }
+
     // Check if this task belongs to a workflow
     let row = sqlx::query(
         "SELECT workflow_run_id, step_index, step_name
@@ -1836,6 +1917,118 @@ async fn run_task_context_request_subscription(
 }
 
 // ---------------------------------------------------------------------------
+// v0.12.2: Delegation NATS subscription loops
+// ---------------------------------------------------------------------------
+
+async fn run_delegation_request_subscription(
+    state: Arc<AppState>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), BroodlinkError> {
+    let subject = format!(
+        "{}.{}.coordinator.delegation_request",
+        state.config.nats.subject_prefix, state.config.broodlink.env,
+    );
+
+    info!(subject = %subject, "subscribing to delegation_request");
+    let mut subscriber = state.nats.subscribe(subject.clone()).await?;
+
+    loop {
+        tokio::select! {
+            msg = subscriber.next() => {
+                match msg {
+                    Some(nats_msg) => {
+                        match serde_json::from_slice::<DelegationRequestPayload>(&nats_msg.payload) {
+                            Ok(payload) => {
+                                let state_clone = Arc::clone(&state);
+                                tokio::spawn(async move {
+                                    if let Err(e) = handle_delegation_request(&state_clone, &payload).await {
+                                        warn!(
+                                            error = %e,
+                                            from = %payload.from_agent,
+                                            "delegation request handling failed"
+                                        );
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "failed to deserialize delegation_request payload");
+                            }
+                        }
+                    }
+                    None => {
+                        warn!("delegation_request subscription stream ended");
+                        break;
+                    }
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                info!("shutdown signal, stopping delegation_request subscription");
+                break;
+            }
+        }
+    }
+
+    if let Err(e) = subscriber.unsubscribe().await {
+        warn!(error = %e, "failed to unsubscribe from delegation_request");
+    }
+    Ok(())
+}
+
+async fn run_delegation_response_subscription(
+    state: Arc<AppState>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), BroodlinkError> {
+    let subject = format!(
+        "{}.{}.coordinator.delegation_response",
+        state.config.nats.subject_prefix, state.config.broodlink.env,
+    );
+
+    info!(subject = %subject, "subscribing to delegation_response");
+    let mut subscriber = state.nats.subscribe(subject.clone()).await?;
+
+    loop {
+        tokio::select! {
+            msg = subscriber.next() => {
+                match msg {
+                    Some(nats_msg) => {
+                        match serde_json::from_slice::<DelegationResponsePayload>(&nats_msg.payload) {
+                            Ok(payload) => {
+                                let state_clone = Arc::clone(&state);
+                                tokio::spawn(async move {
+                                    if let Err(e) = handle_delegation_response(&state_clone, &payload).await {
+                                        warn!(
+                                            error = %e,
+                                            delegation_id = %payload.delegation_id,
+                                            "delegation response handling failed"
+                                        );
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "failed to deserialize delegation_response payload");
+                            }
+                        }
+                    }
+                    None => {
+                        warn!("delegation_response subscription stream ended");
+                        break;
+                    }
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                info!("shutdown signal, stopping delegation_response subscription");
+                break;
+            }
+        }
+    }
+
+    if let Err(e) = subscriber.unsubscribe().await {
+        warn!(error = %e, "failed to unsubscribe from delegation_response");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Metrics publishing
 // ---------------------------------------------------------------------------
 
@@ -1854,6 +2047,343 @@ async fn publish_metrics(state: &AppState) -> Result<(), BroodlinkError> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// v0.12.2: LLM-powered task decomposition
+// ---------------------------------------------------------------------------
+
+/// Sub-task parsed from Ollama decomposition response.
+#[derive(Deserialize, Debug)]
+struct SubTaskDef {
+    title: String,
+    description: String,
+    #[serde(default = "default_sub_role")]
+    role: String,
+}
+
+fn default_sub_role() -> String {
+    "worker".to_string()
+}
+
+/// Ask Ollama to decompose a complex task into sub-tasks.
+/// Returns an empty Vec if decomposition is disabled, task is too simple,
+/// or the LLM call fails (fail-open: route the original task as-is).
+async fn decompose_task(
+    state: &AppState,
+    task: &TaskRow,
+) -> Vec<SubTaskDef> {
+    let decomp = &state.config.collaboration.decomposition;
+    if !decomp.enabled {
+        return Vec::new();
+    }
+
+    // Only decompose tasks with enough description text to be "complex"
+    let desc = task.description.as_deref().unwrap_or("");
+    if desc.len() < decomp.min_complexity_chars {
+        return Vec::new();
+    }
+
+    // Skip tasks that are already workflow steps (they were already decomposed)
+    if task.title.starts_with('[') && task.title.contains('/') {
+        return Vec::new();
+    }
+
+    let max_sub = state.config.collaboration.max_sub_tasks;
+    let system_prompt = format!(
+        "You are a task decomposition engine for a multi-agent AI system. \
+         Break the given task into 2-{max_sub} independent sub-tasks that can be \
+         assigned to different agents. Each sub-task should be self-contained.\n\n\
+         Respond with ONLY a JSON array of objects, each with:\n\
+         - \"title\": short sub-task title\n\
+         - \"description\": detailed description of what to do\n\
+         - \"role\": agent role (\"worker\", \"coder\", \"reviewer\", \"researcher\")\n\n\
+         If the task is already simple enough (single action), respond with an empty array: []\n\n\
+         IMPORTANT: Output ONLY valid JSON. No markdown, no explanation."
+    );
+
+    let ollama_url = format!("{}/api/chat", state.config.ollama.url);
+    let payload = serde_json::json!({
+        "model": decomp.model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": format!("Task: {}\n\nDescription: {}", task.title, desc)}
+        ],
+        "stream": false,
+        "options": {
+            "temperature": 0.3,
+            "num_predict": 2048,
+            "num_ctx": state.config.ollama.num_ctx,
+        }
+    });
+
+    let resp = match state.http.post(&ollama_url).json(&payload).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, task_id = %task.id, "decomposition LLM call failed, routing original task");
+            return Vec::new();
+        }
+    };
+
+    let body: serde_json::Value = match resp.json().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, task_id = %task.id, "decomposition response parse failed");
+            return Vec::new();
+        }
+    };
+
+    // Extract content from Ollama response
+    let content = match body.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
+        Some(c) => c.trim(),
+        None => {
+            warn!(task_id = %task.id, "decomposition response missing message.content");
+            return Vec::new();
+        }
+    };
+
+    // Strip markdown code fences if present
+    let json_str = content
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+
+    // Parse the JSON array of sub-tasks
+    match serde_json::from_str::<Vec<SubTaskDef>>(json_str) {
+        Ok(subs) if subs.len() >= 2 => {
+            let capped: Vec<SubTaskDef> = subs.into_iter().take(max_sub as usize).collect();
+            info!(
+                task_id = %task.id,
+                sub_tasks = capped.len(),
+                "task decomposed into sub-tasks"
+            );
+            capped
+        }
+        Ok(_) => Vec::new(), // 0 or 1 sub-tasks means task is simple enough
+        Err(e) => {
+            warn!(
+                error = %e,
+                task_id = %task.id,
+                content = %json_str,
+                "failed to parse decomposition JSON"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Create sub-tasks in Postgres and publish task_available for each.
+/// Links them to the parent task via convoy_id.
+async fn create_sub_tasks(
+    state: &Arc<AppState>,
+    parent: &TaskRow,
+    subs: &[SubTaskDef],
+) -> Result<Vec<String>, BroodlinkError> {
+    let convoy_id = parent.convoy_id.as_deref().unwrap_or(&parent.id);
+    let mut task_ids = Vec::with_capacity(subs.len());
+
+    for (i, sub) in subs.iter().enumerate() {
+        let task_id = Uuid::new_v4().to_string();
+        let trace_id = Uuid::new_v4().to_string();
+        let title = format!("[{}/{}] {}", i + 1, subs.len(), sub.title);
+
+        sqlx::query(
+            "INSERT INTO task_queue (id, trace_id, title, description, status, priority, parent_task_id, convoy_id, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, NOW(), NOW())",
+        )
+        .bind(&task_id)
+        .bind(&trace_id)
+        .bind(&title)
+        .bind(&sub.description)
+        .bind(parent.priority)
+        .bind(&parent.id)
+        .bind(convoy_id)
+        .execute(&state.pg)
+        .await?;
+
+        // Publish task_available for each sub-task
+        let subject = format!(
+            "{}.{}.coordinator.task_available",
+            state.config.nats.subject_prefix, state.config.broodlink.env,
+        );
+        let nats_payload = serde_json::json!({
+            "task_id": task_id,
+            "role": sub.role,
+            "parent_task_id": parent.id,
+        });
+        if let Ok(bytes) = serde_json::to_vec(&nats_payload) {
+            if let Err(e) = state.nats.publish(subject, bytes.into()).await {
+                warn!(error = %e, task_id = %task_id, "failed to publish sub-task event");
+            }
+        }
+
+        // Track decomposition in task_decompositions table
+        let _ = sqlx::query(
+            "INSERT INTO task_decompositions (parent_task_id, child_task_id, merge_strategy, created_at)
+             VALUES ($1, $2, 'concatenate', NOW())",
+        )
+        .bind(&parent.id)
+        .bind(&task_id)
+        .execute(&state.pg)
+        .await;
+
+        info!(
+            parent_id = %parent.id,
+            sub_task_id = %task_id,
+            sub_task = i + 1,
+            total = subs.len(),
+            title = %sub.title,
+            role = %sub.role,
+            "created sub-task"
+        );
+
+        task_ids.push(task_id);
+    }
+
+    // Mark the parent task as 'decomposed' so it won't be routed directly
+    sqlx::query(
+        "UPDATE task_queue SET status = 'decomposed', updated_at = NOW() WHERE id = $1 AND status = 'pending'",
+    )
+    .bind(&parent.id)
+    .execute(&state.pg)
+    .await?;
+
+    // Log service event
+    let _ = sqlx::query(
+        "INSERT INTO service_events (service, event_type, severity, details, created_at)
+         VALUES ('coordinator', 'task_decomposed', 'info', $1, NOW())",
+    )
+    .bind(serde_json::json!({
+        "parent_task_id": parent.id,
+        "sub_task_ids": task_ids,
+        "sub_task_count": subs.len(),
+    }))
+    .execute(&state.pg)
+    .await;
+
+    Ok(task_ids)
+}
+
+// ---------------------------------------------------------------------------
+// v0.12.2: Verification pipeline
+// ---------------------------------------------------------------------------
+
+/// Verify a completed task's output using an LLM.
+/// Returns a verification result: pass, fail (with feedback), or skip (if disabled).
+#[derive(Debug)]
+enum VerificationResult {
+    Pass,
+    Fail(String), // feedback for the agent
+    Skip,         // verification not applicable
+}
+
+async fn verify_task_output(
+    state: &AppState,
+    task_id: &str,
+    title: &str,
+    description: Option<&str>,
+    result_data: Option<&serde_json::Value>,
+) -> VerificationResult {
+    let decomp = &state.config.collaboration.decomposition;
+    if !decomp.enabled {
+        return VerificationResult::Skip;
+    }
+
+    // Only verify tasks with result data
+    let result = match result_data {
+        Some(r) => r,
+        None => return VerificationResult::Skip,
+    };
+
+    let result_str = match serde_json::to_string_pretty(result) {
+        Ok(s) => s,
+        Err(_) => return VerificationResult::Skip,
+    };
+
+    // Skip verification for very small results (likely simple acknowledgments)
+    if result_str.len() < 50 {
+        return VerificationResult::Skip;
+    }
+
+    let system_prompt = "You are a quality verification agent for a multi-agent AI system. \
+         Your job is to review completed task outputs for correctness and completeness.\n\n\
+         Given the original task and the agent's output, determine if:\n\
+         1. The output addresses the task requirements\n\
+         2. The output appears correct and complete\n\
+         3. There are no obvious errors or omissions\n\n\
+         Respond with ONLY a JSON object:\n\
+         {\"verdict\": \"pass\"} if the output is satisfactory\n\
+         {\"verdict\": \"fail\", \"feedback\": \"specific feedback for improvement\"} if not\n\n\
+         IMPORTANT: Output ONLY valid JSON. Be lenient — only fail clearly wrong or incomplete work.";
+
+    let desc = description.unwrap_or("(no description)");
+    let user_msg = format!(
+        "Task: {title}\nDescription: {desc}\n\nAgent output:\n{result_str}"
+    );
+
+    let ollama_url = format!("{}/api/chat", state.config.ollama.url);
+    let payload = serde_json::json!({
+        "model": decomp.model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_msg}
+        ],
+        "stream": false,
+        "options": {
+            "temperature": 0.1,
+            "num_predict": 512,
+            "num_ctx": state.config.ollama.num_ctx,
+        }
+    });
+
+    let resp = match state.http.post(&ollama_url).json(&payload).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, task_id = %task_id, "verification LLM call failed, skipping");
+            return VerificationResult::Skip;
+        }
+    };
+
+    let body: serde_json::Value = match resp.json().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, task_id = %task_id, "verification response parse failed");
+            return VerificationResult::Skip;
+        }
+    };
+
+    let content = match body.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
+        Some(c) => c.trim(),
+        None => return VerificationResult::Skip,
+    };
+
+    let json_str = content
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+
+    match serde_json::from_str::<serde_json::Value>(json_str) {
+        Ok(obj) => {
+            let verdict = obj.get("verdict").and_then(|v| v.as_str()).unwrap_or("pass");
+            if verdict == "fail" {
+                let feedback = obj.get("feedback")
+                    .and_then(|f| f.as_str())
+                    .unwrap_or("Output did not meet requirements")
+                    .to_string();
+                info!(task_id = %task_id, "verification FAILED: {feedback}");
+                VerificationResult::Fail(feedback)
+            } else {
+                info!(task_id = %task_id, "verification PASSED");
+                VerificationResult::Pass
+            }
+        }
+        Err(_) => {
+            // Can't parse verdict — assume pass (fail-open)
+            VerificationResult::Skip
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1887,6 +2417,29 @@ async fn handle_task_available(
             return Ok(());
         }
     };
+
+    // 1b. v0.12.2: Try LLM-powered decomposition for complex tasks
+    let sub_tasks = decompose_task(state, &task).await;
+    if !sub_tasks.is_empty() {
+        match create_sub_tasks(state, &task, &sub_tasks).await {
+            Ok(ids) => {
+                info!(
+                    task_id = %payload.task_id,
+                    sub_tasks = ids.len(),
+                    "task decomposed, sub-tasks will be routed independently"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    task_id = %payload.task_id,
+                    "failed to create sub-tasks, routing original task"
+                );
+                // Fall through to route the original task
+            }
+        }
+    }
 
     // 2. Determine the required role.  The NATS payload may specify it,
     //    otherwise fall back to "worker" as the default role.
@@ -2322,6 +2875,258 @@ async fn handle_task_context_request(
     });
     if let Ok(bytes) = serde_json::to_vec(&nats_payload) {
         let _ = state.nats.publish(subject, bytes.into()).await;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// v0.12.2: Agent-to-agent delegation protocol
+// ---------------------------------------------------------------------------
+
+/// Payload received on the `delegation_request` subject.
+/// An agent requests the coordinator to delegate work to another agent.
+#[derive(Deserialize, Debug)]
+struct DelegationRequestPayload {
+    from_agent: String,
+    title: String,
+    description: String,
+    #[serde(default)]
+    parent_task_id: Option<String>,
+    #[serde(default)]
+    preferred_agent: Option<String>,
+    #[serde(default = "default_delegation_role")]
+    role: String,
+}
+
+fn default_delegation_role() -> String {
+    "worker".to_string()
+}
+
+/// Payload received on the `delegation_response` subject.
+/// An agent responds to a delegation (accept/reject/complete).
+#[derive(Deserialize, Debug)]
+struct DelegationResponsePayload {
+    delegation_id: String,
+    agent_id: String,
+    action: String, // "accepted", "rejected", "completed", "failed"
+    #[serde(default)]
+    result: Option<serde_json::Value>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+async fn handle_delegation_request(
+    state: &Arc<AppState>,
+    payload: &DelegationRequestPayload,
+) -> Result<(), BroodlinkError> {
+    let delegation_id = Uuid::new_v4().to_string();
+    let trace_id = Uuid::new_v4().to_string();
+
+    info!(
+        delegation_id = %delegation_id,
+        from_agent = %payload.from_agent,
+        title = %payload.title,
+        role = %payload.role,
+        "delegation request received"
+    );
+
+    // 1. Create delegation record
+    sqlx::query(
+        "INSERT INTO delegations (id, trace_id, parent_task_id, from_agent, to_agent, title, description, status, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, '', $5, $6, 'pending', NOW(), NOW())",
+    )
+    .bind(&delegation_id)
+    .bind(&trace_id)
+    .bind(&payload.parent_task_id)
+    .bind(&payload.from_agent)
+    .bind(&payload.title)
+    .bind(&payload.description)
+    .execute(&state.pg)
+    .await?;
+
+    // 2. Create a task for the delegation
+    let task_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO task_queue (id, trace_id, title, description, status, priority, parent_task_id, delegation_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'pending', 5, $5, $6, NOW(), NOW())",
+    )
+    .bind(&task_id)
+    .bind(&trace_id)
+    .bind(&payload.title)
+    .bind(&payload.description)
+    .bind(&payload.parent_task_id)
+    .bind(&delegation_id)
+    .execute(&state.pg)
+    .await?;
+
+    // 3. Route the task — prefer specified agent, otherwise normal routing
+    let subject = format!(
+        "{}.{}.coordinator.task_available",
+        state.config.nats.subject_prefix, state.config.broodlink.env,
+    );
+    let nats_payload = serde_json::json!({
+        "task_id": task_id,
+        "role": payload.role,
+        "delegation_id": delegation_id,
+        "preferred_agent": payload.preferred_agent,
+    });
+    if let Ok(bytes) = serde_json::to_vec(&nats_payload) {
+        if let Err(e) = state.nats.publish(subject, bytes.into()).await {
+            warn!(error = %e, delegation_id = %delegation_id, "failed to publish delegation task");
+        }
+    }
+
+    // 4. Notify the requesting agent that delegation was created
+    let notify_subject = format!(
+        "{}.{}.agent.{}.delegation_created",
+        state.config.nats.subject_prefix, state.config.broodlink.env, payload.from_agent,
+    );
+    let notify_payload = serde_json::json!({
+        "delegation_id": delegation_id,
+        "task_id": task_id,
+        "title": payload.title,
+        "status": "pending",
+    });
+    if let Ok(bytes) = serde_json::to_vec(&notify_payload) {
+        let _ = state.nats.publish(notify_subject, bytes.into()).await;
+    }
+
+    info!(
+        delegation_id = %delegation_id,
+        task_id = %task_id,
+        from = %payload.from_agent,
+        "delegation created and task queued"
+    );
+
+    Ok(())
+}
+
+async fn handle_delegation_response(
+    state: &Arc<AppState>,
+    payload: &DelegationResponsePayload,
+) -> Result<(), BroodlinkError> {
+    info!(
+        delegation_id = %payload.delegation_id,
+        agent_id = %payload.agent_id,
+        action = %payload.action,
+        "delegation response received"
+    );
+
+    let new_status = match payload.action.as_str() {
+        "accepted" => "accepted",
+        "rejected" => "rejected",
+        "completed" => "completed",
+        "failed" => "failed",
+        _ => {
+            warn!(action = %payload.action, "unknown delegation action");
+            return Ok(());
+        }
+    };
+
+    // 1. Update delegation status
+    sqlx::query(
+        "UPDATE delegations SET status = $1, to_agent = $2, result = $3, updated_at = NOW()
+         WHERE id = $4",
+    )
+    .bind(new_status)
+    .bind(&payload.agent_id)
+    .bind(&payload.result)
+    .bind(&payload.delegation_id)
+    .execute(&state.pg)
+    .await?;
+
+    // 2. Look up who requested this delegation so we can notify them
+    let row = sqlx::query(
+        "SELECT from_agent, parent_task_id FROM delegations WHERE id = $1",
+    )
+    .bind(&payload.delegation_id)
+    .fetch_optional(&state.pg)
+    .await?;
+
+    if let Some(row) = row {
+        let from_agent: String = row.get("from_agent");
+
+        // 3. Notify the originating agent about the delegation result
+        let notify_subject = format!(
+            "{}.{}.agent.{}.delegation_result",
+            state.config.nats.subject_prefix, state.config.broodlink.env, from_agent,
+        );
+        let notify_payload = serde_json::json!({
+            "delegation_id": payload.delegation_id,
+            "status": new_status,
+            "agent_id": payload.agent_id,
+            "result": payload.result,
+            "reason": payload.reason,
+        });
+        if let Ok(bytes) = serde_json::to_vec(&notify_payload) {
+            let _ = state.nats.publish(notify_subject, bytes.into()).await;
+        }
+
+        // 4. If completed, check if the parent task should be marked done
+        if new_status == "completed" {
+            let parent_task_id: Option<String> = row.get("parent_task_id");
+            if let Some(ref parent_id) = parent_task_id {
+                check_parent_task_completion(state, parent_id).await?;
+            }
+        }
+
+        info!(
+            delegation_id = %payload.delegation_id,
+            from = %from_agent,
+            to = %payload.agent_id,
+            status = new_status,
+            "delegation updated, originating agent notified"
+        );
+    }
+
+    Ok(())
+}
+
+/// Check if all sub-tasks / delegated tasks of a parent are complete.
+/// If so, mark the parent as completed.
+async fn check_parent_task_completion(
+    state: &Arc<AppState>,
+    parent_task_id: &str,
+) -> Result<(), BroodlinkError> {
+    // Count pending/in-progress child tasks
+    let (total, done): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE status IN ('completed', 'decomposed'))
+         FROM task_queue WHERE parent_task_id = $1",
+    )
+    .bind(parent_task_id)
+    .fetch_one(&state.pg)
+    .await?;
+
+    if total > 0 && total == done {
+        // All children complete — mark parent as completed
+        sqlx::query(
+            "UPDATE task_queue SET status = 'completed', updated_at = NOW()
+             WHERE id = $1 AND status IN ('pending', 'decomposed')",
+        )
+        .bind(parent_task_id)
+        .execute(&state.pg)
+        .await?;
+
+        info!(
+            parent_task_id = %parent_task_id,
+            children = total,
+            "all sub-tasks completed, parent task marked complete"
+        );
+
+        // Publish completion event
+        let subject = format!(
+            "{}.{}.coordinator.task_completed",
+            state.config.nats.subject_prefix, state.config.broodlink.env,
+        );
+        let payload = serde_json::json!({
+            "task_id": parent_task_id,
+            "agent_id": "coordinator",
+            "result_data": {"auto_completed": true, "children_count": total},
+        });
+        if let Ok(bytes) = serde_json::to_vec(&payload) {
+            let _ = state.nats.publish(subject, bytes.into()).await;
+        }
     }
 
     Ok(())
@@ -2884,11 +3689,17 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
     // NATS client (cluster-aware via broodlink-runtime)
     let nats = broodlink_runtime::connect_nats(&config.nats).await?;
 
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(config.collaboration.decomposition.timeout_secs))
+        .build()
+        .map_err(|e| BroodlinkError::Internal(format!("failed to build HTTP client: {e}")))?;
+
     Ok(AppState {
         dolt,
         pg,
         nats,
         config,
+        http,
         start_time: std::time::Instant::now(),
         tasks_claimed: AtomicU64::new(0),
         tasks_dead_lettered: AtomicU64::new(0),
@@ -2991,6 +3802,23 @@ async fn main() {
         }
     });
 
+    // v0.12.2: Spawn delegation subscription loops
+    let deleg_req_state = Arc::clone(&state);
+    let deleg_req_shutdown = shutdown_rx.clone();
+    let deleg_req_handle = tokio::spawn(async move {
+        if let Err(e) = run_delegation_request_subscription(deleg_req_state, deleg_req_shutdown).await {
+            error!(error = %e, "delegation_request subscription failed");
+        }
+    });
+
+    let deleg_resp_state = Arc::clone(&state);
+    let deleg_resp_shutdown = shutdown_rx.clone();
+    let deleg_resp_handle = tokio::spawn(async move {
+        if let Err(e) = run_delegation_response_subscription(deleg_resp_state, deleg_resp_shutdown).await {
+            error!(error = %e, "delegation_response subscription failed");
+        }
+    });
+
     // Spawn the periodic metrics publisher
     let metrics_state = Arc::clone(&state);
     let metrics_shutdown = shutdown_rx.clone();
@@ -3059,6 +3887,12 @@ async fn main() {
         }
         if let Err(e) = ctx_req_handle.await {
             warn!(error = %e, "task context request handler panicked");
+        }
+        if let Err(e) = deleg_req_handle.await {
+            warn!(error = %e, "delegation request handler panicked");
+        }
+        if let Err(e) = deleg_resp_handle.await {
+            warn!(error = %e, "delegation response handler panicked");
         }
     })
     .await
@@ -3782,5 +4616,159 @@ output = "out"
             .filter(|a| !declined.contains(&a.agent_id))
             .collect();
         assert_eq!(filtered.len(), 2);
+    }
+
+    // ----- v0.12.2: Sub-task decomposition tests -----
+
+    #[test]
+    fn test_sub_task_def_deserialization() {
+        let json_str = r#"[
+            {"title": "Research API options", "description": "Find best REST frameworks", "role": "researcher"},
+            {"title": "Implement endpoint", "description": "Code the /api/v1/users route", "role": "coder"}
+        ]"#;
+        let subs: Vec<SubTaskDef> = serde_json::from_str(json_str).unwrap();
+        assert_eq!(subs.len(), 2);
+        assert_eq!(subs[0].title, "Research API options");
+        assert_eq!(subs[0].role, "researcher");
+        assert_eq!(subs[1].role, "coder");
+    }
+
+    #[test]
+    fn test_sub_task_def_default_role() {
+        let json_str = r#"[{"title": "Do something", "description": "details here"}]"#;
+        let subs: Vec<SubTaskDef> = serde_json::from_str(json_str).unwrap();
+        assert_eq!(subs[0].role, "worker", "default role should be 'worker'");
+    }
+
+    #[test]
+    fn test_sub_task_def_empty_array() {
+        let json_str = "[]";
+        let subs: Vec<SubTaskDef> = serde_json::from_str(json_str).unwrap();
+        assert!(subs.is_empty());
+    }
+
+    #[test]
+    fn test_sub_task_def_rejects_invalid_json() {
+        let json_str = r#"{"not": "an array"}"#;
+        let result: Result<Vec<SubTaskDef>, _> = serde_json::from_str(json_str);
+        assert!(result.is_err(), "non-array JSON should fail");
+    }
+
+    // ----- v0.12.2: Delegation protocol tests -----
+
+    #[test]
+    fn test_delegation_request_payload_deserialization() {
+        let json = serde_json::json!({
+            "from_agent": "claude-code",
+            "title": "Review pull request #42",
+            "description": "Check for bugs and style issues",
+            "parent_task_id": "task-123",
+            "preferred_agent": "qwen3-coder",
+            "role": "reviewer"
+        });
+        let payload: DelegationRequestPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(payload.from_agent, "claude-code");
+        assert_eq!(payload.title, "Review pull request #42");
+        assert_eq!(payload.role, "reviewer");
+        assert_eq!(payload.preferred_agent.as_deref(), Some("qwen3-coder"));
+        assert_eq!(payload.parent_task_id.as_deref(), Some("task-123"));
+    }
+
+    #[test]
+    fn test_delegation_request_payload_minimal() {
+        let json = serde_json::json!({
+            "from_agent": "agent-a",
+            "title": "Simple task",
+            "description": "Do this thing"
+        });
+        let payload: DelegationRequestPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(payload.role, "worker", "default role should be 'worker'");
+        assert!(payload.preferred_agent.is_none());
+        assert!(payload.parent_task_id.is_none());
+    }
+
+    #[test]
+    fn test_delegation_response_payload_deserialization() {
+        let json = serde_json::json!({
+            "delegation_id": "del-1",
+            "agent_id": "qwen3",
+            "action": "completed",
+            "result": {"output": "done", "files_changed": 3}
+        });
+        let payload: DelegationResponsePayload = serde_json::from_value(json).unwrap();
+        assert_eq!(payload.delegation_id, "del-1");
+        assert_eq!(payload.agent_id, "qwen3");
+        assert_eq!(payload.action, "completed");
+        assert!(payload.result.is_some());
+        assert!(payload.reason.is_none());
+    }
+
+    #[test]
+    fn test_delegation_response_rejected_with_reason() {
+        let json = serde_json::json!({
+            "delegation_id": "del-2",
+            "agent_id": "agent-b",
+            "action": "rejected",
+            "reason": "Task too complex for my capabilities"
+        });
+        let payload: DelegationResponsePayload = serde_json::from_value(json).unwrap();
+        assert_eq!(payload.action, "rejected");
+        assert_eq!(payload.reason.as_deref(), Some("Task too complex for my capabilities"));
+    }
+
+    // ----- v0.12.2: Decomposition config tests -----
+
+    #[test]
+    fn test_decomposition_config_defaults() {
+        let config: broodlink_config::DecompositionConfig = Default::default();
+        assert!(!config.enabled, "decomposition disabled by default");
+        assert_eq!(config.model, "qwen3.5:4b");
+        assert_eq!(config.min_complexity_chars, 200);
+        assert_eq!(config.timeout_secs, 30);
+    }
+
+    #[test]
+    fn test_decomposition_config_from_toml() {
+        let toml_str = r#"
+enabled = true
+model = "deepseek-r1:32b"
+min_complexity_chars = 500
+timeout_secs = 60
+"#;
+        let config: broodlink_config::DecompositionConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.model, "deepseek-r1:32b");
+        assert_eq!(config.min_complexity_chars, 500);
+        assert_eq!(config.timeout_secs, 60);
+    }
+
+    // ----- v0.12.2: Condition evaluation tests (used in workflow + verification) -----
+
+    #[test]
+    fn test_evaluate_condition_exists() {
+        let results = serde_json::json!({"sources": ["a", "b"]});
+        assert!(evaluate_condition("sources.exists", &results));
+        assert!(!evaluate_condition("missing.exists", &results));
+    }
+
+    #[test]
+    fn test_evaluate_condition_count_gt() {
+        let results = serde_json::json!({"items": [1, 2, 3]});
+        assert!(evaluate_condition("items.count > 2", &results));
+        assert!(!evaluate_condition("items.count > 3", &results));
+    }
+
+    #[test]
+    fn test_evaluate_condition_count_lt() {
+        let results = serde_json::json!({"items": [1]});
+        assert!(evaluate_condition("items.count < 3", &results));
+        assert!(!evaluate_condition("items.count < 1", &results));
+    }
+
+    #[test]
+    fn test_evaluate_condition_equals() {
+        let results = serde_json::json!({"status": "pass"});
+        assert!(evaluate_condition("status == \"pass\"", &results));
+        assert!(!evaluate_condition("status == \"fail\"", &results));
     }
 }

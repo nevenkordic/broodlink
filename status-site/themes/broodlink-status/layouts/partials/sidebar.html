@@ -23,6 +23,9 @@
       <li><a href="/knowledge-graph/" {{ if hasPrefix .RelPermalink "/knowledge-graph" }}aria-current="page"{{ end }}>Connections</a></li>
       <li><a href="/decisions/" {{ if hasPrefix .RelPermalink "/decisions" }}aria-current="page"{{ end }}>Decisions</a></li>
 
+      <li class="sidebar-group-label" aria-hidden="true">AI</li>
+      <li><a href="/models/" {{ if hasPrefix .RelPermalink "/models" }}aria-current="page"{{ end }}>Models</a></li>
+
       <li class="sidebar-group-label" aria-hidden="true">System</li>
       <li><a href="/guardrails/" {{ if hasPrefix .RelPermalink "/guardrails" }}aria-current="page"{{ end }}>Safety Rules</a></li>
       <li><a href="/audit/" {{ if hasPrefix .RelPermalink "/audit" }}aria-current="page"{{ end }}>Activity Log</a></li>

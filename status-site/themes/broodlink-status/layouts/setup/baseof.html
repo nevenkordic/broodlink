@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ .Title }} — {{ .Site.Title }}</title>
+  <link rel="icon" href="/img/broodlink-logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/css/style.css">
+  <style>
+    .setup-layout {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 2rem 1.5rem;
+      min-height: 100vh;
+    }
+    .setup-header {
+      text-align: center;
+      margin-bottom: 2rem;
+    }
+    .setup-header img {
+      height: 48px;
+      margin-bottom: 0.75rem;
+    }
+    .setup-header p {
+      color: var(--text-secondary);
+      font-size: 0.9rem;
+    }
+  </style>
+  {{ block "styles" . }}{{ end }}
+</head>
+<body>
+  <div class="setup-layout">
+    <div class="setup-header">
+      <img src="/img/broodlink-logo.svg" alt="Broodlink">
+      <h1>Broodlink Setup</h1>
+      <p>Get your AI orchestration platform running in a few clicks.</p>
+    </div>
+    {{ block "main" . }}{{ end }}
+  </div>
+  <script src="/js/utils.js"></script>
+  {{ block "scripts" . }}{{ end }}
+</body>
+</html>
