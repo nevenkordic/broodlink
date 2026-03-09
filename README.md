@@ -20,6 +20,16 @@ irm https://raw.githubusercontent.com/nevenkordic/broodlink/main/install.ps1 | i
 
 Then run `broodlink` — the setup wizard handles everything else (Ollama, Postgres, Qdrant, model downloads).
 
+To uninstall:
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/nevenkordic/broodlink/main/install.sh | sh -s -- --uninstall
+
+# Windows (PowerShell)
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/nevenkordic/broodlink/main/install.ps1))) -Uninstall
+```
+
 ### From Source
 
 ```bash
@@ -231,8 +241,8 @@ Download from the [latest release](https://github.com/nevenkordic/broodlink/rele
 
 | Script | Purpose |
 |--------|---------|
-| `install.sh` | **One-liner installer** (macOS/Linux): detects OS/arch, downloads release, verifies SHA256, installs to `/usr/local/bin` |
-| `install.ps1` | **One-liner installer** (Windows): downloads release, verifies SHA256, installs to `%LOCALAPPDATA%\Broodlink\bin`, adds to PATH |
+| `install.sh` | **One-liner installer** (macOS/Linux): detects OS/arch, downloads with progress bar, verifies SHA256, installs to `/usr/local/bin`. Pass `--uninstall` to remove. |
+| `install.ps1` | **One-liner installer** (Windows): downloads with progress, verifies SHA256, installs to `%LOCALAPPDATA%\Broodlink\bin`, adds to PATH. Pass `-Uninstall` to remove. |
 | `broodctl` | **Stack manager**: `up`/`down`/`restart`/`rebuild`/`status`/`health`/`logs`/`doctor` — single command for everything |
 | `scripts/bootstrap.sh` | One-shot setup: prerequisites check, infrastructure, secrets, databases, build, onboard, start |
 | `scripts/start-services.sh` | Start/stop all 7 Rust services + Hugo (`--stop` to stop) |

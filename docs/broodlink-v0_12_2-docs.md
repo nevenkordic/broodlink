@@ -260,11 +260,24 @@ curl -fsSL https://raw.githubusercontent.com/nevenkordic/broodlink/main/install.
 irm https://raw.githubusercontent.com/nevenkordic/broodlink/main/install.ps1 | iex
 ```
 
-The Unix script installs to `/usr/local/bin` (prompts for sudo if needed). The
-Windows script installs to `%LOCALAPPDATA%\Broodlink\bin` and adds it to the
-user's PATH automatically.
+Both scripts show step-by-step progress with download progress bars, checksum
+verification, and a clear success/failure summary. The Unix script installs to
+`/usr/local/bin` (prompts for sudo if needed). The Windows script installs to
+`%LOCALAPPDATA%\Broodlink\bin` and adds it to the user's PATH automatically.
 
 After installation, run `broodlink` to launch the setup wizard.
+
+**Uninstall:**
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/nevenkordic/broodlink/main/install.sh | sh -s -- --uninstall
+
+# Windows (PowerShell)
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/nevenkordic/broodlink/main/install.ps1))) -Uninstall
+```
+
+Removes all 8 binaries and cleans up PATH entries.
 
 ---
 
