@@ -343,15 +343,43 @@ async fn install_brew_or_apt(_brew_name: &str, _apt_name: &str) -> anyhow::Resul
 
     #[cfg(target_os = "linux")]
     {
-        let output = tokio::process::Command::new("sudo")
+        // Try apt-get (Debian/Ubuntu)
+        if let Ok(output) = tokio::process::Command::new("sudo")
             .args(["apt-get", "install", "-y", _apt_name])
             .output()
-            .await?;
-        if output.status.success() {
-            return Ok(format!("Installed {_apt_name} via apt"));
+            .await
+        {
+            if output.status.success() {
+                return Ok(format!("Installed {_apt_name} via apt"));
+            }
         }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("apt install {_apt_name} failed: {stderr}");
+
+        // Try dnf (Fedora/RHEL)
+        if let Ok(output) = tokio::process::Command::new("sudo")
+            .args(["dnf", "install", "-y", _apt_name])
+            .output()
+            .await
+        {
+            if output.status.success() {
+                return Ok(format!("Installed {_apt_name} via dnf"));
+            }
+        }
+
+        // Try pacman (Arch)
+        if let Ok(output) = tokio::process::Command::new("sudo")
+            .args(["pacman", "-S", "--noconfirm", _apt_name])
+            .output()
+            .await
+        {
+            if output.status.success() {
+                return Ok(format!("Installed {_apt_name} via pacman"));
+            }
+        }
+
+        anyhow::bail!(
+            "Could not install {_apt_name}: no supported package manager found (tried apt-get, dnf, pacman). \
+             Please install {_apt_name} manually."
+        );
     }
 
     #[cfg(target_os = "windows")]

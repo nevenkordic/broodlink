@@ -32,15 +32,25 @@ try {
     Write-Host "Checksum verified."
 
     # Extract
-    Expand-Archive "$Tmp\$Archive" -DestinationPath $Tmp -Force
-    $Dir = Join-Path $Tmp "broodlink-$Tag-$Target"
+    $ExtractDir = Join-Path $Tmp "extracted"
+    Expand-Archive "$Tmp\$Archive" -DestinationPath $ExtractDir -Force
+
+    # Find binaries — zip may contain files flat or inside a subdirectory
+    $Dir = $ExtractDir
+    $SubDir = Join-Path $ExtractDir "broodlink-$Tag-$Target"
+    if (Test-Path $SubDir) { $Dir = $SubDir }
 
     # Install
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     $Bins = @("broodlink.exe", "beads-bridge.exe", "coordinator.exe", "heartbeat.exe",
               "embedding-worker.exe", "status-api.exe", "mcp-server.exe", "a2a-gateway.exe")
     foreach ($bin in $Bins) {
-        Copy-Item (Join-Path $Dir $bin) $InstallDir -Force
+        $BinPath = Get-ChildItem -Path $Dir -Filter $bin -Recurse | Select-Object -First 1
+        if ($BinPath) {
+            Copy-Item $BinPath.FullName $InstallDir -Force
+        } else {
+            Write-Warning "Binary $bin not found in archive"
+        }
     }
 
     # Add to PATH if not already there
