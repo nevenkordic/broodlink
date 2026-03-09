@@ -15,9 +15,7 @@ use std::sync::Arc;
 use crate::AppState;
 
 /// GET /setup/status — returns full system state
-pub async fn get_status(
-    State(_state): State<Arc<AppState>>,
-) -> Json<super::SystemState> {
+pub async fn get_status(State(_state): State<Arc<AppState>>) -> Json<super::SystemState> {
     Json(super::check_system_state().await)
 }
 
@@ -47,15 +45,19 @@ pub async fn install_dependency(
     };
 
     match result {
-        Ok(msg) => Json(InstallResult { success: true, message: msg }),
-        Err(e) => Json(InstallResult { success: false, message: e.to_string() }),
+        Ok(msg) => Json(InstallResult {
+            success: true,
+            message: msg,
+        }),
+        Err(e) => Json(InstallResult {
+            success: false,
+            message: e.to_string(),
+        }),
     }
 }
 
 /// POST /setup/init-databases — create DBs and run migrations
-pub async fn init_databases(
-    State(state): State<Arc<AppState>>,
-) -> Json<InstallResult> {
+pub async fn init_databases(State(state): State<Arc<AppState>>) -> Json<InstallResult> {
     let (shell, script_name) = if cfg!(windows) {
         ("powershell", "scripts/db-setup.ps1")
     } else {
@@ -96,9 +98,7 @@ pub async fn init_databases(
 }
 
 /// POST /setup/start-services — start external deps and Broodlink services
-pub async fn start_services(
-    State(state): State<Arc<AppState>>,
-) -> Json<InstallResult> {
+pub async fn start_services(State(state): State<Arc<AppState>>) -> Json<InstallResult> {
     match state.process_manager.start_all(&state.broodlink_dir).await {
         Ok(()) => Json(InstallResult {
             success: true,
@@ -112,9 +112,7 @@ pub async fn start_services(
 }
 
 /// POST /setup/install-all — install all missing dependencies in sequence
-pub async fn install_all_missing(
-    State(_state): State<Arc<AppState>>,
-) -> Json<InstallResult> {
+pub async fn install_all_missing(State(_state): State<Arc<AppState>>) -> Json<InstallResult> {
     let state = super::check_system_state().await;
     let mut installed = Vec::new();
     let mut failed = Vec::new();
@@ -163,11 +161,11 @@ pub async fn install_all_missing(
 }
 
 /// POST /setup/complete — mark setup as done, unlock dashboard
-pub async fn complete_setup(
-    State(state): State<Arc<AppState>>,
-) -> Json<InstallResult> {
+pub async fn complete_setup(State(state): State<Arc<AppState>>) -> Json<InstallResult> {
     // Flip the flag — dashboard is now accessible
-    state.setup_complete.store(true, std::sync::atomic::Ordering::Relaxed);
+    state
+        .setup_complete
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     tracing::info!("Setup complete — dashboard unlocked");
     Json(InstallResult {
         success: true,
@@ -234,7 +232,11 @@ async fn install_qdrant() -> anyhow::Result<String> {
 
     #[cfg(target_os = "macos")]
     {
-        let arch = if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" };
+        let arch = if cfg!(target_arch = "aarch64") {
+            "aarch64"
+        } else {
+            "x86_64"
+        };
         let url = format!(
             "https://github.com/qdrant/qdrant/releases/latest/download/qdrant-{arch}-apple-darwin.tar.gz"
         );
@@ -248,7 +250,10 @@ async fn install_qdrant() -> anyhow::Result<String> {
             .output()
             .await?;
         if !output.status.success() {
-            anyhow::bail!("Failed to download Qdrant: {}", String::from_utf8_lossy(&output.stderr));
+            anyhow::bail!(
+                "Failed to download Qdrant: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
 
         // Extract
@@ -279,7 +284,10 @@ async fn install_qdrant() -> anyhow::Result<String> {
             .output()
             .await?;
         if !output.status.success() {
-            anyhow::bail!("Failed to download Qdrant: {}", String::from_utf8_lossy(&output.stderr));
+            anyhow::bail!(
+                "Failed to download Qdrant: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
 
         let output = tokio::process::Command::new("tar")
@@ -317,14 +325,19 @@ async fn install_qdrant() -> anyhow::Result<String> {
             .await?;
         let _ = tokio::fs::remove_file(&zip_path).await;
         if !output.status.success() {
-            anyhow::bail!("Failed to download/extract Qdrant: {}", String::from_utf8_lossy(&output.stderr));
+            anyhow::bail!(
+                "Failed to download/extract Qdrant: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
 
         return Ok(format!("Installed Qdrant to {}", install_dir.display()));
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    anyhow::bail!("Automatic Qdrant installation not supported on this OS. Install from https://qdrant.tech")
+    anyhow::bail!(
+        "Automatic Qdrant installation not supported on this OS. Install from https://qdrant.tech"
+    )
 }
 
 async fn install_brew_or_apt(_brew_name: &str, _apt_name: &str) -> anyhow::Result<String> {

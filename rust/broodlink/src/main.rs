@@ -45,9 +45,10 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new("broodlink=info,tower_http=info")
-        }))
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("broodlink=info,tower_http=info")),
+        )
         .init();
 
     let cli = Cli::parse();
@@ -92,7 +93,11 @@ async fn cmd_start(port: u16) -> Result<()> {
     } else {
         // Start all backend services
         tracing::info!("Starting backend services...");
-        if let Err(e) = shared.process_manager.start_all(&shared.broodlink_dir).await {
+        if let Err(e) = shared
+            .process_manager
+            .start_all(&shared.broodlink_dir)
+            .await
+        {
             tracing::warn!(error = %e, "Some services failed to start — check setup");
         }
     }
@@ -127,7 +132,9 @@ async fn cmd_stop() -> Result<()> {
             #[cfg(unix)]
             {
                 // Safety: sending SIGTERM to an existing process
-                unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
             }
             #[cfg(windows)]
             {
@@ -159,10 +166,8 @@ pub struct AppState {
     pub http_client: reqwest::Client,
 }
 
-fn build_router(
-    state: std::sync::Arc<AppState>,
-) -> axum::Router {
-    use axum::routing::{get, post, delete, any};
+fn build_router(state: std::sync::Arc<AppState>) -> axum::Router {
+    use axum::routing::{any, delete, get, post};
 
     let app = axum::Router::new()
         // Setup wizard API (always available)
@@ -175,9 +180,15 @@ fn build_router(
         // Model management API (always available)
         .route("/api/v1/models", get(models::list_models))
         .route("/api/v1/models/pull", post(models::pull_model))
-        .route("/api/v1/models/pull/progress", get(models::pull_progress_sse))
+        .route(
+            "/api/v1/models/pull/progress",
+            get(models::pull_progress_sse),
+        )
         .route("/api/v1/models/:name", delete(models::delete_model))
-        .route("/api/v1/models/recommended", get(models::recommended_models))
+        .route(
+            "/api/v1/models/recommended",
+            get(models::recommended_models),
+        )
         // Reverse proxy: forward unmatched /api/v1/* to status-api
         .route("/api/v1/*rest", any(proxy_to_status_api))
         // Ollama proxy for native chat UI
@@ -200,17 +211,23 @@ async fn proxy_to_status_api(
     req: axum::http::Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let method_str = req.method().as_str().to_string();
-    let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+    let query = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
     let target = format!("{}/api/v1/{}{}", state.status_api_url, rest, query);
 
     let body_bytes = axum::body::to_bytes(req.into_body(), 1_048_576)
         .await
         .unwrap_or_default();
 
-    let reqwest_method = reqwest::Method::from_bytes(method_str.as_bytes())
-        .unwrap_or(reqwest::Method::GET);
+    let reqwest_method =
+        reqwest::Method::from_bytes(method_str.as_bytes()).unwrap_or(reqwest::Method::GET);
 
-    let mut builder = state.http_client.request(reqwest_method, &target)
+    let mut builder = state
+        .http_client
+        .request(reqwest_method, &target)
         .header("X-Broodlink-Api-Key", &state.status_api_key)
         .header("Accept", "application/json");
 
@@ -220,20 +237,27 @@ async fn proxy_to_status_api(
             .body(body_bytes);
     }
 
-    match builder.timeout(std::time::Duration::from_secs(30)).send().await {
+    match builder
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+    {
         Ok(resp) => {
             let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
                 .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
             let body = resp.bytes().await.unwrap_or_default();
-            (status, [(axum::http::header::CONTENT_TYPE, "application/json")], body)
+            (
+                status,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body,
+            )
                 .into_response()
         }
-        Err(e) => {
-            (
-                axum::http::StatusCode::BAD_GATEWAY,
-                axum::Json(serde_json::json!({ "error": format!("status-api unreachable: {e}") })),
-            ).into_response()
-        }
+        Err(e) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            axum::Json(serde_json::json!({ "error": format!("status-api unreachable: {e}") })),
+        )
+            .into_response(),
     }
 }
 
@@ -241,51 +265,70 @@ async fn proxy_to_status_api(
 async fn load_status_api_config(bl_dir: &std::path::Path) -> (String, String) {
     let config_path = bl_dir.join("config.toml");
     let config_str = std::fs::read_to_string(&config_path).unwrap_or_default();
-    let config: toml::Value = config_str.parse().unwrap_or(toml::Value::Table(Default::default()));
+    let config: toml::Value = config_str
+        .parse()
+        .unwrap_or(toml::Value::Table(Default::default()));
 
-    let port = config.get("status_api")
+    let port = config
+        .get("status_api")
         .and_then(|s| s.get("port"))
         .and_then(|p| p.as_integer())
         .unwrap_or(3312);
     let url = format!("http://localhost:{port}");
 
-    let api_key_name = config.get("status_api")
+    let api_key_name = config
+        .get("status_api")
         .and_then(|s| s.get("api_key_name"))
         .and_then(|k| k.as_str())
         .unwrap_or("BROODLINK_STATUS_API_KEY");
 
     // Try to decrypt from SOPS
-    let secrets_file = config.get("secrets")
+    let secrets_file = config
+        .get("secrets")
         .and_then(|s| s.get("sops_file"))
         .and_then(|f| f.as_str())
         .unwrap_or("./secrets.enc.json");
     let secrets_path = bl_dir.join(secrets_file);
 
-    let identity = config.get("secrets")
+    let identity = config
+        .get("secrets")
         .and_then(|s| s.get("age_identity"))
         .and_then(|f| f.as_str())
-        .map(|p| p.replace('~', &std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default()))
-        .unwrap_or_else(|| format!("{}/.broodlink/age-identity", std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default()));
+        .map(|p| {
+            p.replace(
+                '~',
+                &std::env::var("HOME")
+                    .or_else(|_| std::env::var("USERPROFILE"))
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "{}/.broodlink/age-identity",
+                std::env::var("HOME")
+                    .or_else(|_| std::env::var("USERPROFILE"))
+                    .unwrap_or_default()
+            )
+        });
 
     let secrets_path_str = secrets_path.to_string_lossy().to_string();
     let api_key = match broodlink_secrets::create_provider(
         "sops",
         Some(&secrets_path_str),
         Some(&identity),
-        None, None,
+        None,
+        None,
     ) {
-        Ok(provider) => {
-            match provider.get(api_key_name).await {
-                Ok(key) => {
-                    tracing::info!("Loaded status-api key from secrets");
-                    key
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Could not load status-api key — proxy will fail auth");
-                    String::new()
-                }
+        Ok(provider) => match provider.get(api_key_name).await {
+            Ok(key) => {
+                tracing::info!("Loaded status-api key from secrets");
+                key
             }
-        }
+            Err(e) => {
+                tracing::warn!(error = %e, "Could not load status-api key — proxy will fail auth");
+                String::new()
+            }
+        },
         Err(e) => {
             tracing::warn!(error = %e, "Could not initialize secrets provider — proxy will fail auth");
             String::new()
@@ -309,8 +352,8 @@ async fn proxy_to_ollama(
         .await
         .unwrap_or_default();
 
-    let reqwest_method = reqwest::Method::from_bytes(method_str.as_bytes())
-        .unwrap_or(reqwest::Method::GET);
+    let reqwest_method =
+        reqwest::Method::from_bytes(method_str.as_bytes()).unwrap_or(reqwest::Method::GET);
 
     let mut builder = state.http_client.request(reqwest_method, &target);
 
@@ -321,24 +364,33 @@ async fn proxy_to_ollama(
     }
 
     // Use a long timeout for streaming chat responses
-    match builder.timeout(std::time::Duration::from_secs(300)).send().await {
+    match builder
+        .timeout(std::time::Duration::from_secs(300))
+        .send()
+        .await
+    {
         Ok(resp) => {
             let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
                 .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
-            let content_type = resp.headers().get("content-type")
+            let content_type = resp
+                .headers()
+                .get("content-type")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("application/json")
                 .to_string();
             let body = resp.bytes().await.unwrap_or_default();
-            (status, [(axum::http::header::CONTENT_TYPE, content_type)], body)
+            (
+                status,
+                [(axum::http::header::CONTENT_TYPE, content_type)],
+                body,
+            )
                 .into_response()
         }
-        Err(e) => {
-            (
-                axum::http::StatusCode::BAD_GATEWAY,
-                axum::Json(serde_json::json!({ "error": format!("Ollama unreachable: {e}") })),
-            ).into_response()
-        }
+        Err(e) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            axum::Json(serde_json::json!({ "error": format!("Ollama unreachable: {e}") })),
+        )
+            .into_response(),
     }
 }
 
@@ -352,9 +404,7 @@ async fn health_handler() -> axum::Json<serde_json::Value> {
 fn broodlink_dir() -> std::path::PathBuf {
     std::env::var("BROODLINK_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs_or_home().join("broodlink")
-        })
+        .unwrap_or_else(|_| dirs_or_home().join("broodlink"))
 }
 
 fn dirs_or_home() -> std::path::PathBuf {
@@ -370,7 +420,9 @@ fn open_browser(url: &str) -> Result<()> {
     #[cfg(target_os = "linux")]
     std::process::Command::new("xdg-open").arg(url).spawn()?;
     #[cfg(target_os = "windows")]
-    std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn()?;
+    std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn()?;
     Ok(())
 }
 

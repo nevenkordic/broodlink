@@ -2880,7 +2880,9 @@ async fn webhook_telegram_handler(
                         let s = Arc::clone(&state_bg);
                         let um = chat_text_bg.clone();
                         let ar = llm_reply.clone();
-                        tokio::spawn(async move { extract_and_store_memory(s, um, ar).await; });
+                        tokio::spawn(async move {
+                            extract_and_store_memory(s, um, ar).await;
+                        });
                     }
                     // Store outbound reply
                     if let Some(ref sid) = session_id_bg {
@@ -2931,7 +2933,9 @@ async fn webhook_telegram_handler(
             let s = Arc::clone(&state);
             let um = chat_text.to_string();
             let ar = llm_reply.clone();
-            tokio::spawn(async move { extract_and_store_memory(s, um, ar).await; });
+            tokio::spawn(async move {
+                extract_and_store_memory(s, um, ar).await;
+            });
         }
 
         // Store outbound reply (skip transient busy messages)
@@ -2968,7 +2972,10 @@ async fn webhook_telegram_handler(
 // ---------------------------------------------------------------------------
 
 /// Process a single Telegram update object.  Returns an optional reply text.
-async fn process_telegram_update(state: &Arc<AppState>, update: &serde_json::Value) -> Option<String> {
+async fn process_telegram_update(
+    state: &Arc<AppState>,
+    update: &serde_json::Value,
+) -> Option<String> {
     // v0.10.0: Handle callback queries (write approval buttons)
     if let Some(callback) = update.get("callback_query") {
         handle_approval_callback(state, callback).await;
@@ -3341,7 +3348,9 @@ async fn process_telegram_update(state: &Arc<AppState>, update: &serde_json::Val
                 let s = Arc::clone(state);
                 let um = chat_text.to_string();
                 let ar = reply_text.clone();
-                tokio::spawn(async move { extract_and_store_memory(s, um, ar).await; });
+                tokio::spawn(async move {
+                    extract_and_store_memory(s, um, ar).await;
+                });
             }
 
             // Final edit if streaming — already delivered via edit, so return None
@@ -5679,8 +5688,8 @@ async fn call_ollama_chat(
         );
     let mut system_prompt = String::from(base_prompt);
     // Inject current date/time so the model always knows "today"
-    let now_aest =
-        chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(11 * 3600).expect("AEST +11"));
+    let now_aest = chrono::Utc::now()
+        .with_timezone(&chrono::FixedOffset::east_opt(11 * 3600).expect("AEST +11"));
     system_prompt.push_str(&format!(
         "\n\nCurrent date/time: {} (AEST, UTC+11).",
         now_aest.format("%Y-%m-%dT%H:%M:%S+11:00, %A %d %B %Y")
@@ -6308,9 +6317,8 @@ async fn call_ollama_chat(
     }
 
     // Some models don't support thinking mode (vision models, qwen3-coder)
-    let is_think_capable = !params.images.is_some()
-        && !model.starts_with("gemma")
-        && !model.contains("-coder");
+    let is_think_capable =
+        !params.images.is_some() && !model.starts_with("gemma") && !model.contains("-coder");
 
     for round in 0..=max_rounds {
         // Include tools only on rounds where the model can still call them.
@@ -6864,8 +6872,8 @@ async fn call_ollama_chat(
                                     let dir_canonical =
                                         std::fs::canonicalize(dir_path).unwrap_or_default();
                                     let unrestricted = is_unrestricted_code_mode(state).await;
-                                    let allowed =
-                                        unrestricted || tool_cfg.allowed_command_dirs.iter().any(|d| {
+                                    let allowed = unrestricted
+                                        || tool_cfg.allowed_command_dirs.iter().any(|d| {
                                             let Ok(allowed_canon) = std::fs::canonicalize(d) else {
                                                 return false;
                                             };
@@ -7091,9 +7099,10 @@ async fn call_ollama_chat(
                         "num_ctx": state.config.ollama.num_ctx,
                     }
                 });
-                if let Ok(no_think_body) = send_ollama_request(
-                    &state.ollama_client, &url, &no_think_payload, timeout_secs,
-                ).await {
+                if let Ok(no_think_body) =
+                    send_ollama_request(&state.ollama_client, &url, &no_think_payload, timeout_secs)
+                        .await
+                {
                     if let Some(nt_content) = no_think_body
                         .get("message")
                         .and_then(|m| m.get("content"))

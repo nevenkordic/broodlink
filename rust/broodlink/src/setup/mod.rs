@@ -69,7 +69,9 @@ pub async fn check_system_state() -> SystemState {
     let databases = check_databases().await;
     let models = list_ollama_models().await;
     let config_exists = std::path::Path::new("config.toml").exists()
-        || std::env::var("BROODLINK_CONFIG").map(|p| std::path::Path::new(&p).exists()).unwrap_or(false);
+        || std::env::var("BROODLINK_CONFIG")
+            .map(|p| std::path::Path::new(&p).exists())
+            .unwrap_or(false);
 
     SystemState {
         ollama,
@@ -102,7 +104,9 @@ async fn check_ollama() -> DepStatus {
 
 async fn check_dolt() -> DepStatus {
     let version = run_cmd("dolt", &["version"]).await;
-    let running = tokio::net::TcpStream::connect("127.0.0.1:3307").await.is_ok();
+    let running = tokio::net::TcpStream::connect("127.0.0.1:3307")
+        .await
+        .is_ok();
 
     DepStatus {
         installed: version.is_some(),
@@ -114,12 +118,23 @@ async fn check_dolt() -> DepStatus {
 
 async fn check_postgres() -> DepStatus {
     // Try psql in PATH first, then common brew locations
-    let version = run_cmd("psql", &["--version"]).await
+    let version = run_cmd("psql", &["--version"])
+        .await
         .or(run_cmd("/opt/homebrew/opt/postgresql/bin/psql", &["--version"]).await)
         .or(run_cmd("/usr/local/opt/postgresql/bin/psql", &["--version"]).await)
-        .or(run_cmd("C:\\Program Files\\PostgreSQL\\16\\bin\\psql", &["--version"]).await)
-        .or(run_cmd("C:\\Program Files\\PostgreSQL\\15\\bin\\psql", &["--version"]).await);
-    let running = tokio::net::TcpStream::connect("127.0.0.1:5432").await.is_ok();
+        .or(run_cmd(
+            "C:\\Program Files\\PostgreSQL\\16\\bin\\psql",
+            &["--version"],
+        )
+        .await)
+        .or(run_cmd(
+            "C:\\Program Files\\PostgreSQL\\15\\bin\\psql",
+            &["--version"],
+        )
+        .await);
+    let running = tokio::net::TcpStream::connect("127.0.0.1:5432")
+        .await
+        .is_ok();
 
     DepStatus {
         installed: version.is_some() || running,
@@ -131,7 +146,9 @@ async fn check_postgres() -> DepStatus {
 
 async fn check_nats() -> DepStatus {
     let version = run_cmd("nats-server", &["--version"]).await;
-    let running = tokio::net::TcpStream::connect("127.0.0.1:4222").await.is_ok();
+    let running = tokio::net::TcpStream::connect("127.0.0.1:4222")
+        .await
+        .is_ok();
 
     DepStatus {
         installed: version.is_some(),
@@ -150,9 +167,10 @@ async fn check_qdrant() -> DepStatus {
         .is_ok();
 
     // Check PATH and ~/.local/bin
-    let installed = which("qdrant") || dirs::home_dir()
-        .map(|h| h.join(".local/bin/qdrant").exists())
-        .unwrap_or(false);
+    let installed = which("qdrant")
+        || dirs::home_dir()
+            .map(|h| h.join(".local/bin/qdrant").exists())
+            .unwrap_or(false);
 
     DepStatus {
         installed,
@@ -187,7 +205,9 @@ async fn list_ollama_models() -> Vec<ModelInfo> {
         .await;
 
     let Ok(resp) = resp else { return vec![] };
-    let Ok(body) = resp.json::<serde_json::Value>().await else { return vec![] };
+    let Ok(body) = resp.json::<serde_json::Value>().await else {
+        return vec![];
+    };
 
     body.get("models")
         .and_then(|m| m.as_array())

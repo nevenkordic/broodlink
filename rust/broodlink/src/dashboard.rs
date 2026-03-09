@@ -23,16 +23,15 @@ struct DashboardAssets;
 /// Dynamic fallback — checks setup_complete on every request.
 /// During setup: only /setup/* and static assets are served, everything else redirects.
 /// After setup: full dashboard is served.
-pub async fn dynamic_fallback(
-    State(state): State<Arc<AppState>>,
-    uri: Uri,
-) -> Response {
+pub async fn dynamic_fallback(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
     let path = uri.path();
 
     if !state.setup_complete.load(Ordering::Relaxed) {
         // Setup mode: only serve setup pages and static assets
-        if path.starts_with("/setup") || path.starts_with("/css/")
-            || path.starts_with("/js/") || path.starts_with("/img/")
+        if path.starts_with("/setup")
+            || path.starts_with("/css/")
+            || path.starts_with("/js/")
+            || path.starts_with("/img/")
             || path.starts_with("/fonts/")
         {
             return serve_path(path);

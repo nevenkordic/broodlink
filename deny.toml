@@ -22,6 +22,8 @@ ignore = [
   "RUSTSEC-2025-0134",
   # rsa timing sidechannel — transitive dep from sqlx-mysql, no safe upgrade available
   "RUSTSEC-2023-0071",
+  # proc-macro-error unmaintained — transitive dep from rust-embed, no upgrade path yet
+  "RUSTSEC-2024-0370",
 ]
 
 [bans]

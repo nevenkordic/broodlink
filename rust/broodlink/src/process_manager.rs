@@ -48,7 +48,10 @@ impl ProcessManager {
         ];
 
         for (name, binary) in &services {
-            match self.start_service(name, &target_dir, binary, broodlink_dir).await {
+            match self
+                .start_service(name, &target_dir, binary, broodlink_dir)
+                .await
+            {
                 Ok(()) => tracing::info!(service = name, "started"),
                 Err(e) => tracing::warn!(service = name, error = %e, "failed to start"),
             }
@@ -123,7 +126,8 @@ impl ProcessManager {
                 .stderr(Stdio::null())
                 .spawn();
         }
-        wait_for_http("http://localhost:11434/api/tags", 30).await
+        wait_for_http("http://localhost:11434/api/tags", 30)
+            .await
             .context("Ollama failed to start")
     }
 
@@ -144,7 +148,8 @@ impl ProcessManager {
             .context("failed to start dolt sql-server")?;
 
         self.children.lock().await.insert("dolt".to_string(), child);
-        wait_for_tcp("127.0.0.1", 3307, 15).await
+        wait_for_tcp("127.0.0.1", 3307, 15)
+            .await
             .context("Dolt failed to start")
     }
 
@@ -171,7 +176,8 @@ impl ProcessManager {
                 .args(["start", "-D", &std::env::var("PGDATA").unwrap_or_default()])
                 .output();
         }
-        wait_for_tcp("127.0.0.1", 5432, 15).await
+        wait_for_tcp("127.0.0.1", 5432, 15)
+            .await
             .context("PostgreSQL failed to start")
     }
 
@@ -188,7 +194,8 @@ impl ProcessManager {
             .context("failed to start nats-server")?;
 
         self.children.lock().await.insert("nats".to_string(), child);
-        wait_for_tcp("127.0.0.1", 4222, 10).await
+        wait_for_tcp("127.0.0.1", 4222, 10)
+            .await
             .context("NATS failed to start")
     }
 
@@ -203,8 +210,12 @@ impl ProcessManager {
             .spawn()
             .context("failed to start qdrant")?;
 
-        self.children.lock().await.insert("qdrant".to_string(), child);
-        wait_for_http("http://localhost:6333/healthz", 15).await
+        self.children
+            .lock()
+            .await
+            .insert("qdrant".to_string(), child);
+        wait_for_http("http://localhost:6333/healthz", 15)
+            .await
             .context("Qdrant failed to start")
     }
 }
@@ -212,7 +223,11 @@ impl ProcessManager {
 fn find_binary_dir(broodlink_dir: &Path) -> PathBuf {
     // Check release first, then debug
     let release = broodlink_dir.join("target/release");
-    let probe = if cfg!(windows) { "beads-bridge.exe" } else { "beads-bridge" };
+    let probe = if cfg!(windows) {
+        "beads-bridge.exe"
+    } else {
+        "beads-bridge"
+    };
     if release.join(probe).exists() {
         return release;
     }
@@ -229,9 +244,7 @@ async fn check_http(url: &str) -> bool {
 }
 
 async fn check_tcp(host: &str, port: u16) -> bool {
-    tokio::net::TcpStream::connect((host, port))
-        .await
-        .is_ok()
+    tokio::net::TcpStream::connect((host, port)).await.is_ok()
 }
 
 async fn wait_for_http(url: &str, timeout_secs: u64) -> Result<()> {

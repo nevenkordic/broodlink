@@ -13,6 +13,7 @@ NC='\033[0m'
 BROOD_DIR="$HOME/broodlink"
 
 # Load env vars (NAS config, API keys) — .env is gitignored
+# shellcheck source=/dev/null
 [ -f "$BROOD_DIR/.env" ] && set -a && source "$BROOD_DIR/.env" && set +a
 
 log()  { echo -e "${GREEN}[offline]${NC} $1"; }
@@ -26,7 +27,7 @@ start_ollama() {
     else
         log "Starting Ollama..."
         open -a Ollama 2>/dev/null || ollama serve &>/dev/null &
-        for i in {1..30}; do
+        for _i in {1..30}; do
             curl -s --max-time 1 http://localhost:11434/api/tags >/dev/null 2>&1 && break
             sleep 1
         done
@@ -66,7 +67,7 @@ show_status() {
     echo -e "${BOLD}║       BROODLINK OFFLINE CODING READY         ║${NC}"
     echo -e "${BOLD}╠══════════════════════════════════════════════╣${NC}"
     echo -e "${BOLD}║${NC} Models:                                      ${BOLD}║${NC}"
-    ollama list 2>/dev/null | tail -n +2 | while read -r name id size rest; do
+    ollama list 2>/dev/null | tail -n +2 | while read -r name _id size rest; do
         printf "${BOLD}║${NC}   %-30s %8s   ${BOLD}║${NC}\n" "$name" "$size"
     done
     echo -e "${BOLD}╠══════════════════════════════════════════════╣${NC}"

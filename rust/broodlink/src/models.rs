@@ -35,9 +35,7 @@ pub struct ModelEntry {
 }
 
 /// GET /api/v1/models
-pub async fn list_models(
-    State(_state): State<Arc<AppState>>,
-) -> Json<ModelListResponse> {
+pub async fn list_models(State(_state): State<Arc<AppState>>) -> Json<ModelListResponse> {
     let resp = reqwest::Client::new()
         .get(format!("{OLLAMA_URL}/api/tags"))
         .timeout(std::time::Duration::from_secs(5))
@@ -252,7 +250,8 @@ pub async fn recommended_models(
         RecommendedModel {
             name: "qwen3.5:4b".to_string(),
             size: "3.4 GB".to_string(),
-            description: "General-purpose agent — fast, lightweight, handles most tasks".to_string(),
+            description: "General-purpose agent — fast, lightweight, handles most tasks"
+                .to_string(),
             role: "general".to_string(),
             required: false,
             category: "core".to_string(),
@@ -269,7 +268,8 @@ pub async fn recommended_models(
         RecommendedModel {
             name: "qwen3.5:35b".to_string(),
             size: "23 GB".to_string(),
-            description: "Smarter general-purpose agent — better planning and reasoning".to_string(),
+            description: "Smarter general-purpose agent — better planning and reasoning"
+                .to_string(),
             role: "general".to_string(),
             required: false,
             category: "advanced".to_string(),
@@ -285,7 +285,8 @@ pub async fn recommended_models(
         RecommendedModel {
             name: "deepseek-r1:32b".to_string(),
             size: "19 GB".to_string(),
-            description: "Reasoning specialist — deep analysis, verification, complex problems".to_string(),
+            description: "Reasoning specialist — deep analysis, verification, complex problems"
+                .to_string(),
             role: "reasoning".to_string(),
             required: false,
             category: "advanced".to_string(),

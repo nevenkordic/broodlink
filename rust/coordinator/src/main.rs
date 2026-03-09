@@ -1063,12 +1063,11 @@ async fn handle_task_completed(
 ) -> Result<(), BroodlinkError> {
     // v0.12.2: Run verification pipeline on the completed output
     {
-        let task_info = sqlx::query(
-            "SELECT title, description, parent_task_id FROM task_queue WHERE id = $1",
-        )
-        .bind(&payload.task_id)
-        .fetch_optional(&state.pg)
-        .await?;
+        let task_info =
+            sqlx::query("SELECT title, description, parent_task_id FROM task_queue WHERE id = $1")
+                .bind(&payload.task_id)
+                .fetch_optional(&state.pg)
+                .await?;
 
         if let Some(ti) = &task_info {
             let title: String = ti.get("title");
@@ -1081,7 +1080,8 @@ async fn handle_task_completed(
                 &title,
                 description.as_deref(),
                 payload.result_data.as_ref(),
-            ).await;
+            )
+            .await;
 
             match verdict {
                 VerificationResult::Fail(feedback) => {
@@ -1101,7 +1101,9 @@ async fn handle_task_completed(
                     // Notify the agent about the failure
                     let notify_subject = format!(
                         "{}.{}.agent.{}.verification_result",
-                        state.config.nats.subject_prefix, state.config.broodlink.env, payload.agent_id,
+                        state.config.nats.subject_prefix,
+                        state.config.broodlink.env,
+                        payload.agent_id,
                     );
                     let notify = serde_json::json!({
                         "task_id": payload.task_id,
@@ -2069,10 +2071,7 @@ fn default_sub_role() -> String {
 /// Ask Ollama to decompose a complex task into sub-tasks.
 /// Returns an empty Vec if decomposition is disabled, task is too simple,
 /// or the LLM call fails (fail-open: route the original task as-is).
-async fn decompose_task(
-    state: &AppState,
-    task: &TaskRow,
-) -> Vec<SubTaskDef> {
+async fn decompose_task(state: &AppState, task: &TaskRow) -> Vec<SubTaskDef> {
     let decomp = &state.config.collaboration.decomposition;
     if !decomp.enabled {
         return Vec::new();
@@ -2134,7 +2133,11 @@ async fn decompose_task(
     };
 
     // Extract content from Ollama response
-    let content = match body.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
+    let content = match body
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+    {
         Some(c) => c.trim(),
         None => {
             warn!(task_id = %task.id, "decomposition response missing message.content");
@@ -2318,9 +2321,7 @@ async fn verify_task_output(
          IMPORTANT: Output ONLY valid JSON. Be lenient — only fail clearly wrong or incomplete work.";
 
     let desc = description.unwrap_or("(no description)");
-    let user_msg = format!(
-        "Task: {title}\nDescription: {desc}\n\nAgent output:\n{result_str}"
-    );
+    let user_msg = format!("Task: {title}\nDescription: {desc}\n\nAgent output:\n{result_str}");
 
     let ollama_url = format!("{}/api/chat", state.config.ollama.url);
     let payload = serde_json::json!({
@@ -2353,7 +2354,11 @@ async fn verify_task_output(
         }
     };
 
-    let content = match body.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
+    let content = match body
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+    {
         Some(c) => c.trim(),
         None => return VerificationResult::Skip,
     };
@@ -2366,9 +2371,13 @@ async fn verify_task_output(
 
     match serde_json::from_str::<serde_json::Value>(json_str) {
         Ok(obj) => {
-            let verdict = obj.get("verdict").and_then(|v| v.as_str()).unwrap_or("pass");
+            let verdict = obj
+                .get("verdict")
+                .and_then(|v| v.as_str())
+                .unwrap_or("pass");
             if verdict == "fail" {
-                let feedback = obj.get("feedback")
+                let feedback = obj
+                    .get("feedback")
                     .and_then(|f| f.as_str())
                     .unwrap_or("Output did not meet requirements")
                     .to_string();
@@ -3037,12 +3046,10 @@ async fn handle_delegation_response(
     .await?;
 
     // 2. Look up who requested this delegation so we can notify them
-    let row = sqlx::query(
-        "SELECT from_agent, parent_task_id FROM delegations WHERE id = $1",
-    )
-    .bind(&payload.delegation_id)
-    .fetch_optional(&state.pg)
-    .await?;
+    let row = sqlx::query("SELECT from_agent, parent_task_id FROM delegations WHERE id = $1")
+        .bind(&payload.delegation_id)
+        .fetch_optional(&state.pg)
+        .await?;
 
     if let Some(row) = row {
         let from_agent: String = row.get("from_agent");
@@ -3690,7 +3697,9 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
     let nats = broodlink_runtime::connect_nats(&config.nats).await?;
 
     let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(config.collaboration.decomposition.timeout_secs))
+        .timeout(Duration::from_secs(
+            config.collaboration.decomposition.timeout_secs,
+        ))
         .build()
         .map_err(|e| BroodlinkError::Internal(format!("failed to build HTTP client: {e}")))?;
 
@@ -3806,7 +3815,9 @@ async fn main() {
     let deleg_req_state = Arc::clone(&state);
     let deleg_req_shutdown = shutdown_rx.clone();
     let deleg_req_handle = tokio::spawn(async move {
-        if let Err(e) = run_delegation_request_subscription(deleg_req_state, deleg_req_shutdown).await {
+        if let Err(e) =
+            run_delegation_request_subscription(deleg_req_state, deleg_req_shutdown).await
+        {
             error!(error = %e, "delegation_request subscription failed");
         }
     });
@@ -3814,7 +3825,9 @@ async fn main() {
     let deleg_resp_state = Arc::clone(&state);
     let deleg_resp_shutdown = shutdown_rx.clone();
     let deleg_resp_handle = tokio::spawn(async move {
-        if let Err(e) = run_delegation_response_subscription(deleg_resp_state, deleg_resp_shutdown).await {
+        if let Err(e) =
+            run_delegation_response_subscription(deleg_resp_state, deleg_resp_shutdown).await
+        {
             error!(error = %e, "delegation_response subscription failed");
         }
     });
@@ -4713,7 +4726,10 @@ output = "out"
         });
         let payload: DelegationResponsePayload = serde_json::from_value(json).unwrap();
         assert_eq!(payload.action, "rejected");
-        assert_eq!(payload.reason.as_deref(), Some("Task too complex for my capabilities"));
+        assert_eq!(
+            payload.reason.as_deref(),
+            Some("Task too complex for my capabilities")
+        );
     }
 
     // ----- v0.12.2: Decomposition config tests -----

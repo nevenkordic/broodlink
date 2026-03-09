@@ -3131,7 +3131,19 @@ async fn handler_delegations(
 async fn handler_negotiations(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let rows = sqlx::query_as::<_, (i64, String, String, String, Option<String>, Option<String>, Option<serde_json::Value>, String)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<serde_json::Value>,
+            String,
+        ),
+    >(
         "SELECT id, task_id, agent_id, action, reason, suggested_agent, questions,
                 created_at::text
          FROM task_negotiations ORDER BY created_at DESC LIMIT 200",
@@ -5125,13 +5137,12 @@ async fn handler_telegram_disconnect(
 async fn handler_list_settings(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusApiError> {
-    let rows: Vec<(String, serde_json::Value, String, Option<String>, String)> =
-        sqlx::query_as(
-            "SELECT key, value, description, changed_by, CAST(changed_at AS TEXT) \
+    let rows: Vec<(String, serde_json::Value, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT key, value, description, changed_by, CAST(changed_at AS TEXT) \
              FROM runtime_settings ORDER BY key",
-        )
-        .fetch_all(&state.pg)
-        .await?;
+    )
+    .fetch_all(&state.pg)
+    .await?;
 
     let settings: Vec<serde_json::Value> = rows
         .iter()
@@ -5293,12 +5304,10 @@ async fn handler_toggle_scheduled_task(
         .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
     require_role(&ctx, UserRole::Operator)?;
 
-    let result = sqlx::query(
-        "UPDATE scheduled_tasks SET enabled = NOT enabled WHERE id = $1",
-    )
-    .bind(task_id)
-    .execute(&state.pg)
-    .await?;
+    let result = sqlx::query("UPDATE scheduled_tasks SET enabled = NOT enabled WHERE id = $1")
+        .bind(task_id)
+        .execute(&state.pg)
+        .await?;
 
     if result.rows_affected() == 0 {
         return Err(StatusApiError::NotFound(format!(
@@ -5306,11 +5315,10 @@ async fn handler_toggle_scheduled_task(
         )));
     }
 
-    let (enabled,): (bool,) =
-        sqlx::query_as("SELECT enabled FROM scheduled_tasks WHERE id = $1")
-            .bind(task_id)
-            .fetch_one(&state.pg)
-            .await?;
+    let (enabled,): (bool,) = sqlx::query_as("SELECT enabled FROM scheduled_tasks WHERE id = $1")
+        .bind(task_id)
+        .fetch_one(&state.pg)
+        .await?;
 
     Ok(ok_response(serde_json::json!({
         "id": task_id,
