@@ -327,18 +327,18 @@ async fn install_qdrant() -> anyhow::Result<String> {
     anyhow::bail!("Automatic Qdrant installation not supported on this OS. Install from https://qdrant.tech")
 }
 
-async fn install_brew_or_apt(brew_name: &str, _apt_name: &str) -> anyhow::Result<String> {
+async fn install_brew_or_apt(_brew_name: &str, _apt_name: &str) -> anyhow::Result<String> {
     #[cfg(target_os = "macos")]
     {
         let output = tokio::process::Command::new("brew")
-            .args(["install", brew_name])
+            .args(["install", _brew_name])
             .output()
             .await?;
         if output.status.success() {
-            return Ok(format!("Installed {brew_name} via Homebrew"));
+            return Ok(format!("Installed {_brew_name} via Homebrew"));
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("brew install {brew_name} failed: {stderr}");
+        anyhow::bail!("brew install {_brew_name} failed: {stderr}");
     }
 
     #[cfg(target_os = "linux")]
@@ -357,14 +357,14 @@ async fn install_brew_or_apt(brew_name: &str, _apt_name: &str) -> anyhow::Result
     #[cfg(target_os = "windows")]
     {
         let output = tokio::process::Command::new("choco")
-            .args(["install", "-y", brew_name])
+            .args(["install", "-y", _brew_name])
             .output()
             .await?;
         if output.status.success() {
-            return Ok(format!("Installed {brew_name} via Chocolatey"));
+            return Ok(format!("Installed {_brew_name} via Chocolatey"));
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("choco install {brew_name} failed: {stderr}");
+        anyhow::bail!("choco install {_brew_name} failed: {stderr}");
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
