@@ -21,8 +21,9 @@ This document covers changes in v0.12.2. For previous versions, see the
 7. [Negotiations Endpoint](#7-negotiations-endpoint)
 8. [Windows Support](#8-windows-support)
 9. [Cross-Platform Release Workflow](#9-cross-platform-release-workflow)
-10. [Configuration Reference](#10-configuration-reference)
-11. [Test Coverage](#11-test-coverage)
+10. [Install Scripts](#10-install-scripts)
+11. [Configuration Reference](#11-configuration-reference)
+12. [Test Coverage](#12-test-coverage)
 
 ---
 
@@ -224,7 +225,7 @@ Triggered on version tags (`v*`). Builds 5 targets in parallel:
 | Target | Runner | Archive |
 |--------|--------|---------|
 | `aarch64-apple-darwin` | `macos-latest` | `.tar.gz` |
-| `x86_64-apple-darwin` | `macos-13` | `.tar.gz` |
+| `x86_64-apple-darwin` | `macos-latest` | `.tar.gz` |
 | `x86_64-unknown-linux-gnu` | `ubuntu-latest` | `.tar.gz` |
 | `aarch64-unknown-linux-gnu` | `ubuntu-latest` + `cross` | `.tar.gz` |
 | `x86_64-pc-windows-msvc` | `windows-latest` | `.zip` |
@@ -241,7 +242,34 @@ git push origin v0.12.2
 
 ---
 
-## 10. Configuration Reference
+## 10. Install Scripts
+
+**Files:** `install.sh`, `install.ps1`
+
+One-liner installers that detect OS/architecture, download the correct release
+archive, verify the SHA256 checksum, and copy all 8 binaries into the system
+PATH.
+
+**macOS / Linux:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/nevenkordic/broodlink/main/install.sh | sh
+```
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/nevenkordic/broodlink/main/install.ps1 | iex
+```
+
+The Unix script installs to `/usr/local/bin` (prompts for sudo if needed). The
+Windows script installs to `%LOCALAPPDATA%\Broodlink\bin` and adds it to the
+user's PATH automatically.
+
+After installation, run `broodlink` to launch the setup wizard.
+
+---
+
+## 11. Configuration Reference
+
 
 New config fields in v0.12.2:
 
@@ -257,7 +285,7 @@ All existing configuration is unchanged and backward-compatible.
 
 ---
 
-## 11. Test Coverage
+## 12. Test Coverage
 
 381 unit tests across the workspace (up from 367 in v0.11.0):
 

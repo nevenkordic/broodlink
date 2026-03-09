@@ -44,6 +44,10 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
   Intel, Linux x86_64, Linux ARM (via `cross`), Windows x86_64. Each produces
   a tarball/zip with all 8 binaries + SHA256 checksums. Creates a GitHub
   Release with all artifacts.
+- **One-Liner Install Scripts**: `install.sh` (macOS/Linux) and `install.ps1`
+  (Windows) detect OS/architecture, download the correct release archive, verify
+  SHA256 checksum, and install all 8 binaries. Usage:
+  `curl -fsSL https://raw.githubusercontent.com/nevenkordic/broodlink/main/install.sh | sh`
 - **Windows Support**: All Broodlink binaries now compile and run on Windows.
   `nix` crate replaced with `libc` (Unix) / `taskkill` (Windows) for process
   management. `USERPROFILE` fallback for home directory. Browser opening via

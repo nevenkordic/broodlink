@@ -8,7 +8,19 @@ Broodlink lets multiple AI agents work together. Instead of one AI working alone
 
 ![Broodlink Operations Dashboard](docs/dashboard.png)
 
-## Quick Start
+## Install
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/nevenkordic/broodlink/main/install.sh | sh
+
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/nevenkordic/broodlink/main/install.ps1 | iex
+```
+
+Then run `broodlink` — the setup wizard handles everything else (Ollama, Postgres, Qdrant, model downloads).
+
+### From Source
 
 ```bash
 # Recommended: use broodctl to manage the stack
@@ -190,7 +202,17 @@ Local models achieve ~85-95% of cloud quality at zero cost, zero latency, full p
 
 ## Platforms
 
-Pre-built binaries are available for macOS (ARM + Intel), Linux (x86_64 + ARM), and Windows (x86_64). Push a version tag (`git tag v0.12.2 && git push origin v0.12.2`) to trigger the release workflow, which builds all 5 targets and publishes them as a GitHub Release with SHA256 checksums.
+Pre-built binaries for all platforms — no build tools required:
+
+| Platform | Architecture | Archive |
+|----------|-------------|---------|
+| macOS | ARM (Apple Silicon) | `.tar.gz` |
+| macOS | Intel (x86_64) | `.tar.gz` |
+| Linux | x86_64 | `.tar.gz` |
+| Linux | ARM64 (aarch64) | `.tar.gz` |
+| Windows | x86_64 | `.zip` |
+
+Download from the [latest release](https://github.com/nevenkordic/broodlink/releases/latest), or use the one-liner install scripts above. All archives include SHA256 checksums. Push a version tag (`git tag vX.Y.Z && git push origin vX.Y.Z`) to trigger the release workflow.
 
 ## Prerequisites
 
@@ -209,6 +231,8 @@ Pre-built binaries are available for macOS (ARM + Intel), Linux (x86_64 + ARM), 
 
 | Script | Purpose |
 |--------|---------|
+| `install.sh` | **One-liner installer** (macOS/Linux): detects OS/arch, downloads release, verifies SHA256, installs to `/usr/local/bin` |
+| `install.ps1` | **One-liner installer** (Windows): downloads release, verifies SHA256, installs to `%LOCALAPPDATA%\Broodlink\bin`, adds to PATH |
 | `broodctl` | **Stack manager**: `up`/`down`/`restart`/`rebuild`/`status`/`health`/`logs`/`doctor` — single command for everything |
 | `scripts/bootstrap.sh` | One-shot setup: prerequisites check, infrastructure, secrets, databases, build, onboard, start |
 | `scripts/start-services.sh` | Start/stop all 7 Rust services + Hugo (`--stop` to stop) |
@@ -249,6 +273,8 @@ broodlink/
 ├── agents/                       # Python SDK: typed clients, Click CLI, BaseAgent framework, ML utilities
 ├── status-site/                  # Hugo dashboard (WCAG 2.1 AA, 18 pages)
 │   └── themes/broodlink-status/  # 18 pages
+├── install.sh                    # One-liner installer (macOS/Linux)
+├── install.ps1                   # One-liner installer (Windows)
 ├── broodctl                      # Stack manager (up/down/status/rebuild/doctor)
 ├── migrations/                   # SQL migrations (33 files, additive only)
 │   ├── 001_dolt_brain.sql
