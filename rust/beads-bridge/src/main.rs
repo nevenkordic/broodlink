@@ -292,6 +292,127 @@ impl RateLimiter {
 // Application state
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Deny-list permission pre-filter
+// ---------------------------------------------------------------------------
+// Fast-path tool blocking that runs before hitting the database for guardrail
+// policies.  Loaded once at startup from config and kept in memory.  Supports
+// both exact tool name matches and prefix-based blocking.
+
+use std::collections::HashSet;
+
+/// In-memory deny list for fast O(1) tool permission checks.
+///
+/// This runs as the very first check in `tool_dispatch`, before guardrail
+/// policy queries or budget checks, providing a cheap rejection path for
+/// known-blocked tools without any database overhead.
+pub struct ToolDenyList {
+    /// Exact tool names that are always blocked (lowercase).
+    denied_names: HashSet<String>,
+    /// Prefixes — any tool starting with one of these is blocked.
+    denied_prefixes: Vec<String>,
+    /// Per-agent overrides: agent_id → set of additionally denied tool names.
+    agent_overrides: HashMap<String, HashSet<String>>,
+}
+
+impl ToolDenyList {
+    /// Build from configuration.  Called once at startup.
+    pub fn from_config(config: &Config) -> Self {
+        let mut denied_names = HashSet::new();
+        let mut denied_prefixes = Vec::new();
+        let mut agent_overrides: HashMap<String, HashSet<String>> = HashMap::new();
+
+        // Load global deny list from config (if present)
+        // Convention: config.beads_bridge may contain deny_tools / deny_prefixes
+        // We also auto-deny tools that should never be directly invoked via the
+        // bridge by external agents (internal-only tools).
+        let internal_only: &[&str] = &[
+            "debug_dump_state",
+            "unsafe_raw_query",
+            "system_shutdown",
+            "admin_rotate_keys",
+        ];
+        for tool in internal_only {
+            denied_names.insert(tool.to_string());
+        }
+
+        // Load per-agent deny lists from config agent definitions
+        for (agent_id, agent_cfg) in &config.agents {
+            // Check if the agent config has any blocked tools/prefixes
+            // (These are stored as skills with "deny:" prefix by convention)
+            let mut per_agent = HashSet::new();
+            for skill in &agent_cfg.skills {
+                if let Some(denied) = skill.strip_prefix("deny:") {
+                    per_agent.insert(denied.to_lowercase());
+                }
+            }
+            if !per_agent.is_empty() {
+                agent_overrides.insert(agent_id.clone(), per_agent);
+            }
+        }
+
+        // Built-in dangerous prefixes
+        denied_prefixes.push("debug_".to_string());
+        denied_prefixes.push("unsafe_".to_string());
+
+        Self {
+            denied_names,
+            denied_prefixes,
+            agent_overrides,
+        }
+    }
+
+    /// Check whether a tool is blocked for a given agent.
+    /// Returns `Some(reason)` if blocked, `None` if allowed.
+    pub fn check(&self, tool_name: &str, agent_id: &str) -> Option<String> {
+        let lower = tool_name.to_lowercase();
+
+        // 1. Global exact match
+        if self.denied_names.contains(&lower) {
+            return Some(format!("tool '{tool_name}' is blocked by global deny list"));
+        }
+
+        // 2. Prefix match
+        for prefix in &self.denied_prefixes {
+            if lower.starts_with(prefix) {
+                return Some(format!(
+                    "tool '{tool_name}' is blocked by deny prefix '{prefix}'"
+                ));
+            }
+        }
+
+        // 3. Per-agent override
+        if let Some(agent_denied) = self.agent_overrides.get(agent_id) {
+            if agent_denied.contains(&lower) {
+                return Some(format!(
+                    "tool '{tool_name}' is blocked for agent '{agent_id}'"
+                ));
+            }
+        }
+
+        None
+    }
+
+    /// Add a tool to the global deny list at runtime (e.g. via admin API).
+    pub fn deny_tool(&mut self, tool_name: &str) {
+        self.denied_names.insert(tool_name.to_lowercase());
+    }
+
+    /// Add a prefix to the global deny list at runtime.
+    pub fn deny_prefix(&mut self, prefix: &str) {
+        self.denied_prefixes.push(prefix.to_lowercase());
+    }
+
+    /// Remove a tool from the global deny list.
+    pub fn allow_tool(&mut self, tool_name: &str) {
+        self.denied_names.remove(&tool_name.to_lowercase());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Application state
+// ---------------------------------------------------------------------------
+
 pub struct AppState {
     pub dolt: MySqlPool,
     pub pg: PgPool,
@@ -308,6 +429,7 @@ pub struct AppState {
     pub jwt_decoding_keys: Vec<(String, jsonwebtoken::DecodingKey)>, // (kid, key) pairs
     pub jwt_validation: jsonwebtoken::Validation,
     pub sse_connections: RwLock<HashMap<String, usize>>, // agent_id → active SSE count
+    pub tool_deny_list: ToolDenyList,
 }
 
 // ---------------------------------------------------------------------------
@@ -1384,7 +1506,21 @@ async fn tool_dispatch(
         "tool invoked"
     );
 
-    // Guardrail check — runs after auth+rate-limit, before tool execution
+    // Deny-list pre-filter — O(1) in-memory check before any DB calls
+    if let Some(reason) = state.tool_deny_list.check(&tool_name, agent_id) {
+        warn!(
+            tool = %tool_name,
+            agent = %agent_id,
+            reason = %reason,
+            "tool blocked by deny-list pre-filter"
+        );
+        return Err(BroodlinkError::Guardrail {
+            policy: "deny_list".to_string(),
+            message: reason,
+        });
+    }
+
+    // Guardrail check — runs after auth+rate-limit+deny-list, before tool execution
     check_guardrails(&state, agent_id, &tool_name, params).await?;
 
     // Budget check — runs after guardrails, before tool execution

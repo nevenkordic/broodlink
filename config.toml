@@ -111,7 +111,7 @@ reranker_model = "snowflake-arctic-embed2:568m"    # dedicated reranker model
 reranker_enabled = true                            # set false to disable reranking globally
 max_content_length = 2000                          # truncate content in results (chars, 0 = no limit)
 kg_enabled = true                                  # enable knowledge graph entity extraction
-kg_extraction_model = "qwen3.5:4b"                 # model for entity/relationship extraction
+kg_extraction_model = "gemma4:e4b"                   # model for entity/relationship extraction
 kg_entity_similarity_threshold = 0.85              # cosine threshold for entity deduplication
 kg_max_hops = 3                                    # max traversal depth for graph_traverse
 kg_extraction_timeout_seconds = 120                # timeout for LLM extraction calls (high for cold model loading)
@@ -121,7 +121,7 @@ kg_cleanup_interval_hours = 24                     # run cleanup every N hours
 kg_min_mention_count = 3                           # protect entities with >= N mentions from TTL pruning
 smart_chunking = true                              # split at markdown headings, code fences, tables (false = word-based)
 query_expansion_enabled = true                     # generate variant phrasings before searching
-query_expansion_model = "qwen3.5:4b"               # fast model for query expansion
+query_expansion_model = "gemma4:e4b"                 # fast model for query expansion
 query_expansion_timeout_seconds = 15               # timeout for expansion LLM call
 
 [collaboration]
@@ -155,12 +155,12 @@ max_retries           = 3
 
 [chat]
 enabled = true
-chat_model = "qwen3.5:35b"
-chat_fallback_model = "qwen3.5:4b"
+chat_model = "gemma4:31b"
+chat_fallback_model = "gemma4:e4b"
 verifier_model = "deepseek-r1:32b"
 verifier_timeout_seconds = 60
-chat_code_model = "qwen3-coder:30b"
-chat_vision_model = "gemma3:27b"
+chat_code_model = "gemma4:26b"
+chat_vision_model = "gemma4:31b"
 max_context_messages = 10
 session_timeout_hours = 24
 reply_timeout_seconds = 300

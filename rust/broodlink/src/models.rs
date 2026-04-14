@@ -248,9 +248,9 @@ pub async fn recommended_models(
     Json(vec![
         // -- Core multi-agent stack (what most users need) --
         RecommendedModel {
-            name: "qwen3.5:4b".to_string(),
-            size: "3.4 GB".to_string(),
-            description: "General-purpose agent — fast, lightweight, handles most tasks"
+            name: "gemma4:e4b".to_string(),
+            size: "3.3 GB".to_string(),
+            description: "General-purpose agent — fast, efficient, native tool calling, 256K context"
                 .to_string(),
             role: "general".to_string(),
             required: false,
@@ -266,18 +266,19 @@ pub async fn recommended_models(
         },
         // -- Upgrade: better quality for users with more hardware --
         RecommendedModel {
-            name: "qwen3.5:35b".to_string(),
-            size: "23 GB".to_string(),
-            description: "Smarter general-purpose agent — better planning and reasoning"
+            name: "gemma4:31b".to_string(),
+            size: "20 GB".to_string(),
+            description: "Primary agent model — top-tier reasoning, agentic workflows, native tool calling"
                 .to_string(),
             role: "general".to_string(),
             required: false,
             category: "advanced".to_string(),
         },
         RecommendedModel {
-            name: "qwen3-coder:30b".to_string(),
-            size: "18 GB".to_string(),
-            description: "Code specialist — writes, edits, and reviews code".to_string(),
+            name: "gemma4:26b".to_string(),
+            size: "16 GB".to_string(),
+            description: "MoE agent — strong balance of quality and speed, code and general tasks"
+                .to_string(),
             role: "coder".to_string(),
             required: false,
             category: "advanced".to_string(),
@@ -304,6 +305,8 @@ fn infer_role(name: &str) -> Option<String> {
         Some("embedding".to_string())
     } else if n.contains("meditron") || n.contains("med") {
         Some("medical".to_string())
+    } else if n.contains("gemma4") {
+        Some("general".to_string())
     } else if n.contains("gemma") {
         Some("vision".to_string())
     } else if n.contains("deepseek") {

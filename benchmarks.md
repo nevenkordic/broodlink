@@ -1,9 +1,9 @@
 # Broodlink System Benchmark
 
-**Date:** 2026-03-03
+**Date:** 2026-04-14
 **Host:** Mac Studio — Apple M4 Max, 16 cores (12P + 4E), 128 GB unified memory
 **Disk:** 6.5 GB/s sequential write
-**Ollama:** 0.17.5
+**Ollama:** 0.20.7
 
 ---
 
@@ -11,42 +11,40 @@
 
 | Model | Role | Size | Generation | Think Support |
 |-------|------|------|------------|---------------|
-| qwen3.5:35b | Primary chat | 23 GB | 43 tok/s | Yes |
-| qwen3-coder:30b | Code | 18 GB | 72 tok/s | No |
-| qwen3.5:4b | Fallback/expansion/KG | 3.4 GB | 54 tok/s | Yes |
+| gemma4:31b | Primary chat | 19 GB | 38 tok/s | Yes |
+| gemma4:26b | Code | 17 GB | 65 tok/s | Yes |
+| gemma4:e4b | Fallback/expansion/KG | 9.6 GB | 48 tok/s | Yes |
 | deepseek-r1:32b | Verifier | 19 GB | 9-22 tok/s | Yes |
-| gemma3:27b | Vision | 17 GB | 25 tok/s | No (vision) |
+| gemma4:31b | Vision | 19 GB | 38 tok/s | Yes (vision) |
 | nomic-embed-text | Embeddings | 274 MB | 13.9 emb/s | — |
 
 ---
 
 ## Accuracy Benchmark (13 tests)
 
-| Category | Test | qwen3.5:35b | qwen3-coder:30b | qwen3.5:4b | deepseek-r1:32b |
-|----------|------|-------------|-----------------|------------|-----------------|
-| REASONING | math (17*23) | PASS 6.7s | — | — | — |
-| REASONING | logic puzzle | PASS 25.9s | — | — | — |
-| REASONING | probability (3/8) | PASS 13.3s | — | — | — |
-| REASONING | series sum (210) | PASS 7.9s | — | — | — |
-| CODING | fizzbuzz | PASS* 97.0s | PASS 5.2s | — | — |
-| CODING | bug fix | PASS 13.3s | PASS 1.1s | — | — |
-| CODING | regex | PASS 4.4s | PASS 0.5s | — | — |
-| CODING | reverse string | PASS 8.6s | PASS 1.1s | — | — |
-| INSTRUCTION | JSON format | PASS 7.3s | — | PASS 8.0s | — |
-| INSTRUCTION | numbered list | PASS 23.6s | — | PASS 12.7s | — |
-| KNOWLEDGE | speed of light | PASS 13.1s | — | PASS 3.6s | — |
-| KNOWLEDGE | geography | PASS 4.3s | — | PASS 2.8s | — |
-| KNOWLEDGE | history | PASS 6.0s | — | PASS 3.8s | — |
-
-\* Used think:false retry (thinking chain exhausted budget on first attempt)
+| Category | Test | gemma4:31b | gemma4:26b | gemma4:e4b | deepseek-r1:32b |
+|----------|------|------------|------------|------------|-----------------|
+| REASONING | math (17*23) | PASS 5.8s | — | — | — |
+| REASONING | logic puzzle | PASS 18.2s | — | — | — |
+| REASONING | probability (3/8) | PASS 10.1s | — | — | — |
+| REASONING | series sum (210) | PASS 6.4s | — | — | — |
+| CODING | fizzbuzz | PASS 12.3s | PASS 4.8s | — | — |
+| CODING | bug fix | PASS 9.7s | PASS 1.0s | — | — |
+| CODING | regex | PASS 3.9s | PASS 0.5s | — | — |
+| CODING | reverse string | PASS 7.1s | PASS 0.9s | — | — |
+| INSTRUCTION | JSON format | PASS 6.1s | — | PASS 7.2s | — |
+| INSTRUCTION | numbered list | PASS 15.4s | — | PASS 10.3s | — |
+| KNOWLEDGE | speed of light | PASS 9.8s | — | PASS 3.2s | — |
+| KNOWLEDGE | geography | PASS 3.6s | — | PASS 2.5s | — |
+| KNOWLEDGE | history | PASS 4.9s | — | PASS 3.1s | — |
 
 ### Scores
 
 | Model | Accuracy | Role |
 |-------|----------|------|
-| qwen3.5:35b | **13/13 (100%)** | General chat + reasoning |
-| qwen3-coder:30b | **4/4 (100%)** | Code generation |
-| qwen3.5:4b | **7/9 (78%)** | Fallback (failed logic + word count) |
+| gemma4:31b | **13/13 (100%)** | General chat + reasoning |
+| gemma4:26b | **4/4 (100%)** | Code generation |
+| gemma4:e4b | **9/9 (100%)** | Fallback/expansion/KG |
 | deepseek-r1:32b | **3/4 (75%)** | Verifier (verbose output misses exact format) |
 
 ---
@@ -57,10 +55,10 @@
 |-------|------|-----------|------|-----------|------|
 | Claude Opus 4.6 | 88.7% | 94.5% | 78.3% | 80%+ | ~$15/1M tok |
 | GPT-4o | 87.2% | 90.2% | 76.6% | 33.2% | ~$5/1M tok |
-| **qwen3.5:35b (local)** | ~82% | ~85% | ~73% | 76.4% | **$0** |
-| **qwen3-coder:30b (local)** | — | ~88% | — | ~70% | **$0** |
+| **gemma4:31b (local)** | ~84% | ~87% | ~76% | ~72% | **$0** |
+| **gemma4:26b (local)** | — | ~89% | — | ~68% | **$0** |
 | **deepseek-r1:32b (local)** | ~80% | ~73% | ~75% | — | **$0** |
-| **qwen3.5:4b (local)** | ~65% | ~59% | ~52% | — | **$0** |
+| **gemma4:e4b (local)** | ~72% | ~68% | ~61% | — | **$0** |
 
 Local models achieve ~85-95% of cloud quality with zero cost, zero latency, and full data privacy.
 

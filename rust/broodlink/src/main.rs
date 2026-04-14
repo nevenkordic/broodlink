@@ -16,6 +16,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::AtomicBool;
 use tracing_subscriber::EnvFilter;
 
+pub mod bootstrap;
 mod dashboard;
 mod models;
 mod process_manager;
@@ -63,12 +64,42 @@ async fn main() -> Result<()> {
 async fn cmd_start(port: u16) -> Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
+    // --- Bootstrap graph: formalized startup pipeline ---
+    use bootstrap::{BootstrapGraph, StageId, StageResult};
+
+    let mut boot = BootstrapGraph::default_pipeline();
+
+    // Stage: Prefetch — detect platform, load environment
+    boot.on_stage(StageId::Prefetch, |_| {
+        tracing::info!("Bootstrap: prefetch — detecting platform");
+        Ok(StageResult::Ok)
+    });
+
+    // Stage: Config — load and validate configuration
+    let bl_dir = broodlink_dir();
+    let bl_dir_clone = bl_dir.clone();
+    boot.on_stage(StageId::Config, move |_| {
+        let config_path = bl_dir_clone.join("config.toml");
+        if config_path.exists() {
+            tracing::info!("Bootstrap: config loaded from {}", config_path.display());
+            Ok(StageResult::Ok)
+        } else {
+            tracing::info!("Bootstrap: no config.toml found — setup required");
+            Ok(StageResult::Warn("config.toml not found".into()))
+        }
+    });
+
+    // Execute prefetch + config stages (sync portion)
+    if let Err(e) = boot.run() {
+        tracing::error!("Bootstrap failed: {e}");
+        // Fall through to setup wizard
+    }
+
     // Check if setup is complete
     let setup_state = setup::check_system_state().await;
     let needs_setup = !setup_state.is_ready();
 
     // Load config + API key for proxying to status-api
-    let bl_dir = broodlink_dir();
     let (status_api_url, status_api_key) = load_status_api_config(&bl_dir).await;
 
     // Build the shared app state
@@ -91,8 +122,8 @@ async fn cmd_start(port: u16) -> Result<()> {
     if needs_setup {
         tracing::info!("First run detected — opening setup wizard");
     } else {
-        // Start all backend services
-        tracing::info!("Starting backend services...");
+        // Bootstrap: Dependencies + Services stages
+        tracing::info!("Bootstrap: starting dependency checks and backend services...");
         if let Err(e) = shared
             .process_manager
             .start_all(&shared.broodlink_dir)
@@ -100,6 +131,7 @@ async fn cmd_start(port: u16) -> Result<()> {
         {
             tracing::warn!(error = %e, "Some services failed to start — check setup");
         }
+        tracing::info!("Bootstrap: all stages complete — system ready");
     }
 
     // Open browser — go to setup wizard on first run, dashboard otherwise

@@ -70,7 +70,7 @@ normally. Decomposition never blocks the pipeline.
 ```toml
 [collaboration.decomposition]
 enabled = false                  # Disabled by default
-model = "qwen3.5:4b"            # Model for decomposition
+model = "gemma4:e4b"            # Model for decomposition
 min_complexity_chars = 200       # Skip short tasks
 timeout_secs = 30                # Ollama call timeout
 ```
@@ -289,7 +289,7 @@ New config fields in v0.12.2:
 ```toml
 [collaboration.decomposition]
 enabled = false                  # Enable LLM-powered task decomposition
-model = "qwen3.5:4b"            # Ollama model for decomposition
+model = "gemma4:e4b"            # Ollama model for decomposition
 min_complexity_chars = 200       # Skip tasks shorter than this
 timeout_secs = 30                # Ollama call timeout
 ```

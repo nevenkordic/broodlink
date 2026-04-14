@@ -9,6 +9,17 @@ from .config import AgentConfig
 from .client import AsyncBroodlinkClient, BroodlinkClient
 from .agent import BaseAgent
 from .nats_helper import NATSHelper
+from .transcript import TranscriptManager
+from .deferred_init import TrustGate, TrustLevel, DeferredInitManager
+from .events import (
+    StreamEvent,
+    StreamBuilder,
+    EventSource,
+    EventType,
+    StreamStatus,
+    parse_sse_stream,
+    parse_sse_stream_sync,
+)
 from .models import (
     Memory,
     SemanticResult,
@@ -34,6 +45,20 @@ __all__ = [
     # Agent framework
     "BaseAgent",
     "NATSHelper",
+    # Streaming event protocol
+    "StreamEvent",
+    "StreamBuilder",
+    "EventSource",
+    "EventType",
+    "StreamStatus",
+    "parse_sse_stream",
+    "parse_sse_stream_sync",
+    # Transcript compaction
+    "TranscriptManager",
+    # Trust-gated deferred initialization
+    "TrustGate",
+    "TrustLevel",
+    "DeferredInitManager",
     # Config
     "AgentConfig",
     # Models

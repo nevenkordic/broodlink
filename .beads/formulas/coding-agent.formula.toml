@@ -5,7 +5,7 @@
 [formula]
 name = "coding-agent"
 version = "1.0.0"
-description = "Offline Claude Code replacement: read codebase, plan edits, apply changes, run tests, iterate"
+description = "Offline coding agent: read codebase, plan edits, apply changes, run tests, iterate"
 model_domain = "code"
 
 [[steps]]

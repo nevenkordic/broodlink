@@ -6316,14 +6316,17 @@ async fn call_ollama_chat(
         }
     }
 
-    // Some models don't support thinking mode (vision models, qwen3-coder)
+    // Some models don't support thinking mode (legacy vision models, qwen3-coder).
+    // Gemma 4 supports thinking and tool calling natively; only legacy gemma3 is excluded.
+    let is_legacy_gemma = model.starts_with("gemma") && !model.starts_with("gemma4");
     let is_think_capable =
-        !params.images.is_some() && !model.starts_with("gemma") && !model.contains("-coder");
+        !params.images.is_some() && !is_legacy_gemma && !model.contains("-coder");
 
     for round in 0..=max_rounds {
         // Include tools only on rounds where the model can still call them.
-        // Vision models (gemma3) don't support tools or thinking.
-        let is_vision = params.images.is_some();
+        // Legacy vision models (gemma3) don't support tools or thinking.
+        // Gemma 4 has native vision + tool calling, so it is NOT excluded here.
+        let is_vision = params.images.is_some() && is_legacy_gemma;
         let include_tools = !is_vision && round < max_rounds && tools_def.is_some();
         let use_think = is_think_capable;
         // With think:true, thinking tokens eat into num_predict budget.

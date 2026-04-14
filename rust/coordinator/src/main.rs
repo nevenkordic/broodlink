@@ -496,6 +496,119 @@ fn rank_agents(
 }
 
 // ---------------------------------------------------------------------------
+// Token-based prompt pre-filter
+// ---------------------------------------------------------------------------
+
+/// Lightweight token overlap scoring for fast candidate pre-filtering.
+///
+/// Before running the heavier weighted multi-factor scoring, this function
+/// cheaply narrows down the candidate set by comparing tokenised description
+/// keywords against agent capability tokens and preferred formula names.
+///
+/// Agents that score below `min_token_overlap` (default 0) are dropped.  The
+/// remaining agents proceed to the full `rank_agents` pipeline.  When *all*
+/// agents would be dropped the original set is returned unchanged so that the
+/// weighted scorer can still pick the best available.
+fn token_prefilter(
+    agents: Vec<EligibleAgent>,
+    task_title: Option<&str>,
+    task_description: Option<&str>,
+    formula_name: Option<&str>,
+    config_agents: &HashMap<String, broodlink_config::AgentConfig>,
+    min_token_overlap: usize,
+) -> Vec<EligibleAgent> {
+    // Build the query token set from the task text
+    let mut query_tokens: Vec<String> = Vec::new();
+    if let Some(title) = task_title {
+        query_tokens.extend(tokenize_text(title));
+    }
+    if let Some(desc) = task_description {
+        query_tokens.extend(tokenize_text(desc));
+    }
+    if let Some(fname) = formula_name {
+        query_tokens.extend(tokenize_text(fname));
+    }
+
+    // If there are no query tokens, skip filtering entirely
+    if query_tokens.is_empty() {
+        return agents;
+    }
+
+    let query_set: std::collections::HashSet<&str> = query_tokens.iter().map(|s| s.as_str()).collect();
+
+    let mut scored: Vec<(EligibleAgent, usize)> = agents
+        .into_iter()
+        .map(|agent| {
+            let mut overlap: usize = 0;
+
+            // Check capabilities JSON for matching keys
+            if let Some(caps) = &agent.capabilities {
+                if let Some(obj) = caps.as_object() {
+                    for key in obj.keys() {
+                        let key_tokens = tokenize_text(key);
+                        overlap += key_tokens.iter().filter(|t| query_set.contains(t.as_str())).count();
+                    }
+                }
+            }
+
+            // Check config-defined preferred_formulas and skills
+            if let Some(cfg) = config_agents.get(&agent.agent_id) {
+                for pf in &cfg.preferred_formulas {
+                    let pf_tokens = tokenize_text(pf);
+                    overlap += pf_tokens.iter().filter(|t| query_set.contains(t.as_str())).count();
+                }
+                for skill in &cfg.skills {
+                    let skill_tokens = tokenize_text(skill);
+                    overlap += skill_tokens.iter().filter(|t| query_set.contains(t.as_str())).count();
+                }
+                // Model domains also count as matching tokens
+                for domain in &cfg.model_domains {
+                    if query_set.contains(domain.as_str()) {
+                        overlap += 1;
+                    }
+                }
+            }
+
+            (agent, overlap)
+        })
+        .collect();
+
+    // Sort by overlap descending (stable relative order on ties)
+    scored.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // Filter out agents below the minimum overlap threshold
+    let filtered: Vec<EligibleAgent> = scored
+        .iter()
+        .filter(|(_, score)| *score >= min_token_overlap)
+        .map(|(agent, _)| agent.clone())
+        .collect();
+
+    // If filtering would eliminate everyone, return the full set
+    if filtered.is_empty() {
+        scored.into_iter().map(|(agent, _)| agent).collect()
+    } else {
+        filtered
+    }
+}
+
+/// Tokenize text into lowercase alphanumeric tokens, splitting on whitespace,
+/// hyphens, underscores, dots, and slashes.  Strips tokens shorter than 2 chars
+/// and common stop words.
+fn tokenize_text(text: &str) -> Vec<String> {
+    const STOP_WORDS: &[&str] = &[
+        "the", "and", "for", "with", "this", "that", "from", "into", "all", "are",
+        "was", "has", "have", "not", "but", "can", "will", "should", "would",
+    ];
+
+    text.to_lowercase()
+        .split(|c: char| c.is_whitespace() || c == '-' || c == '_' || c == '.' || c == '/')
+        .filter(|t| t.len() >= 2)
+        .filter(|t| !STOP_WORDS.contains(t))
+        .map(|t| t.to_string())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // v0.9.0: Model domain classification
 // ---------------------------------------------------------------------------
 
@@ -4738,7 +4851,7 @@ output = "out"
     fn test_decomposition_config_defaults() {
         let config: broodlink_config::DecompositionConfig = Default::default();
         assert!(!config.enabled, "decomposition disabled by default");
-        assert_eq!(config.model, "qwen3.5:4b");
+        assert_eq!(config.model, "gemma4:e4b");
         assert_eq!(config.min_complexity_chars, 200);
         assert_eq!(config.timeout_secs, 30);
     }

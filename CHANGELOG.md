@@ -5,6 +5,54 @@ All notable changes to Broodlink are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.12.3] - 2026-04-14
+
+### Changed
+
+- **Model Migration — Gemma 4**: Migrated entire model stack from Qwen 3.x to
+  Google Gemma 4 family. All models are Apache 2.0, have native tool calling,
+  and support 256K context windows with day-one Ollama support.
+  `chat_model`: qwen3.5:35b → gemma4:31b (primary chat + vision),
+  `chat_code_model`: qwen3-coder:30b → gemma4:26b (MoE, code tasks),
+  `chat_fallback_model`: qwen3.5:4b → gemma4:e4b (fallback, KG extraction,
+  query expansion). deepseek-r1:32b retained as reasoning verifier.
+  nomic-embed-text and snowflake-arctic-embed2:568m retained for embeddings
+  and reranking.
+- **A2A Gateway Gemma 4 Compatibility**: Updated think/vision capability
+  detection to distinguish gemma4 (full tool+vision support) from legacy
+  gemma3 models. gemma4 models no longer excluded from think mode or vision
+  tool dispatch.
+- **Recommended Models Endpoint**: Updated `/api/v1/models/recommended` to
+  return Gemma 4 models in core and advanced tiers.
+- **Config Defaults**: Updated all default model functions in broodlink-config
+  to reference Gemma 4 variants.
+
+### Added
+
+- **Streaming Event Protocol** (`broodlink-events` crate): Formalized SSE/NATS
+  event envelope with typed event kinds (StreamStart, StreamEnd, RouteStart,
+  AgentMatch, TaskDispatched, ToolExecStart, MessageDelta, PermissionDenied,
+  BudgetExhausted, etc.). StreamBuilder for ordered emission. Python SDK
+  counterpart in `agents/broodlink_agent/events.py`.
+- **Transcript Compaction**: Context window management for agents. Keeps system
+  prompt + compaction summary + last N messages. Auto-compacts at 80% token
+  budget. Python module: `agents/broodlink_agent/transcript.py`.
+- **Trust-Gated Deferred Initialization**: Phased tool access based on agent
+  trust levels (UNTRUSTED → PROBATION → STANDARD → ELEVATED → SYSTEM).
+  DeferredInitManager orchestrates phased init hooks. Python module:
+  `agents/broodlink_agent/deferred_init.py`.
+- **Token-Based Prompt Pre-Filter**: Lightweight keyword overlap scoring in
+  coordinator to pre-filter agents before weighted multi-factor routing.
+- **Deny-List Permission Pre-Filter**: O(1) in-memory tool blocking in
+  beads-bridge before database guardrail queries. Blocks internal-only tools
+  and dangerous prefixes.
+- **Bootstrap Graph**: Formalized startup pipeline with directed acyclic graph
+  of stages (Prefetch, Config, Dependencies, Databases, Services,
+  DeferredInit, Ready). Topological sorting with cycle detection.
+- **Native Infrastructure Scripts**: `scripts/infra-start.sh` for managing
+  all infrastructure services natively via brew (PostgreSQL, NATS, Dolt,
+  Qdrant, Ollama, Jaeger) without containers.
+
 ## [0.12.2] - 2026-03-09
 
 ### Added

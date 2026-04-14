@@ -12,6 +12,8 @@ from typing import Any, Callable, Awaitable
 
 from .config import AgentConfig
 from ._transport import AsyncTransport
+from .transcript import TranscriptManager
+from .deferred_init import TrustGate, TrustLevel, DeferredInitManager
 
 
 ToolHandler = Callable[..., Awaitable[Any]]
@@ -41,6 +43,12 @@ class BaseAgent:
         self._tool_schemas: list[dict[str, Any]] = []
         self._bridge_tools: list[dict[str, Any]] = []
         self._running = False
+        self._transcript = TranscriptManager(
+            max_tokens=self.config.max_context_tokens,
+            keep_last=self.config.max_history,
+        )
+        self._trust_gate = TrustGate(agent_trust_level=TrustLevel.PROBATION)
+        self._deferred_init = DeferredInitManager(self._trust_gate)
 
     # ── Custom tool registration ────────────────────────────────────
 
@@ -112,13 +120,16 @@ class BaseAgent:
         rounds = max_rounds or self.config.max_tool_rounds
         all_tools = self._bridge_tools + self._tool_schemas
 
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ]
+        # Use the transcript manager for context window management
+        self._transcript.clear()
+        self._transcript.append({"role": "system", "content": system_prompt})
+        self._transcript.append({"role": "user", "content": user_message})
 
         async with aiohttp.ClientSession() as session:
             for _ in range(rounds):
+                # Get compacted messages if context is getting large
+                messages = self._transcript.compacted_messages()
+
                 payload: dict[str, Any] = {
                     "model": self.config.lm_model,
                     "messages": messages,
@@ -148,7 +159,7 @@ class BaseAgent:
                 if not tool_calls:
                     return msg.get("content", "") or ""
 
-                messages.append(msg)
+                self._transcript.append(msg)
 
                 for tc in tool_calls:
                     func = tc.get("function", {})
@@ -165,13 +176,14 @@ class BaseAgent:
                         result = await self._transport.call(tc_name, tc_args)
                         result_str = json.dumps(result, default=str)
 
-                    messages.append({
+                    self._transcript.append({
                         "role": "tool",
                         "tool_call_id": tc.get("id", ""),
                         "content": result_str,
                     })
 
             # Exhausted rounds — get final text without tools
+            messages = self._transcript.compacted_messages()
             payload = {
                 "model": self.config.lm_model,
                 "messages": messages,
@@ -195,11 +207,24 @@ class BaseAgent:
 
     # ── Start / stop ────────────────────────────────────────────────
 
-    async def start(self) -> None:
-        """Initialize transport, fetch tools, register agent, call on_start."""
+    async def start(self, trust_level: TrustLevel | None = None) -> None:
+        """Initialize transport, fetch tools with trust gating, register agent.
+
+        Parameters
+        ----------
+        trust_level
+            Initial trust level for this agent.  Defaults to ``PROBATION``
+            for new agents.  Set to ``STANDARD`` or ``ELEVATED`` for pre-
+            trusted agents.
+        """
+        if trust_level is not None:
+            self._trust_gate.agent_trust_level = trust_level
+
         await self._transport.__aenter__()
 
-        self._bridge_tools = await self._transport.fetch_tools()
+        # Fetch all available tools, then filter through the trust gate
+        all_tools = await self._transport.fetch_tools()
+        self._bridge_tools = self._trust_gate.filter_tools(all_tools)
 
         if self.config.agent_id:
             await self._transport.call("agent_upsert", {
@@ -209,6 +234,15 @@ class BaseAgent:
                 "cost_tier": self.config.cost_tier,
                 "active": True,
             })
+
+        # Run any deferred init phases eligible at the current trust level
+        await self._deferred_init.run_eligible()
+
+        # After successful registration, promote from probation to standard
+        if self._trust_gate.agent_trust_level == TrustLevel.PROBATION:
+            self._trust_gate.promote(TrustLevel.STANDARD)
+            self._bridge_tools = self._trust_gate.filter_tools(all_tools)
+            await self._deferred_init.run_eligible()
 
         self._running = True
         await self.on_start()

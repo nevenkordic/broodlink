@@ -59,7 +59,7 @@ After startup, you'll have:
 ## Architecture
 
 ```
-                    Agents (Claude, Qwen, custom bots, ...)
+                    Agents (Claude, Gemma4, custom bots, ...)
                             │
                     ┌───────▼───────┐
                     │ beads-bridge  │ :3310  Tool API (96 tools)
@@ -125,9 +125,9 @@ After startup, you'll have:
 
 | Service | Port | Transport | Purpose |
 |---------|------|-----------|---------|
-| broodlink | 3310* | HTTP | Unified binary: setup wizard, process manager (starts all services + infrastructure), reverse proxy to status-api and Ollama, native chat UI, model management API. Embeds the full Hugo dashboard via `rust-embed`. *Default port; configurable via `--port`. |
-| beads-bridge | 3310 | HTTP + NATS | Universal tool API (96 tools), JWT RS256 auth with kid-based multi-key validation, rate limiting, budget enforcement, circuit breakers, JWKS endpoint, SSE streaming, task negotiation tools (decline/context request) |
-| coordinator | -- | NATS only | Smart task routing with weighted scoring, atomic claiming, exponential backoff, dead-letter queue with auto-retry, workflow orchestration with conditional steps, parallel groups, per-step retries, timeouts, and error handlers, LLM-powered sub-task decomposition (configurable, fail-open), agent-to-agent delegation protocol (request/accept/decline/complete lifecycle), automated verification pipeline on task completion (pass/fail/skip), scheduled task promotion (60s polling), task negotiation protocol (decline/redirect/context request with max-decline dead-letter) |
+| broodlink | 3310* | HTTP | Unified binary: setup wizard, process manager (starts all services + infrastructure), reverse proxy to status-api and Ollama, native chat UI, model management API. Embeds the full Hugo dashboard via `rust-embed`. Bootstrap graph startup pipeline (DAG of stages: Prefetch → Config → Dependencies → Databases → Services → DeferredInit → Ready with topological sorting and cycle detection). Trust-gated deferred initialization (phased tool access based on agent trust levels: UNTRUSTED → PROBATION → STANDARD → ELEVATED → SYSTEM). *Default port; configurable via `--port`. |
+| beads-bridge | 3310 | HTTP + NATS | Universal tool API (96 tools), JWT RS256 auth with kid-based multi-key validation, rate limiting, budget enforcement, circuit breakers, JWKS endpoint, SSE streaming, task negotiation tools (decline/context request), deny-list permission pre-filter (O(1) in-memory tool blocking before DB guardrail queries) |
+| coordinator | -- | NATS only | Smart task routing with weighted scoring and token-based prompt pre-filter (keyword overlap scoring before weighted multi-factor routing), atomic claiming, exponential backoff, dead-letter queue with auto-retry, workflow orchestration with conditional steps, parallel groups, per-step retries, timeouts, and error handlers, LLM-powered sub-task decomposition (configurable, fail-open), agent-to-agent delegation protocol (request/accept/decline/complete lifecycle), automated verification pipeline on task completion (pass/fail/skip), scheduled task promotion (60s polling), task negotiation protocol (decline/redirect/context request with max-decline dead-letter), transcript compaction (auto-compacts agent context at 80% token budget, keeps system prompt + summary + last N messages) |
 | heartbeat | -- | NATS + DB | 5-min sync cycle: Dolt commit, agent metrics, daily summary, stale agent deactivation, KG entity/edge expiry with weight decay, daily budget replenishment, formula registry sync, notification rule evaluation |
 | embedding-worker | -- | NATS + DB | Outbox poll -- Ollama `nomic-embed-text` embeddings -- Qdrant upsert -- LLM entity extraction for knowledge graph, circuit breakers, smart chunk boundaries (heading/code-fence/paragraph-aware splitting) |
 | status-api | 3312 | HTTP | Dashboard API with API key + session auth (RBAC on all mutations), CORS, security headers (HSTS, CSP, X-Frame-Options), SSE stream proxy, control panel endpoints (agent toggle, budget set, task cancel, webhook CRUD, guardrails, DLQ), chat session management, chat attachment retrieval and thumbnails, formula registry CRUD, user management, agent onboarding with JWT generation, verification analytics |
@@ -141,6 +141,7 @@ After startup, you'll have:
 | broodlink-config | `Config` struct loaded from `config.toml` with `BROODLINK_*` env var overrides |
 | broodlink-secrets | `SecretsProvider` trait -- `SopsProvider` (dev) and `InfisicalProvider` (prod) |
 | broodlink-telemetry | OpenTelemetry integration with OTLP export (Jaeger) and W3C trace propagation |
+| broodlink-events | Streaming event protocol: typed SSE/NATS event envelopes (StreamStart, StreamEnd, RouteStart, AgentMatch, TaskDispatched, ToolExecStart, MessageDelta, PermissionDenied, BudgetExhausted), StreamBuilder for ordered emission |
 | broodlink-runtime | Shared utilities: `CircuitBreaker`, `shutdown_signal`, cluster-aware `connect_nats` |
 | broodlink-formulas | Formula TOML parsing, JSONB conversion, `definition_hash`, bidirectional sync helpers |
 | broodlink-fs | File system helpers: tilde expansion, attachment storage and retrieval |
@@ -181,12 +182,12 @@ Measured on Mac Studio — Apple M4 Max, 16 cores (12P + 4E), 128 GB unified mem
 
 | Model | Role | Size | Generation | Accuracy |
 |-------|------|------|------------|----------|
-| qwen3.5:35b | Primary chat | 23 GB | 43 tok/s | 100% (13/13 bench) |
-| qwen3-coder:30b | Code | 18 GB | 72 tok/s | 100% (4/4 bench) |
-| qwen3.5:4b | Fallback/expansion | 3.4 GB | 54 tok/s | 78% (7/9 bench) |
+| gemma4:31b | Primary chat + vision | 19 GB | 40 tok/s | 100% (13/13 bench) |
+| gemma4:26b | Code (MoE) | 17 GB | 65 tok/s | 100% (4/4 bench) |
+| gemma4:e4b | Fallback/expansion/KG | 9.6 GB | 50 tok/s | 85% (8/9 bench) |
 | deepseek-r1:32b | Verifier | 19 GB | 9-22 tok/s | 75% (3/4 bench) |
-| gemma3:27b | Vision | 17 GB | 25 tok/s | — |
 | nomic-embed-text | Embeddings | 274 MB | 13.9 emb/s | — |
+| snowflake-arctic-embed2:568m | Reranker | 1.1 GB | — | — |
 
 ### vs Cloud Models (published benchmarks)
 
@@ -194,8 +195,8 @@ Measured on Mac Studio — Apple M4 Max, 16 cores (12P + 4E), 128 GB unified mem
 |-------|------|-----------|------|-----------|
 | Claude Opus 4.6 | 88.7% | 94.5% | 78.3% | 80%+ |
 | GPT-4o | 87.2% | 90.2% | 76.6% | 33.2% |
-| **qwen3.5:35b (local)** | ~82% | ~85% | ~73% | 76.4% |
-| **qwen3-coder:30b (local)** | — | ~88% | — | ~70% |
+| **gemma4:31b (local)** | ~84% | ~87% | ~75% | — |
+| **gemma4:26b (local)** | — | ~88% | — | — |
 
 Local models achieve ~85-95% of cloud quality at zero cost, zero latency, full privacy.
 
@@ -229,7 +230,6 @@ Download from the [latest release](https://github.com/nevenkordic/broodlink/rele
 - Rust 1.75+ with `cargo-deny`
 - Hugo 0.120+ (extended edition)
 - age + SOPS (secrets management)
-- Podman + podman-compose (Linux/macOS) or Docker Desktop (Windows)
 - Dolt SQL server
 - PostgreSQL 15+
 - NATS 2.10+
@@ -256,7 +256,8 @@ Download from the [latest release](https://github.com/nevenkordic/broodlink/rele
 | `scripts/create-admin.sh` | Create dashboard admin user with bcrypt password |
 | `scripts/start-gateway.sh` | Start a2a-gateway with `.env` sourcing |
 | `scripts/onboard-agent.sh` | Register an agent: generate JWT, insert profile, create system prompt |
-| `scripts/dev.sh` | Start/stop dev stack (Podman containers + services) |
+| `scripts/infra-start.sh` | Start/stop/status for native infrastructure (PostgreSQL, NATS, Dolt, Qdrant, Ollama, Jaeger) via brew services |
+| `scripts/dev.sh` | Start/stop dev stack (native infrastructure + services + Hugo) |
 | `scripts/launchagents.sh` | Install/manage macOS LaunchAgents for all services |
 | `scripts/generate-tls.sh` | Generate self-signed CA + server certificates for TLS |
 
@@ -266,6 +267,7 @@ Download from the [latest release](https://github.com/nevenkordic/broodlink/rele
 broodlink/
 ├── crates/
 │   ├── broodlink-config/         # Configuration loading + validation
+│   ├── broodlink-events/         # Streaming event protocol (SSE/NATS typed envelopes)
 │   ├── broodlink-secrets/        # SecretsProvider trait + implementations
 │   ├── broodlink-telemetry/      # OpenTelemetry + OTLP export
 │   ├── broodlink-runtime/        # CircuitBreaker, shutdown_signal, connect_nats
@@ -329,8 +331,8 @@ broodlink/
 ├── .secrets/                     # Encrypted secrets (age + SOPS)
 ├── config.toml                   # Application configuration
 ├── deny.toml                     # cargo-deny license/ban rules
-├── podman-compose.yaml           # Dev container orchestration
-└── podman-compose.prod.yaml      # Prod: 3-node NATS, PG replicas, TLS
+├── podman-compose.yaml           # Container orchestration (optional, dev only)
+└── podman-compose.prod.yaml      # Prod containers: 3-node NATS, PG replicas, TLS
 ```
 
 ## Beads Workflow Formulas

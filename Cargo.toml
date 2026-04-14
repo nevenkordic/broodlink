@@ -7,6 +7,7 @@ members = [
   "crates/broodlink-runtime",
   "crates/broodlink-formulas",
   "crates/broodlink-fs",
+  "crates/broodlink-events",
   "rust/beads-bridge",
   "rust/coordinator",
   "rust/heartbeat",

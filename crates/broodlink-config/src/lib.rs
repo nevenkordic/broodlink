@@ -637,7 +637,7 @@ fn default_kg_enabled() -> bool {
 }
 
 fn default_kg_extraction_model() -> String {
-    "qwen3:1.7b".to_string()
+    "gemma4:e4b".to_string()
 }
 
 fn default_kg_entity_similarity_threshold() -> f64 {
@@ -826,7 +826,7 @@ impl Default for DecompositionConfig {
 }
 
 fn default_decompose_model() -> String {
-    "qwen3.5:4b".to_string()
+    "gemma4:e4b".to_string()
 }
 
 fn default_decompose_min_complexity() -> usize {
@@ -1135,7 +1135,7 @@ fn default_chat_enabled() -> bool {
 }
 
 fn default_chat_model() -> String {
-    "qwen3:32b".to_string()
+    "gemma4:31b".to_string()
 }
 
 fn default_chat_max_tool_rounds() -> u32 {
@@ -1266,7 +1266,7 @@ fn default_query_expansion_enabled() -> bool {
 }
 
 fn default_query_expansion_model() -> String {
-    "qwen3:1.7b".to_string()
+    "gemma4:e4b".to_string()
 }
 
 fn default_query_expansion_timeout_seconds() -> u64 {
@@ -1687,7 +1687,7 @@ api_key_name = "STATUS_API_KEY"
 
         // v0.5.0: Knowledge graph defaults
         assert!(cfg.memory_search.kg_enabled);
-        assert_eq!(cfg.memory_search.kg_extraction_model, "qwen3:1.7b");
+        assert_eq!(cfg.memory_search.kg_extraction_model, "gemma4:e4b");
         assert!((cfg.memory_search.kg_entity_similarity_threshold - 0.85).abs() < f64::EPSILON);
         assert_eq!(cfg.memory_search.kg_max_hops, 3);
         assert_eq!(cfg.memory_search.kg_extraction_timeout_seconds, 120);
