@@ -509,6 +509,7 @@ fn rank_agents(
 /// remaining agents proceed to the full `rank_agents` pipeline.  When *all*
 /// agents would be dropped the original set is returned unchanged so that the
 /// weighted scorer can still pick the best available.
+#[allow(dead_code)]
 fn token_prefilter(
     agents: Vec<EligibleAgent>,
     task_title: Option<&str>,
@@ -604,6 +605,7 @@ fn token_prefilter(
 /// Tokenize text into lowercase alphanumeric tokens, splitting on whitespace,
 /// hyphens, underscores, dots, and slashes.  Strips tokens shorter than 2 chars
 /// and common stop words.
+#[allow(dead_code)]
 fn tokenize_text(text: &str) -> Vec<String> {
     const STOP_WORDS: &[&str] = &[
         "the", "and", "for", "with", "this", "that", "from", "into", "all", "are", "was", "has",

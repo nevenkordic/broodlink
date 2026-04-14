@@ -25,6 +25,15 @@ ignore = [
   "RUSTSEC-2023-0071",
   # proc-macro-error unmaintained — transitive dep from rust-embed, no upgrade path yet
   "RUSTSEC-2024-0370",
+  # AWS-LC advisories — transitive deps from rustls/tokio-rustls, awaiting upstream patch
+  "RUSTSEC-2026-0044",
+  "RUSTSEC-2026-0045",
+  "RUSTSEC-2026-0046",
+  "RUSTSEC-2026-0047",
+  "RUSTSEC-2026-0048",
+  "RUSTSEC-2026-0049",
+  # rand unsoundness with custom logger — not applicable (no custom logger)
+  "RUSTSEC-2026-0097",
 ]
 
 [bans]
