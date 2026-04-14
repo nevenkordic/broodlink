@@ -250,8 +250,9 @@ pub async fn recommended_models(
         RecommendedModel {
             name: "gemma4:e4b".to_string(),
             size: "3.3 GB".to_string(),
-            description: "General-purpose agent — fast, efficient, native tool calling, 256K context"
-                .to_string(),
+            description:
+                "General-purpose agent — fast, efficient, native tool calling, 256K context"
+                    .to_string(),
             role: "general".to_string(),
             required: false,
             category: "core".to_string(),
@@ -268,8 +269,9 @@ pub async fn recommended_models(
         RecommendedModel {
             name: "gemma4:31b".to_string(),
             size: "20 GB".to_string(),
-            description: "Primary agent model — top-tier reasoning, agentic workflows, native tool calling"
-                .to_string(),
+            description:
+                "Primary agent model — top-tier reasoning, agentic workflows, native tool calling"
+                    .to_string(),
             role: "general".to_string(),
             required: false,
             category: "advanced".to_string(),

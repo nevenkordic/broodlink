@@ -695,6 +695,8 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
         });
     }
 
+    let tool_deny_list = ToolDenyList::from_config(&config);
+
     Ok(AppState {
         dolt,
         pg,
@@ -711,6 +713,7 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
         jwt_decoding_keys,
         jwt_validation,
         sse_connections: RwLock::new(HashMap::new()),
+        tool_deny_list,
     })
 }
 

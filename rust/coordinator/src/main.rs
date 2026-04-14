@@ -534,7 +534,8 @@ fn token_prefilter(
         return agents;
     }
 
-    let query_set: std::collections::HashSet<&str> = query_tokens.iter().map(|s| s.as_str()).collect();
+    let query_set: std::collections::HashSet<&str> =
+        query_tokens.iter().map(|s| s.as_str()).collect();
 
     let mut scored: Vec<(EligibleAgent, usize)> = agents
         .into_iter()
@@ -546,7 +547,10 @@ fn token_prefilter(
                 if let Some(obj) = caps.as_object() {
                     for key in obj.keys() {
                         let key_tokens = tokenize_text(key);
-                        overlap += key_tokens.iter().filter(|t| query_set.contains(t.as_str())).count();
+                        overlap += key_tokens
+                            .iter()
+                            .filter(|t| query_set.contains(t.as_str()))
+                            .count();
                     }
                 }
             }
@@ -555,11 +559,17 @@ fn token_prefilter(
             if let Some(cfg) = config_agents.get(&agent.agent_id) {
                 for pf in &cfg.preferred_formulas {
                     let pf_tokens = tokenize_text(pf);
-                    overlap += pf_tokens.iter().filter(|t| query_set.contains(t.as_str())).count();
+                    overlap += pf_tokens
+                        .iter()
+                        .filter(|t| query_set.contains(t.as_str()))
+                        .count();
                 }
                 for skill in &cfg.skills {
                     let skill_tokens = tokenize_text(skill);
-                    overlap += skill_tokens.iter().filter(|t| query_set.contains(t.as_str())).count();
+                    overlap += skill_tokens
+                        .iter()
+                        .filter(|t| query_set.contains(t.as_str()))
+                        .count();
                 }
                 // Model domains also count as matching tokens
                 for domain in &cfg.model_domains {
@@ -596,8 +606,8 @@ fn token_prefilter(
 /// and common stop words.
 fn tokenize_text(text: &str) -> Vec<String> {
     const STOP_WORDS: &[&str] = &[
-        "the", "and", "for", "with", "this", "that", "from", "into", "all", "are",
-        "was", "has", "have", "not", "but", "can", "will", "should", "would",
+        "the", "and", "for", "with", "this", "that", "from", "into", "all", "are", "was", "has",
+        "have", "not", "but", "can", "will", "should", "would",
     ];
 
     text.to_lowercase()

@@ -137,12 +137,36 @@ impl BootstrapGraph {
     pub fn default_pipeline() -> Self {
         let mut graph = Self::new();
 
-        graph.add_stage(StageId::Prefetch, vec![], "Pre-flight checks: platform, environment");
-        graph.add_stage(StageId::Config, vec![StageId::Prefetch], "Load and validate configuration");
-        graph.add_stage(StageId::Dependencies, vec![StageId::Config], "Ensure external dependencies are running");
-        graph.add_stage(StageId::Databases, vec![StageId::Dependencies], "Initialize databases and run migrations");
-        graph.add_stage(StageId::Services, vec![StageId::Databases], "Start Broodlink backend services");
-        graph.add_stage(StageId::DeferredInit, vec![StageId::Services], "Trust-gated deferred initialization");
+        graph.add_stage(
+            StageId::Prefetch,
+            vec![],
+            "Pre-flight checks: platform, environment",
+        );
+        graph.add_stage(
+            StageId::Config,
+            vec![StageId::Prefetch],
+            "Load and validate configuration",
+        );
+        graph.add_stage(
+            StageId::Dependencies,
+            vec![StageId::Config],
+            "Ensure external dependencies are running",
+        );
+        graph.add_stage(
+            StageId::Databases,
+            vec![StageId::Dependencies],
+            "Initialize databases and run migrations",
+        );
+        graph.add_stage(
+            StageId::Services,
+            vec![StageId::Databases],
+            "Start Broodlink backend services",
+        );
+        graph.add_stage(
+            StageId::DeferredInit,
+            vec![StageId::Services],
+            "Trust-gated deferred initialization",
+        );
         graph.add_stage(StageId::Ready, vec![StageId::DeferredInit], "System ready");
 
         graph
@@ -170,7 +194,8 @@ impl BootstrapGraph {
         description: impl Into<String>,
     ) {
         // Find the target stage's dependencies and use them as our deps
-        let deps = self.stages
+        let deps = self
+            .stages
             .iter()
             .find(|s| &s.id == before)
             .map(|s| s.depends_on.clone())
@@ -210,9 +235,7 @@ impl BootstrapGraph {
                 let dep_record = self.records.iter().find(|r| &r.id == dep);
                 match dep_record {
                     Some(r) if r.result.is_failed() => {
-                        let result = StageResult::Skipped(format!(
-                            "dependency '{}' failed", dep
-                        ));
+                        let result = StageResult::Skipped(format!("dependency '{}' failed", dep));
                         self.records.push(StageRecord {
                             id: stage_id.clone(),
                             result,
@@ -372,7 +395,10 @@ mod tests {
         assert!(prefetch_pos < config_pos);
         // Services must come before DeferredInit
         let services_pos = order.iter().position(|s| *s == StageId::Services).unwrap();
-        let deferred_pos = order.iter().position(|s| *s == StageId::DeferredInit).unwrap();
+        let deferred_pos = order
+            .iter()
+            .position(|s| *s == StageId::DeferredInit)
+            .unwrap();
         assert!(services_pos < deferred_pos);
     }
 
@@ -388,9 +414,7 @@ mod tests {
     #[test]
     fn failed_stage_stops_pipeline() {
         let mut graph = BootstrapGraph::default_pipeline();
-        graph.on_stage(StageId::Dependencies, |_| {
-            Err("NATS not found".to_string())
-        });
+        graph.on_stage(StageId::Dependencies, |_| Err("NATS not found".to_string()));
         let result = graph.run();
         assert!(result.is_err());
     }
@@ -404,7 +428,10 @@ mod tests {
             "Generate TLS certificates",
         );
         let order = graph.topo_sort().unwrap();
-        let tls_pos = order.iter().position(|s| *s == StageId::Custom("tls_setup".into())).unwrap();
+        let tls_pos = order
+            .iter()
+            .position(|s| *s == StageId::Custom("tls_setup".into()))
+            .unwrap();
         let services_pos = order.iter().position(|s| *s == StageId::Services).unwrap();
         assert!(tls_pos < services_pos);
     }

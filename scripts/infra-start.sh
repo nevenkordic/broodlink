@@ -8,6 +8,7 @@
 set -euo pipefail
 
 BROOD_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+export BROOD_DIR
 INFRA_DIR="${HOME}/.broodlink/infra"
 LOG_DIR="/tmp/broodlink"
 
@@ -16,7 +17,7 @@ mkdir -p "$INFRA_DIR" "$LOG_DIR"
 # ── Dolt setup ───────────────────────────────────────────────────
 DOLT_DATA="${INFRA_DIR}/dolt-data"
 DOLT_PORT=3307
-DOLT_PASSWORD="${BROODLINK_DOLT_PASSWORD:-changeme}"
+export DOLT_PASSWORD="${BROODLINK_DOLT_PASSWORD:-changeme}"
 
 # ── Qdrant setup ─────────────────────────────────────────────────
 QDRANT_DATA="${INFRA_DIR}/qdrant-storage"
@@ -24,7 +25,7 @@ QDRANT_PORT=6333
 
 # ── Jaeger ───────────────────────────────────────────────────────
 JAEGER_PORT=16686
-OTLP_PORT=4317
+export OTLP_PORT=4317
 
 # ── Functions ────────────────────────────────────────────────────
 

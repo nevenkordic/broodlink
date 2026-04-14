@@ -55,7 +55,12 @@ pub struct StreamEvent {
 impl StreamEvent {
     /// Create a new event in the given stream with an auto-generated id and
     /// the current UTC timestamp.
-    pub fn new(stream_id: impl Into<String>, sequence: u64, source: EventSource, kind: EventKind) -> Self {
+    pub fn new(
+        stream_id: impl Into<String>,
+        sequence: u64,
+        source: EventSource,
+        kind: EventKind,
+    ) -> Self {
         Self {
             event_id: Uuid::new_v4(),
             stream_id: stream_id.into(),
