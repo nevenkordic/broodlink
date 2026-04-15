@@ -365,14 +365,15 @@ Broodlink applies defence-in-depth across all services:
 
 | Layer | Mechanism |
 |-------|-----------|
-| **Authentication** | JWT RS256 (beads-bridge, MCP), API key + session tokens (status-api), Bearer token (a2a-gateway) |
-| **Authorization** | RBAC (viewer/operator/admin) enforced on every status-api mutation endpoint via `require_role()` |
-| **Transport** | HSTS, CSP `default-src 'self'`, X-Frame-Options DENY, X-Content-Type-Options nosniff on all HTTP services |
-| **Input validation** | 10 MiB body limits, query LIMIT clamping (1–1000), anchored regex, path traversal prevention, webhook SSRF blocking |
-| **Secrets** | SOPS/age encryption, constant-time API key comparison, bcrypt passwords (cost 12), 12-char minimum policy |
+| **Authentication** | JWT RS256 with algorithm validation (beads-bridge, MCP), API key + 256-bit CSPRNG session tokens (status-api), Bearer token (a2a-gateway), NATS token auth on all services |
+| **Authorization** | RBAC (viewer/operator/admin) enforced on every status-api mutation endpoint via `require_role()`, Ollama proxy auth gate |
+| **Transport** | HSTS, CSP `default-src 'self'`, X-Frame-Options DENY, X-Content-Type-Options nosniff on all HTTP services, TLS enforcement (fatal in non-dev), all services bound to 127.0.0.1 |
+| **Input validation** | 10 MiB body limits, query LIMIT clamping (1–1000), anchored regex, path traversal prevention (canonicalize + component check), webhook SSRF blocking, shell command allowlist (~50 safe commands) with metacharacter rejection |
+| **Secrets** | SOPS/age encryption, constant-time API key comparison, bcrypt passwords (cost 12), 12-char minimum policy, no default passwords (fail-fast on missing secrets), runtime API key injection (no baked secrets in static assets), HMAC-SHA256 webhook payload signing |
 | **Resilience** | Fail-closed guardrails, fail-closed condition evaluation, circuit breakers, rate limiting, SSE stream caps (100 max, 1h TTL) |
+| **Network** | Explicit CORS origin allowlist, parameterized SQL queries throughout, sanitized error responses (no internal details leaked to clients) |
 | **Container** | `read_only: true`, `no-new-privileges`, dropped capabilities in production compose |
-| **CI** | `cargo-deny` license and advisory audit |
+| **CI** | `cargo-deny` license and advisory audit, `cargo fmt` enforcement |
 
 ## External Integrations
 

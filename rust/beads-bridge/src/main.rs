@@ -1370,7 +1370,10 @@ async fn auth_middleware(
         // Belt-and-suspenders: reject tokens with unexpected algorithm in header.
         if let Ok(header) = jsonwebtoken::decode_header(token) {
             if header.alg != jsonwebtoken::Algorithm::RS256 {
-                let msg = format!("rejected token with algorithm {:?} (expected RS256)", header.alg);
+                let msg = format!(
+                    "rejected token with algorithm {:?} (expected RS256)",
+                    header.alg
+                );
                 log_auth_failure(&state.pg, &msg).await;
                 return Err(BroodlinkError::Auth(msg));
             }

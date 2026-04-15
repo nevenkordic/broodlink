@@ -9,7 +9,7 @@ theme            = "broodlink-status"
   # statusApiKey = ""
   refreshInterval = 10000
   company         = "Broodlink"
-  version         = "0.12.4"
+  version         = "0.12.5"
 
 [build]
   [build.environment]

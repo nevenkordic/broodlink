@@ -5214,16 +5214,63 @@ fn validate_shell_command(
 ) -> Result<(), String> {
     /// Commands considered safe for chat tool execution.
     const ALLOWED_BINS: &[&str] = &[
-        "ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "tree", "file", "du", "df",
-        "stat", "echo", "printf", "date", "env", "pwd", "whoami", "uname",
-        "git", "cargo", "npm", "npx", "node", "python3", "python", "pip", "ruby", "go",
-        "rustc", "rustfmt", "clippy-driver",
-        "make", "cmake", "just",
-        "jq", "yq", "sed", "awk", "sort", "uniq", "cut", "tr", "diff", "patch",
-        "curl", "wget",                                // network (read-only intent)
-        "tar", "zip", "unzip", "gzip", "gunzip",       // archive
-        "dolt", "psql", "mysql",                        // DB CLIs
-        "hugo",                                         // static site
+        "ls",
+        "cat",
+        "head",
+        "tail",
+        "wc",
+        "grep",
+        "rg",
+        "find",
+        "tree",
+        "file",
+        "du",
+        "df",
+        "stat",
+        "echo",
+        "printf",
+        "date",
+        "env",
+        "pwd",
+        "whoami",
+        "uname",
+        "git",
+        "cargo",
+        "npm",
+        "npx",
+        "node",
+        "python3",
+        "python",
+        "pip",
+        "ruby",
+        "go",
+        "rustc",
+        "rustfmt",
+        "clippy-driver",
+        "make",
+        "cmake",
+        "just",
+        "jq",
+        "yq",
+        "sed",
+        "awk",
+        "sort",
+        "uniq",
+        "cut",
+        "tr",
+        "diff",
+        "patch",
+        "curl",
+        "wget",    // network (read-only intent)
+        "tar",
+        "zip",
+        "unzip",
+        "gzip",
+        "gunzip",  // archive
+        "dolt",
+        "psql",
+        "mysql",   // DB CLIs
+        "hugo",    // static site
     ];
 
     let trimmed = command.trim();
@@ -6936,44 +6983,44 @@ async fn call_ollama_chat(
                             } else if let Err(reason) = validate_shell_command(&command, tool_cfg) {
                                 format!("Error: {reason}")
                             } else {
-                                    // Resolve working directory
-                                    let dir = if working_dir.is_empty() {
-                                        tool_cfg
-                                            .allowed_command_dirs
-                                            .first()
-                                            .cloned()
-                                            .unwrap_or_else(|| ".".to_string())
-                                    } else {
-                                        working_dir.clone()
-                                    };
-                                    let dir_path = std::path::Path::new(&dir);
+                                // Resolve working directory
+                                let dir = if working_dir.is_empty() {
+                                    tool_cfg
+                                        .allowed_command_dirs
+                                        .first()
+                                        .cloned()
+                                        .unwrap_or_else(|| ".".to_string())
+                                } else {
+                                    working_dir.clone()
+                                };
+                                let dir_path = std::path::Path::new(&dir);
 
-                                    // Validate working dir is within allowed dirs
-                                    let dir_canonical =
-                                        std::fs::canonicalize(dir_path).unwrap_or_default();
-                                    let unrestricted = is_unrestricted_code_mode(state).await;
-                                    let allowed = unrestricted
-                                        || tool_cfg.allowed_command_dirs.iter().any(|d| {
-                                            let Ok(allowed_canon) = std::fs::canonicalize(d) else {
-                                                return false;
-                                            };
-                                            dir_canonical.starts_with(&allowed_canon)
-                                        });
-                                    if !allowed {
-                                        format!(
-                                            "Access denied: {} is not within allowed command directories.",
-                                            dir
-                                        )
-                                    } else {
-                                        request_command_approval(
-                                            state,
-                                            params.chat_ctx.as_ref(),
-                                            &command,
-                                            &dir_canonical,
-                                            timeout_secs,
-                                        )
-                                        .await
-                                    }
+                                // Validate working dir is within allowed dirs
+                                let dir_canonical =
+                                    std::fs::canonicalize(dir_path).unwrap_or_default();
+                                let unrestricted = is_unrestricted_code_mode(state).await;
+                                let allowed = unrestricted
+                                    || tool_cfg.allowed_command_dirs.iter().any(|d| {
+                                        let Ok(allowed_canon) = std::fs::canonicalize(d) else {
+                                            return false;
+                                        };
+                                        dir_canonical.starts_with(&allowed_canon)
+                                    });
+                                if !allowed {
+                                    format!(
+                                        "Access denied: {} is not within allowed command directories.",
+                                        dir
+                                    )
+                                } else {
+                                    request_command_approval(
+                                        state,
+                                        params.chat_ctx.as_ref(),
+                                        &command,
+                                        &dir_canonical,
+                                        timeout_secs,
+                                    )
+                                    .await
+                                }
                             }
                         }
                         "fetch_webpage" => {

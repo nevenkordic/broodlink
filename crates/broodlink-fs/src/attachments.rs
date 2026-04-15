@@ -54,6 +54,14 @@ pub fn store_attachment(
 
 /// Read attachment bytes from disk.
 pub fn read_attachment(attachments_dir: &str, relative_path: &str) -> Result<Vec<u8>, String> {
+    // Layer 1: reject any path containing ".." components (works on non-existent paths).
+    let rel = Path::new(relative_path);
+    for component in rel.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err("path traversal not allowed".to_string());
+        }
+    }
+
     let dir = crate::expand_tilde(attachments_dir);
     let base = PathBuf::from(&dir)
         .canonicalize()
@@ -63,7 +71,7 @@ pub fn read_attachment(attachments_dir: &str, relative_path: &str) -> Result<Vec
         .canonicalize()
         .map_err(|e| format!("invalid attachment path: {e}"))?;
 
-    // Ensure the resolved path stays within the attachments directory.
+    // Layer 2: symlink protection — resolved path must stay within base.
     if !full.starts_with(&base) {
         return Err("path traversal not allowed".to_string());
     }

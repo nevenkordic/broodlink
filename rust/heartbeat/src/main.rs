@@ -509,7 +509,13 @@ async fn run_cycle(state: &AppState) -> Result<(), BroodlinkError> {
     // 5i. Outbound webhook notifications
     // -----------------------------------------------------------------------
     if state.config.webhooks.enabled {
-        if let Err(e) = deliver_outbound_notifications(&state.dolt, &state.pg, &state.config, &state.webhook_signing_key).await
+        if let Err(e) = deliver_outbound_notifications(
+            &state.dolt,
+            &state.pg,
+            &state.config,
+            &state.webhook_signing_key,
+        )
+        .await
         {
             warn!(error = %e, "outbound webhook delivery failed");
         }
@@ -1607,15 +1613,11 @@ async fn deliver_outbound_notifications(
                 use hmac::{Hmac, Mac};
                 use sha2::Sha256;
                 type HmacSha256 = Hmac<Sha256>;
-                let mut mac =
-                    HmacSha256::new_from_slice(signing_key.as_bytes()).expect("HMAC key");
+                let mut mac = HmacSha256::new_from_slice(signing_key.as_bytes()).expect("HMAC key");
                 mac.update(&payload_bytes);
                 let sig = mac.finalize().into_bytes();
                 let hex_sig: String = sig.iter().map(|b| format!("{b:02x}")).collect();
-                builder = builder.header(
-                    "X-Broodlink-Signature",
-                    format!("sha256={hex_sig}"),
-                );
+                builder = builder.header("X-Broodlink-Signature", format!("sha256={hex_sig}"));
             }
 
             let result = builder.body(payload_bytes).send().await;

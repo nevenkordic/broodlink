@@ -19,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version     = "0.12.4"
+version     = "0.12.5"
 edition     = "2021"
 authors     = ["Neven Kordic <neven@broodlink.ai>"]
 license     = "AGPL-3.0-or-later"

@@ -5,6 +5,51 @@ All notable changes to Broodlink are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.12.5] - 2026-04-15
+
+### Security
+
+- **SQL Injection Prevention**: Replaced `format!` string interpolation with
+  parameterized `sqlx::query().bind()` in heartbeat stale-agent deactivation
+  query.
+- **Network Binding Hardening**: Changed all HTTP services (beads-bridge,
+  status-api, a2a-gateway, broodlink) from `0.0.0.0` to `127.0.0.1`. Services
+  now only accept connections from localhost; use a reverse proxy for external
+  access.
+- **NATS Token Authentication**: All services now resolve
+  `BROODLINK_NATS_TOKEN` from SOPS secrets and pass it via
+  `ConnectOptions::with_token()`. Added `credentials_key` field to
+  `[nats]` config section.
+- **CORS Lockdown**: Replaced `CorsLayer::permissive()` on the broodlink
+  binary with explicit origin allowlist (`localhost:1313`, `localhost:3300`),
+  restricted methods (GET, POST), and named headers only.
+- **Ollama Proxy Auth Gate**: The `/ollama/*` reverse proxy now requires either
+  a valid API key or session token. Previously unauthenticated.
+- **Webhook HMAC-SHA256 Signing**: Heartbeat webhook delivery now signs
+  payloads with `X-Broodlink-Signature: sha256=<hex>` using
+  `BROODLINK_WEBHOOK_SIGNING_KEY` from secrets.
+- **CSPRNG Session Tokens**: Status-api session tokens upgraded from UUID v4
+  (128-bit) to 256-bit cryptographically random hex strings via
+  `rand::thread_rng().gen::<[u8; 32]>()`.
+- **JWT Algorithm Validation**: beads-bridge now rejects tokens that don't use
+  RS256 before attempting decode, preventing algorithm confusion attacks.
+- **Shell Command Allowlist**: a2a-gateway `validate_shell_command()` enforces
+  a three-layer defence: reject shell metacharacters, allowlist ~50 safe
+  commands, legacy blocklist as fallback.
+- **TLS Enforcement**: All services now `process::exit(1)` when TLS is
+  disabled in non-dev profiles (previously only warned).
+- **Default Password Elimination**: Removed all `changeme` fallback passwords
+  from docker-compose, podman-compose, and shell scripts. Container env vars
+  now use `${VAR:?Set VAR}` syntax to fail fast on missing secrets.
+  `secrets-init.sh` generates random passwords via `openssl rand`.
+- **Path Traversal Prevention**: `broodlink-fs` attachment resolution now uses
+  `canonicalize()` + `starts_with()` instead of string-based `..` detection.
+- **Error Message Sanitization**: Client-facing error responses no longer leak
+  internal details (database errors, file paths, stack traces).
+- **API Key Removal from Static Site**: Stripped `statusApiKey` from Hugo
+  config and HTML meta tags. Dashboard API key is now injected at runtime via
+  `rust-embed` HTML rewriting.
+
 ## [0.12.3] - 2026-04-14
 
 ### Changed
