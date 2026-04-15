@@ -5261,7 +5261,7 @@ fn validate_shell_command(
         "diff",
         "patch",
         "curl",
-        "wget",    // network (read-only intent)
+        "wget", // network (read-only intent)
         "tar",
         "zip",
         "unzip",
