@@ -145,6 +145,9 @@ struct AppState {
     nats: async_nats::Client,
     config: Arc<Config>,
     start_time: Instant,
+    /// HMAC-SHA256 key for signing outbound webhook payloads.
+    /// Empty string disables signing (dev-only).
+    webhook_signing_key: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -243,8 +246,19 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
         .await?;
     info!("postgres pool connected");
 
-    // NATS client (cluster-aware via broodlink-runtime)
-    let nats = broodlink_runtime::connect_nats(&config.nats).await?;
+    // NATS client (cluster-aware via broodlink-runtime, with token auth)
+    let nats_token = if config.nats.credentials_key.is_empty() {
+        None
+    } else {
+        Some(secrets.get(&config.nats.credentials_key).await?)
+    };
+    let nats = broodlink_runtime::connect_nats(&config.nats, nats_token.as_deref()).await?;
+
+    // Webhook signing key (optional — empty disables HMAC signing)
+    let webhook_signing_key = secrets
+        .get("BROODLINK_WEBHOOK_SIGNING_KEY")
+        .await
+        .unwrap_or_default();
 
     Ok(AppState {
         dolt,
@@ -252,6 +266,7 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
         nats,
         config,
         start_time: Instant::now(),
+        webhook_signing_key,
     })
 }
 
@@ -494,7 +509,7 @@ async fn run_cycle(state: &AppState) -> Result<(), BroodlinkError> {
     // 5i. Outbound webhook notifications
     // -----------------------------------------------------------------------
     if state.config.webhooks.enabled {
-        if let Err(e) = deliver_outbound_notifications(&state.dolt, &state.pg, &state.config).await
+        if let Err(e) = deliver_outbound_notifications(&state.dolt, &state.pg, &state.config, &state.webhook_signing_key).await
         {
             warn!(error = %e, "outbound webhook delivery failed");
         }
@@ -893,13 +908,17 @@ async fn deactivate_stale_agents(
     dolt: &MySqlPool,
     stale_minutes: u32,
 ) -> Result<u64, BroodlinkError> {
-    let result = sqlx::query(&format!(
+    // Compute the cutoff in Rust and bind it — never interpolate into SQL.
+    #[allow(deprecated)] // chrono::Duration::minutes — works across all 0.4.x
+    let cutoff = Utc::now() - chrono::Duration::minutes(i64::from(stale_minutes));
+    let result = sqlx::query(
         "UPDATE agent_profiles
              SET active = false
              WHERE active = true
                AND last_seen IS NOT NULL
-               AND last_seen < NOW() - INTERVAL {stale_minutes} MINUTE"
-    ))
+               AND last_seen < ?",
+    )
+    .bind(cutoff)
     .execute(dolt)
     .await?;
 
@@ -1407,6 +1426,7 @@ async fn deliver_outbound_notifications(
     dolt: &MySqlPool,
     pg: &PgPool,
     config: &Config,
+    signing_key: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Fetch active webhook endpoints with their subscribed events
     let endpoints: Vec<(String, String, Option<String>, serde_json::Value)> = sqlx::query_as(
@@ -1577,12 +1597,28 @@ async fn deliver_outbound_notifications(
                 None => continue,
             };
 
-            let result = http_client
+            // Sign payload with HMAC-SHA256 if a signing key is configured.
+            let payload_bytes = serde_json::to_vec(payload).unwrap_or_default();
+            let mut builder = http_client
                 .post(url)
-                .header("Content-Type", "application/json")
-                .json(payload)
-                .send()
-                .await;
+                .header("Content-Type", "application/json");
+
+            if !signing_key.is_empty() {
+                use hmac::{Hmac, Mac};
+                use sha2::Sha256;
+                type HmacSha256 = Hmac<Sha256>;
+                let mut mac =
+                    HmacSha256::new_from_slice(signing_key.as_bytes()).expect("HMAC key");
+                mac.update(&payload_bytes);
+                let sig = mac.finalize().into_bytes();
+                let hex_sig: String = sig.iter().map(|b| format!("{b:02x}")).collect();
+                builder = builder.header(
+                    "X-Broodlink-Signature",
+                    format!("sha256={hex_sig}"),
+                );
+            }
+
+            let result = builder.body(payload_bytes).send().await;
 
             let (status, error_msg) = match result {
                 Ok(resp) if resp.status().is_success() => ("delivered", None),

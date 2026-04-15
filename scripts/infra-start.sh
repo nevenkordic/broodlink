@@ -17,7 +17,7 @@ mkdir -p "$INFRA_DIR" "$LOG_DIR"
 # ── Dolt setup ───────────────────────────────────────────────────
 DOLT_DATA="${INFRA_DIR}/dolt-data"
 DOLT_PORT=3307
-export DOLT_PASSWORD="${BROODLINK_DOLT_PASSWORD:-changeme}"
+export DOLT_PASSWORD="${BROODLINK_DOLT_PASSWORD:?Set BROODLINK_DOLT_PASSWORD — run scripts/secrets-init.sh}"
 
 # ── Qdrant setup ─────────────────────────────────────────────────
 QDRANT_DATA="${INFRA_DIR}/qdrant-storage"

@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
 }
 
 async fn cmd_start(port: u16) -> Result<()> {
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
 
     // --- Bootstrap graph: formalized startup pipeline ---
     use bootstrap::{BootstrapGraph, StageId, StageResult};
@@ -231,8 +231,20 @@ fn build_router(state: std::sync::Arc<AppState>) -> axum::Router {
         .fallback(dashboard::dynamic_fallback)
         .with_state(state);
 
-    // CORS for local development
-    let cors = tower_http::cors::CorsLayer::permissive();
+    // CORS: only allow same-origin (dashboard is served from the same binary).
+    // In dev mode, also allow localhost:1313 (Hugo dev server).
+    let cors = tower_http::cors::CorsLayer::new()
+        .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderName::from_static("x-broodlink-api-key"),
+            axum::http::HeaderName::from_static("x-broodlink-session"),
+        ])
+        .allow_origin(tower_http::cors::AllowOrigin::list([
+            "http://localhost:1313".parse().unwrap(),
+            "http://localhost:3300".parse().unwrap(),
+        ]));
     app.layer(cors)
 }
 
@@ -285,11 +297,14 @@ async fn proxy_to_status_api(
             )
                 .into_response()
         }
-        Err(e) => (
-            axum::http::StatusCode::BAD_GATEWAY,
-            axum::Json(serde_json::json!({ "error": format!("status-api unreachable: {e}") })),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, "status-api proxy request failed");
+            (
+                axum::http::StatusCode::BAD_GATEWAY,
+                axum::Json(serde_json::json!({ "error": "API service unavailable" })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -371,12 +386,32 @@ async fn load_status_api_config(bl_dir: &std::path::Path) -> (String, String) {
 }
 
 /// Reverse proxy: forward /api/ollama/* to local Ollama for native chat UI.
-/// Streams responses back to the client for real-time token delivery.
+/// Requires a valid status-api key or dashboard session token.
 async fn proxy_to_ollama(
     axum::extract::State(state): axum::extract::State<std::sync::Arc<AppState>>,
     axum::extract::Path(rest): axum::extract::Path<String>,
     req: axum::http::Request<axum::body::Body>,
 ) -> impl IntoResponse {
+    // Auth gate: require API key or valid session token
+    let has_api_key = req
+        .headers()
+        .get("x-broodlink-api-key")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|k| !k.is_empty() && k == state.status_api_key);
+    let has_session = req
+        .headers()
+        .get("x-broodlink-session")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| !s.is_empty());
+
+    if !has_api_key && !has_session {
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({ "error": "authentication required" })),
+        )
+            .into_response();
+    }
+
     let method_str = req.method().as_str().to_string();
     let target = format!("http://localhost:11434/{rest}");
 
@@ -418,11 +453,14 @@ async fn proxy_to_ollama(
             )
                 .into_response()
         }
-        Err(e) => (
-            axum::http::StatusCode::BAD_GATEWAY,
-            axum::Json(serde_json::json!({ "error": format!("Ollama unreachable: {e}") })),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, "Ollama proxy request failed");
+            (
+                axum::http::StatusCode::BAD_GATEWAY,
+                axum::Json(serde_json::json!({ "error": "Ollama service unavailable" })),
+            )
+                .into_response()
+        }
     }
 }
 

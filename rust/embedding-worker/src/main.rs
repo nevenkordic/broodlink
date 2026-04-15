@@ -307,8 +307,13 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
         .await?;
     info!("postgres pool connected");
 
-    // NATS client (cluster-aware via broodlink-runtime)
-    let nats = broodlink_runtime::connect_nats(&config.nats).await?;
+    // NATS client (cluster-aware via broodlink-runtime, with token auth)
+    let nats_token = if config.nats.credentials_key.is_empty() {
+        None
+    } else {
+        Some(secrets.get(&config.nats.credentials_key).await?)
+    };
+    let nats = broodlink_runtime::connect_nats(&config.nats, nats_token.as_deref()).await?;
 
     // HTTP client for Ollama and Qdrant (rustls, no default features)
     let http_client = reqwest::Client::builder()

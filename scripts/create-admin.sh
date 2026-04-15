@@ -118,7 +118,11 @@ run_sql() {
   fi
 }
 
-PGPASSWORD=$(decrypt_or_default "BROODLINK_POSTGRES_PASSWORD" "changeme")
+PGPASSWORD=$(decrypt_or_default "BROODLINK_POSTGRES_PASSWORD" "")
+if [[ -z "$PGPASSWORD" ]]; then
+  echo "ERROR: BROODLINK_POSTGRES_PASSWORD not set. Run scripts/secrets-init.sh first." >&2
+  exit 1
+fi
 
 # Ensure pgcrypto extension exists (needed for Postgres-based bcrypt fallback)
 run_sql "CREATE EXTENSION IF NOT EXISTS pgcrypto;" "-q" 2>/dev/null || true

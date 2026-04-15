@@ -34,7 +34,7 @@ pub async fn dynamic_fallback(State(state): State<Arc<AppState>>, uri: Uri) -> R
             || path.starts_with("/img/")
             || path.starts_with("/fonts/")
         {
-            return serve_path(path);
+            return serve_path(path, &state);
         }
         return axum::response::Redirect::temporary("/setup/").into_response();
     }
@@ -44,39 +44,59 @@ pub async fn dynamic_fallback(State(state): State<Arc<AppState>>, uri: Uri) -> R
         return axum::response::Redirect::temporary("/").into_response();
     }
 
-    serve_path(path)
+    serve_path(path, &state)
 }
 
-fn serve_path(path: &str) -> Response {
+fn serve_path(path: &str, state: &AppState) -> Response {
     let path = path.trim_start_matches('/').trim_end_matches('/');
 
     // Try exact path
     if let Some(content) = DashboardAssets::get(path) {
-        return serve_embedded(path, &content);
+        return serve_embedded(path, &content, state);
     }
 
     // Try directory index (e.g. "workflows" -> "workflows/index.html")
     let with_index = format!("{path}/index.html");
     if let Some(content) = DashboardAssets::get(&with_index) {
-        return serve_embedded(&with_index, &content);
+        return serve_embedded(&with_index, &content, state);
     }
 
     // Try with .html extension (e.g. "about" -> "about.html")
     let with_ext = format!("{path}.html");
     if let Some(content) = DashboardAssets::get(&with_ext) {
-        return serve_embedded(&with_ext, &content);
+        return serve_embedded(&with_ext, &content, state);
     }
 
     // SPA fallback — serve root index
     if let Some(content) = DashboardAssets::get("index.html") {
-        return serve_embedded("index.html", &content);
+        return serve_embedded("index.html", &content, state);
     }
 
     StatusCode::NOT_FOUND.into_response()
 }
 
-fn serve_embedded(path: &str, content: &rust_embed::EmbeddedFile) -> Response {
+fn serve_embedded(path: &str, content: &rust_embed::EmbeddedFile, state: &AppState) -> Response {
     let mime = mime_guess::from_path(path).first_or_octet_stream();
+
+    // For HTML pages, inject runtime config (API key) so we never bake secrets
+    // into the static Hugo build.
+    if path.ends_with(".html") {
+        let html = String::from_utf8_lossy(&content.data);
+        let config_script = format!(
+            r#"<script>window.BroodlinkConfig={{statusApiKey:"{}"}}</script>"#,
+            state.status_api_key.replace('"', r#"\""#),
+        );
+        let injected = html.replacen("</head>", &format!("{config_script}</head>"), 1);
+        return (
+            [
+                (header::CONTENT_TYPE, mime.as_ref().to_string()),
+                (header::CACHE_CONTROL, cache_policy(path)),
+            ],
+            injected,
+        )
+            .into_response();
+    }
+
     (
         [
             (header::CONTENT_TYPE, mime.as_ref().to_string()),

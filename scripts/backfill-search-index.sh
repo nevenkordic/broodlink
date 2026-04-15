@@ -21,7 +21,11 @@ decrypt_or_default() {
   fi
 }
 
-PGPASSWORD=$(decrypt_or_default "BROODLINK_POSTGRES_PASSWORD" "changeme")
+PGPASSWORD=$(decrypt_or_default "BROODLINK_POSTGRES_PASSWORD" "")
+if [[ -z "$PGPASSWORD" ]]; then
+  echo "ERROR: BROODLINK_POSTGRES_PASSWORD not set. Run scripts/secrets-init.sh first." >&2
+  exit 1
+fi
 DOLT_PASSWORD=$(decrypt_or_default "BROODLINK_DOLT_PASSWORD" "")
 
 DOLT_USER="${DOLT_PASSWORD:+broodlink_agent}"

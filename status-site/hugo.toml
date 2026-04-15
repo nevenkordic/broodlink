@@ -5,7 +5,8 @@ theme            = "broodlink-status"
 
 [params]
   statusApiUrl    = "SELF"  # "SELF" = same-origin (binary mode). Override for hugo dev server.
-  statusApiKey    = "dev-api-key"  # must match BROODLINK_STATUS_API_KEY
+  # API key is injected at runtime by dashboard.rs — never bake secrets into static HTML.
+  # statusApiKey = ""
   refreshInterval = 10000
   company         = "Broodlink"
   version         = "0.12.4"

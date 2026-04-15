@@ -164,24 +164,38 @@ pub async fn shutdown_signal() {
 // NATS connection (cluster-aware)
 // ---------------------------------------------------------------------------
 
-/// Connect to NATS, using cluster URLs if configured.
+/// Connect to NATS, using cluster URLs and token auth if configured.
+///
+/// When `nats_token` is `Some`, the connection uses token authentication.
+/// Pass the resolved secret value; leave as `None` for unauthenticated
+/// connections (dev only).
 ///
 /// # Errors
 ///
 /// Returns `async_nats::ConnectError` if the connection fails.
 pub async fn connect_nats(
     config: &broodlink_config::NatsConfig,
+    nats_token: Option<&str>,
 ) -> Result<async_nats::Client, async_nats::ConnectError> {
-    let client = if config.cluster_urls.is_empty() {
-        async_nats::connect(&config.url).await?
+    let mut addrs: Vec<String> = vec![config.url.clone()];
+    addrs.extend(config.cluster_urls.clone());
+
+    let opts = if let Some(token) = nats_token {
+        async_nats::ConnectOptions::with_token(token.to_string())
     } else {
-        let mut addrs: Vec<String> = vec![config.url.clone()];
-        addrs.extend(config.cluster_urls.clone());
-        async_nats::connect(addrs.as_slice()).await?
+        async_nats::ConnectOptions::new()
     };
+
+    let client = if addrs.len() == 1 {
+        opts.connect(&config.url).await?
+    } else {
+        opts.connect(addrs.as_slice()).await?
+    };
+
     info!(
         url = %config.url,
         cluster_size = config.cluster_urls.len(),
+        auth = nats_token.is_some(),
         "nats connected"
     );
     Ok(client)

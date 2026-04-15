@@ -359,7 +359,7 @@ async fn main() {
     let shared = Arc::new(state);
     let app = build_router(Arc::clone(&shared));
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
 
     if shared.config.profile.tls_interservice {
         let tls = &shared.config.tls;
@@ -384,9 +384,10 @@ async fn main() {
         }
     } else {
         if shared.config.broodlink.env != "dev" && shared.config.broodlink.env != "local" {
-            warn!("TLS is disabled in non-dev environment — traffic is unencrypted");
+            error!("TLS is disabled in non-dev environment — refusing to start. Set profile.tls_interservice = true");
+            process::exit(1);
         }
-        info!(addr = %addr, "listening (plaintext)");
+        info!(addr = %addr, "listening (plaintext — dev/local only)");
 
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,
@@ -469,8 +470,18 @@ async fn init_state() -> Result<AppState, StatusApiError> {
     let nats_url = config.nats.url.clone();
     let qdrant_url = config.qdrant.url.clone();
 
-    // NATS client (cluster-aware via broodlink-runtime)
-    let nats = broodlink_runtime::connect_nats(&config.nats)
+    // NATS client (cluster-aware via broodlink-runtime, with token auth)
+    let nats_token = if config.nats.credentials_key.is_empty() {
+        None
+    } else {
+        Some(
+            secrets
+                .get(&config.nats.credentials_key)
+                .await
+                .map_err(|e| StatusApiError::Nats(format!("NATS credentials: {e}")))?,
+        )
+    };
+    let nats = broodlink_runtime::connect_nats(&config.nats, nats_token.as_deref())
         .await
         .map_err(|e| StatusApiError::Nats(e.to_string()))?;
 
@@ -1592,6 +1603,8 @@ async fn handler_health(
     dependencies.insert("postgres".to_string(), pg_status);
 
     // NATS health: attempt a quick connect/flush check
+    // TODO: use the existing state.nats client for health probes once NATS auth is enforced,
+    // instead of opening a new unauthenticated connection.
     let nats_start = Instant::now();
     let nats_status =
         match tokio::time::timeout(Duration::from_secs(3), async_nats::connect(&state.nats_url))
@@ -4432,7 +4445,11 @@ async fn handler_auth_login(
         .await?;
     }
 
-    let session_id = Uuid::new_v4().to_string();
+    // 256-bit CSPRNG session token (hex-encoded = 64 chars)
+    let session_id: String = {
+        let bytes: [u8; 32] = rand::thread_rng().gen();
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    };
     let ttl_hours = i64::from(state.config.dashboard_auth.session_ttl_hours);
 
     sqlx::query(

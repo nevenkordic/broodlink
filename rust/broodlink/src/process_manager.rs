@@ -200,6 +200,9 @@ impl ProcessManager {
             return Ok(());
         }
         tracing::info!("Starting NATS...");
+        // TODO: generate a nats-server.conf with token auth from BROODLINK_NATS_TOKEN
+        // and pass `--config nats-server.conf` instead of bare `--js`.
+        // For now, services authenticate via token if credentials_key is set in config.
         let child = Command::new("nats-server")
             .args(["--js", "-p", "4222"])
             .stdout(Stdio::null())

@@ -7,9 +7,7 @@
   {{ with .Site.Params.statusApiUrl }}
   <meta name="broodlink:statusApiUrl" content="{{ . }}">
   {{ end }}
-  {{ with .Site.Params.statusApiKey }}
-  <meta name="broodlink:statusApiKey" content="{{ . }}">
-  {{ end }}
+  {{/* API key is injected at runtime by dashboard.rs — never bake secrets into static HTML. */}}
   <link rel="icon" href="/img/broodlink-logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/css/style.css">
   {{ block "styles" . }}{{ end }}

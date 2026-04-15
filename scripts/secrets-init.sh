@@ -58,12 +58,19 @@ echo ""
 if [[ -f "$BROOD_DIR/secrets.enc.json" ]]; then
   echo "secrets.enc.json already exists — skipping skeleton."
 else
+  # Generate random secrets — never ship with static defaults
+  GEN_PG_PW=$(openssl rand -base64 24 2>/dev/null || head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 24)
+  GEN_API_KEY=$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | xxd -p)
+  GEN_NATS_TOKEN=$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | xxd -p)
+  GEN_WEBHOOK_KEY=$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | xxd -p)
   cat > "$BROOD_DIR/secrets.skeleton.json" <<SKEL
 {
   "BROODLINK_DOLT_PASSWORD": "",
-  "BROODLINK_POSTGRES_PASSWORD": "changeme",
+  "BROODLINK_POSTGRES_PASSWORD": "$GEN_PG_PW",
   "BROODLINK_QDRANT_API_KEY": "",
-  "BROODLINK_STATUS_API_KEY": "dev-api-key",
+  "BROODLINK_STATUS_API_KEY": "$GEN_API_KEY",
+  "BROODLINK_NATS_TOKEN": "$GEN_NATS_TOKEN",
+  "BROODLINK_WEBHOOK_SIGNING_KEY": "$GEN_WEBHOOK_KEY",
   "BROODLINK_JWT_PUBLIC_KEY": $(printf '%s' "$JWT_PUB" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
 }
 SKEL
@@ -84,13 +91,14 @@ if [[ -f "$BROOD_DIR/secrets.enc.json" ]]; then
   # Extract from encrypted file
   echo "Generating .secrets/env from secrets.enc.json..."
   DOLT_PW=$(sops --decrypt --extract '["BROODLINK_DOLT_PASSWORD"]' "$BROOD_DIR/secrets.enc.json" 2>/dev/null || echo "")
-  PG_PW=$(sops --decrypt --extract '["BROODLINK_POSTGRES_PASSWORD"]' "$BROOD_DIR/secrets.enc.json" 2>/dev/null || echo "changeme")
-  API_KEY=$(sops --decrypt --extract '["BROODLINK_STATUS_API_KEY"]' "$BROOD_DIR/secrets.enc.json" 2>/dev/null || echo "dev-api-key")
+  PG_PW=$(sops --decrypt --extract '["BROODLINK_POSTGRES_PASSWORD"]' "$BROOD_DIR/secrets.enc.json" 2>/dev/null || echo "")
+  API_KEY=$(sops --decrypt --extract '["BROODLINK_STATUS_API_KEY"]' "$BROOD_DIR/secrets.enc.json" 2>/dev/null || echo "")
 else
-  echo "No secrets.enc.json found — generating .secrets/env with dev defaults."
+  echo "No secrets.enc.json found — please encrypt the skeleton first (see above)." >&2
+  echo "Generating .secrets/env with empty placeholders." >&2
   DOLT_PW=""
-  PG_PW="changeme"
-  API_KEY="dev-api-key"
+  PG_PW=""
+  API_KEY=""
 fi
 
 cat > "$BROOD_DIR/.secrets/env" <<EOF

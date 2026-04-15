@@ -470,7 +470,7 @@ async fn main() {
 
     let app = build_router(Arc::clone(&shared));
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], shared.config.beads_bridge.port));
+    let addr = SocketAddr::from(([127, 0, 0, 1], shared.config.beads_bridge.port));
 
     // Conditional TLS binding
     if shared.config.profile.tls_interservice {
@@ -496,9 +496,10 @@ async fn main() {
             });
     } else {
         if shared.config.broodlink.env != "dev" && shared.config.broodlink.env != "local" {
-            warn!("TLS is disabled in non-dev environment — traffic is unencrypted");
+            error!("TLS is disabled in non-dev environment — refusing to start. Set profile.tls_interservice = true");
+            process::exit(1);
         }
-        info!(addr = %addr, "listening (plaintext)");
+        info!(addr = %addr, "listening (plaintext — dev/local only)");
 
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,
@@ -617,8 +618,13 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
         .await?;
     info!("postgres pool connected");
 
-    // NATS client (cluster-aware via broodlink-runtime)
-    let nats = broodlink_runtime::connect_nats(&config.nats).await?;
+    // NATS client (cluster-aware via broodlink-runtime, with token auth)
+    let nats_token = if config.nats.credentials_key.is_empty() {
+        None
+    } else {
+        Some(secrets.get(&config.nats.credentials_key).await?)
+    };
+    let nats = broodlink_runtime::connect_nats(&config.nats, nats_token.as_deref()).await?;
 
     // Rate limiter from config (validate bounds)
     let rpm = config.rate_limits.requests_per_minute_per_agent;
@@ -1361,6 +1367,14 @@ async fn auth_middleware(
 
     // Multi-key validation: try kid-matched key first, then all keys
     let token_data = {
+        // Belt-and-suspenders: reject tokens with unexpected algorithm in header.
+        if let Ok(header) = jsonwebtoken::decode_header(token) {
+            if header.alg != jsonwebtoken::Algorithm::RS256 {
+                let msg = format!("rejected token with algorithm {:?} (expected RS256)", header.alg);
+                log_auth_failure(&state.pg, &msg).await;
+                return Err(BroodlinkError::Auth(msg));
+            }
+        }
         let header_kid = jsonwebtoken::decode_header(token).ok().and_then(|h| h.kid);
 
         if let Some(ref kid) = header_kid {

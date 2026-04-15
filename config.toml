@@ -35,8 +35,9 @@ min_connections = 5
 max_connections = 20
 
 [nats]
-url            = "nats://localhost:4222"
-subject_prefix = "broodlink"
+url             = "nats://localhost:4222"
+subject_prefix  = "broodlink"
+credentials_key = "BROODLINK_NATS_TOKEN"  # SOPS key for NATS auth token
 
 [qdrant]
 url        = "http://localhost:6333"

@@ -166,6 +166,9 @@ pub struct NatsConfig {
     pub subject_prefix: String,
     #[serde(default)]
     pub cluster_urls: Vec<String>,
+    /// SOPS key name that holds the NATS token/password.  Empty = no auth.
+    #[serde(default)]
+    pub credentials_key: String,
 }
 
 #[derive(Deserialize, Clone, Debug)]

@@ -55,9 +55,16 @@ pub fn store_attachment(
 /// Read attachment bytes from disk.
 pub fn read_attachment(attachments_dir: &str, relative_path: &str) -> Result<Vec<u8>, String> {
     let dir = crate::expand_tilde(attachments_dir);
-    let full = PathBuf::from(&dir).join(relative_path);
+    let base = PathBuf::from(&dir)
+        .canonicalize()
+        .map_err(|e| format!("invalid attachments dir: {e}"))?;
+    let full = base
+        .join(relative_path)
+        .canonicalize()
+        .map_err(|e| format!("invalid attachment path: {e}"))?;
 
-    if relative_path.contains("..") {
+    // Ensure the resolved path stays within the attachments directory.
+    if !full.starts_with(&base) {
         return Err("path traversal not allowed".to_string());
     }
 

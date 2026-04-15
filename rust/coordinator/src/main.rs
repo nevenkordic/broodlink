@@ -3818,8 +3818,13 @@ async fn init_state() -> Result<AppState, BroodlinkError> {
         .await?;
     info!("postgres pool connected");
 
-    // NATS client (cluster-aware via broodlink-runtime)
-    let nats = broodlink_runtime::connect_nats(&config.nats).await?;
+    // NATS client (cluster-aware via broodlink-runtime, with token auth)
+    let nats_token = if config.nats.credentials_key.is_empty() {
+        None
+    } else {
+        Some(secrets.get(&config.nats.credentials_key).await?)
+    };
+    let nats = broodlink_runtime::connect_nats(&config.nats, nats_token.as_deref()).await?;
 
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(

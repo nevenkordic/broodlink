@@ -518,7 +518,14 @@ async fn async_main() {
     }
 
     // Connect to NATS for task completion events
-    let nats_client = match broodlink_runtime::connect_nats(&config.nats).await {
+    let nats_token = if config.nats.credentials_key.is_empty() {
+        None
+    } else {
+        secrets.get(&config.nats.credentials_key).await.ok()
+    };
+    let nats_client = match broodlink_runtime::connect_nats(&config.nats, nats_token.as_deref())
+        .await
+    {
         Ok(nc) => {
             info!("connected to NATS");
             Some(nc)
@@ -882,7 +889,7 @@ async fn async_main() {
         .with_state(state);
 
     let port = config.a2a.port;
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
 
     if config.profile.tls_interservice {
         let tls = &config.tls;
@@ -906,9 +913,10 @@ async fn async_main() {
         }
     } else {
         if config.broodlink.env != "dev" && config.broodlink.env != "local" {
-            warn!("TLS is disabled in non-dev environment — traffic is unencrypted");
+            error!("TLS is disabled in non-dev environment — refusing to start. Set profile.tls_interservice = true");
+            process::exit(1);
         }
-        info!(addr = %addr, "A2A Gateway listening (plaintext)");
+        info!(addr = %addr, "A2A Gateway listening (plaintext — dev/local only)");
 
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,
@@ -5191,6 +5199,82 @@ async fn request_command_approval(
     }
 }
 
+/// Validate a shell command against both an allowlist of safe top-level
+/// commands and a blocklist of dangerous patterns.
+///
+/// Defence-in-depth:
+///  1. Extract the first token (the binary name) and reject if it is not in
+///     the allowlist of known-safe commands.
+///  2. Reject shell meta-characters that enable chaining/escaping
+///     (`|`, `$(`, backtick, `&&`, `||`, `;`, `>`, `<`).
+///  3. Fall through to the legacy blocklist substring check.
+fn validate_shell_command(
+    command: &str,
+    cfg: &broodlink_config::ChatToolsConfig,
+) -> Result<(), String> {
+    /// Commands considered safe for chat tool execution.
+    const ALLOWED_BINS: &[&str] = &[
+        "ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "tree", "file", "du", "df",
+        "stat", "echo", "printf", "date", "env", "pwd", "whoami", "uname",
+        "git", "cargo", "npm", "npx", "node", "python3", "python", "pip", "ruby", "go",
+        "rustc", "rustfmt", "clippy-driver",
+        "make", "cmake", "just",
+        "jq", "yq", "sed", "awk", "sort", "uniq", "cut", "tr", "diff", "patch",
+        "curl", "wget",                                // network (read-only intent)
+        "tar", "zip", "unzip", "gzip", "gunzip",       // archive
+        "dolt", "psql", "mysql",                        // DB CLIs
+        "hugo",                                         // static site
+    ];
+
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return Err("command is empty".into());
+    }
+
+    // 1. Reject shell meta-characters that enable chaining / redirection.
+    //    The command runs via `sh -c`, so these allow arbitrary execution.
+    const DANGEROUS_CHARS: &[&str] = &["|", "$(", "`", "&&", "||", ";", ">>", "<<"];
+    // Allow single `>` only at the end (simple redirect), but still block it
+    // to be safe.
+    let cmd_lower = trimmed.to_lowercase();
+    for pattern in DANGEROUS_CHARS {
+        if cmd_lower.contains(pattern) {
+            return Err(format!(
+                "command contains disallowed shell operator '{pattern}'"
+            ));
+        }
+    }
+    // Also block single `>` and `<` for redirect
+    if trimmed.contains('>') || trimmed.contains('<') {
+        return Err("command contains disallowed redirection operator".into());
+    }
+
+    // 2. Extract the first token (binary name) and check allowlist.
+    let first_token = trimmed.split_whitespace().next().unwrap_or("");
+    // Strip any path prefix so `/usr/bin/ls` matches `ls`
+    let bin_name = std::path::Path::new(first_token)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(first_token);
+
+    if !ALLOWED_BINS.contains(&bin_name) {
+        return Err(format!(
+            "command '{bin_name}' is not in the allowlist of permitted commands"
+        ));
+    }
+
+    // 3. Legacy blocklist — defence-in-depth substring check.
+    let blocked = cfg
+        .blocked_commands
+        .iter()
+        .any(|b| cmd_lower.contains(&b.to_lowercase()));
+    if blocked {
+        return Err("this command is blocked for safety reasons".into());
+    }
+
+    Ok(())
+}
+
 /// Execute a shell command with timeout and output capture.
 async fn run_shell_command(
     command: &str,
@@ -6849,16 +6933,9 @@ async fn call_ollama_chat(
 
                             if command.is_empty() {
                                 "Error: command is required.".to_string()
+                            } else if let Err(reason) = validate_shell_command(&command, tool_cfg) {
+                                format!("Error: {reason}")
                             } else {
-                                // Safety: check against blocked commands
-                                let cmd_lower = command.to_lowercase();
-                                let blocked = tool_cfg
-                                    .blocked_commands
-                                    .iter()
-                                    .any(|b| cmd_lower.contains(&b.to_lowercase()));
-                                if blocked {
-                                    "Error: this command is blocked for safety reasons.".to_string()
-                                } else {
                                     // Resolve working directory
                                     let dir = if working_dir.is_empty() {
                                         tool_cfg
@@ -6897,7 +6974,6 @@ async fn call_ollama_chat(
                                         )
                                         .await
                                     }
-                                }
                             }
                         }
                         "fetch_webpage" => {
