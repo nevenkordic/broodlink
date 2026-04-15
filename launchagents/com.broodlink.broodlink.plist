@@ -3,13 +3,16 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.broodlink.beads-bridge</string>
+    <string>com.broodlink.broodlink</string>
     <key>ProgramArguments</key>
     <array>
-        <string>__BROOD_DIR__/target/release/beads-bridge</string>
+        <string>__BROOD_DIR__/target/release/broodlink</string>
+        <string>start</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
+        <key>BROODLINK_DIR</key>
+        <string>__BROOD_DIR__</string>
         <key>BROODLINK_CONFIG</key>
         <string>__BROOD_DIR__/config.toml</string>
         <key>PATH</key>
@@ -17,17 +20,16 @@
     </dict>
     <key>WorkingDirectory</key>
     <string>__BROOD_DIR__</string>
-    <!-- RunAtLoad and KeepAlive are disabled because broodlink's process
-         manager spawns beads-bridge as a child process.  This plist exists
-         only as a fallback for standalone operation (load manually with
-         launchctl bootstrap). -->
     <key>RunAtLoad</key>
-    <false/>
+    <true/>
     <key>KeepAlive</key>
-    <false/>
+    <true/>
     <key>StandardOutPath</key>
-    <string>__LOG_DIR__/beads-bridge.stdout.log</string>
+    <string>__LOG_DIR__/broodlink.stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>__LOG_DIR__/beads-bridge.stderr.log</string>
+    <string>__LOG_DIR__/broodlink.stderr.log</string>
+    <!-- Wait 5 seconds before restarting on crash to avoid tight restart loops -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
 </dict>
 </plist>

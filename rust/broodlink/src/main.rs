@@ -33,8 +33,8 @@ struct Cli {
 enum Commands {
     /// Start all Broodlink services and open the dashboard
     Start {
-        /// Port for the unified web interface
-        #[arg(long, default_value = "3310")]
+        /// Port for the unified web interface (default: 3300, separate from beads-bridge on 3310)
+        #[arg(long, default_value = "3300")]
         port: u16,
     },
     /// Stop a running Broodlink instance
@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    match cli.command.unwrap_or(Commands::Start { port: 3310 }) {
+    match cli.command.unwrap_or(Commands::Start { port: 3300 }) {
         Commands::Start { port } => cmd_start(port).await,
         Commands::Stop => cmd_stop().await,
         Commands::Status => cmd_status().await,
