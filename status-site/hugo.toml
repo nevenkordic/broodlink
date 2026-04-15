@@ -8,7 +8,7 @@ theme            = "broodlink-status"
   statusApiKey    = "dev-api-key"  # must match BROODLINK_STATUS_API_KEY
   refreshInterval = 10000
   company         = "Broodlink"
-  version         = "0.12.2"
+  version         = "0.12.4"
 
 [build]
   [build.environment]

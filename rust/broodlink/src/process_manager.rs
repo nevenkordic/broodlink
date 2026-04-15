@@ -287,7 +287,11 @@ async fn evict_stale_launchd_service(name: &str, port: u16) {
 
     // Fallback: if the port is still occupied, kill the process holding it
     if port > 0 && check_tcp("127.0.0.1", port).await {
-        tracing::info!(service = name, port, "port still occupied — killing process");
+        tracing::info!(
+            service = name,
+            port,
+            "port still occupied — killing process"
+        );
         let _ = std::process::Command::new("lsof")
             .args(["-ti", &format!(":{port}")])
             .output()
@@ -314,7 +318,11 @@ async fn evict_stale_launchd_service(name: &str, port: u16) {
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
-        tracing::warn!(service = name, port, "port still occupied after eviction attempt");
+        tracing::warn!(
+            service = name,
+            port,
+            "port still occupied after eviction attempt"
+        );
     }
 }
 
