@@ -34,6 +34,12 @@ ignore = [
   "RUSTSEC-2026-0049",
   # rand unsoundness with custom logger — not applicable (no custom logger)
   "RUSTSEC-2026-0097",
+  # rustls-webpki URI/wildcard name constraint issues — transitive deps from reqwest 0.11,
+  # async-nats 0.35, and rustls 0.23; pinned by upstream, low exploitability (requires
+  # misissuance after signature verification). Run `cargo update -p rustls-webpki` to fix
+  # the 0.103.x version; 0.101.x and 0.102.x await upstream upgrades.
+  "RUSTSEC-2026-0098",
+  "RUSTSEC-2026-0099",
 ]
 
 [bans]

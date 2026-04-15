@@ -1,8 +1,9 @@
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
 
 permissions:
   contents: write
@@ -11,8 +12,22 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Gate: only run when CI passed on a version tag (not every push to main)
+  gate:
+    name: Release gate
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
+    outputs:
+      tag: ${{ github.event.workflow_run.head_branch }}
+      sha: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - run: echo "CI passed on ${{ github.event.workflow_run.head_branch }} — proceeding with release"
+
   build:
     name: Build (${{ matrix.target }})
+    needs: gate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -37,6 +52,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
 
       - name: Install Hugo (macOS)
         if: runner.os == 'macOS'
@@ -92,7 +109,8 @@ jobs:
       - name: Package (Unix)
         if: matrix.archive == 'tar.gz'
         run: |
-          STAGING="broodlink-${{ github.ref_name }}-${{ matrix.target }}"
+          TAG="${{ needs.gate.outputs.tag }}"
+          STAGING="broodlink-${TAG}-${{ matrix.target }}"
           mkdir -p "$STAGING"
 
           BINS="broodlink beads-bridge coordinator heartbeat embedding-worker status-api mcp-server a2a-gateway"
@@ -108,7 +126,8 @@ jobs:
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          $STAGING = "broodlink-${{ github.ref_name }}-${{ matrix.target }}"
+          $TAG = "${{ needs.gate.outputs.tag }}"
+          $STAGING = "broodlink-${TAG}-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $STAGING
 
           $BINS = @("broodlink", "beads-bridge", "coordinator", "heartbeat", "embedding-worker", "status-api", "mcp-server", "a2a-gateway")
@@ -143,10 +162,12 @@ jobs:
 
   release:
     name: Create Release
-    needs: build
+    needs: [gate, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -157,6 +178,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.gate.outputs.tag }}
           generate_release_notes: true
           files: |
             artifacts/*
