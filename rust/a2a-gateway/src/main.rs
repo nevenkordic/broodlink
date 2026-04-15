@@ -5266,11 +5266,11 @@ fn validate_shell_command(
         "zip",
         "unzip",
         "gzip",
-        "gunzip",  // archive
+        "gunzip", // archive
         "dolt",
         "psql",
-        "mysql",   // DB CLIs
-        "hugo",    // static site
+        "mysql", // DB CLIs
+        "hugo",  // static site
     ];
 
     let trimmed = command.trim();
