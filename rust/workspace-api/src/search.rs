@@ -110,6 +110,11 @@ pub struct SearchBody {
     time_filter: Option<String>,
 }
 
+/// Public helper for other modules (e.g. research): SearXNG results, best-effort.
+pub async fn fetch(query: &str, count: usize) -> Vec<Value> {
+    searxng(query, count, &None).await.unwrap_or_default()
+}
+
 pub async fn search(headers: HeaderMap, Json(b): Json<SearchBody>) -> Json<Value> {
     let _ = headers;
     if b.query.trim().is_empty() {

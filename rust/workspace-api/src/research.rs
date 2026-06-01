@@ -55,22 +55,59 @@ pub async fn start(
 ) -> Result<Json<Value>, WsError> {
     let owner = owner_from(&headers);
     let id = format!("rp-{}", Uuid::new_v4().simple());
-    // The LLM+search loop isn't ported; record the run as errored so the UI
-    // surfaces a clear message rather than spinning forever.
     sqlx::query(
-        "INSERT INTO ws_research (session_id, owner, query, status, result, category, completed_at) \
-         VALUES ($1,$2,$3,'error',$4,$5, now())",
+        "INSERT INTO ws_research (session_id, owner, query, status, category) VALUES ($1,$2,$3,'running',$4)",
     )
     .bind(&id)
     .bind(&owner)
     .bind(&b.query)
-    .bind("Deep Research pipeline (multi-step LLM + web search) is not yet ported.")
     .bind(&b.category)
     .execute(&state.pg)
     .await?;
+
+    // Single-round pipeline: web search → LLM synthesis. (Multi-round
+    // iterative deepening is a future enhancement.)
+    let st = Arc::clone(&state);
+    let (sid, query, o) = (id.clone(), b.query.clone(), owner.clone());
+    tokio::spawn(async move {
+        let sources = crate::search::fetch(&query, 6).await;
+        let mut ctx = String::new();
+        for (i, s) in sources.iter().enumerate() {
+            ctx.push_str(&format!(
+                "[{}] {}\n{}\n{}\n\n",
+                i + 1,
+                s["title"].as_str().unwrap_or(""),
+                s["url"].as_str().unwrap_or(""),
+                s["snippet"].as_str().unwrap_or("")
+            ));
+        }
+        let sys = "You are a research assistant. Write a thorough, well-structured report \
+                   answering the user's query using ONLY the provided sources. Cite sources as [n].";
+        let user = format!("Query: {query}\n\nSources:\n{ctx}");
+        let (status, result) = match crate::chat::complete_text(&st, &o, sys, &user).await {
+            Ok(r) => ("done", r),
+            Err(e) => ("error", format!("research failed: {e}")),
+        };
+        let sources_json = serde_json::to_string(
+            &sources
+                .iter()
+                .map(|s| json!({ "title": s["title"], "url": s["url"], "snippet": s["snippet"] }))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|_| "[]".into());
+        let _ = sqlx::query(
+            "UPDATE ws_research SET status = $2, result = $3, sources = $4, completed_at = now() WHERE session_id = $1",
+        )
+        .bind(&sid)
+        .bind(status)
+        .bind(&result)
+        .bind(&sources_json)
+        .execute(&st.pg)
+        .await;
+    });
+
     Ok(Json(
-        json!({ "session_id": id, "status": "error", "query": b.query,
-        "error": "research pipeline not yet ported" }),
+        json!({ "session_id": id, "status": "running", "query": b.query }),
     ))
 }
 
