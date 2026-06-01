@@ -228,6 +228,21 @@ pub async fn create_session(
     .execute(&state.pg)
     .await?;
 
+    // Fire session.created webhooks (best-effort).
+    {
+        let st = Arc::clone(&state);
+        let (o, sid, n, m) = (owner.clone(), id.clone(), name.clone(), model.clone());
+        tokio::spawn(async move {
+            crate::webhooks::fire(
+                &st,
+                &o,
+                "session.created",
+                json!({ "session_id": sid, "name": n, "model": m }),
+            )
+            .await;
+        });
+    }
+
     Ok(Json(
         json!({ "id": id, "name": name, "model": model, "rag": rag, "archived": false }),
     ))
@@ -1028,6 +1043,31 @@ async fn run_chat(
     let _ = tx
         .send(ev(&json!({ "type": "message_saved", "id": msg_id })))
         .await;
+
+    // Fire chat.completed webhooks (best-effort, off the response path).
+    {
+        let st = Arc::clone(&state);
+        let (o, s, m, um, rp) = (
+            owner.clone(),
+            sid.clone(),
+            model.clone(),
+            message.clone(),
+            full.clone(),
+        );
+        tokio::spawn(async move {
+            crate::webhooks::fire(
+                &st,
+                &o,
+                "chat.completed",
+                json!({
+                    "session_id": s, "model": m,
+                    "user_message": um.chars().take(2000).collect::<String>(),
+                    "response": rp.chars().take(2000).collect::<String>(),
+                }),
+            )
+            .await;
+        });
+    }
     Ok(())
 }
 
