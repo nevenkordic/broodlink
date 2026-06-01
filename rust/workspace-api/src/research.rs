@@ -1,8 +1,9 @@
 /*
  * Broodlink workspace-api — Deep Research.
- * Ported from the workspace app research_routes. Data plane (run records,
- * library, archive, spinoff) is implemented; the actual multi-step LLM+search
- * research loop is not ported, so `start` records the run as failed-pending.
+ * Ported from the workspace app research_routes. Full data plane (run records,
+ * library, archive, spinoff) plus a real single-round pipeline in `start`
+ * (web search -> LLM synthesis). Multi-round iterative deepening is a future
+ * enhancement.
  */
 
 use std::sync::Arc;

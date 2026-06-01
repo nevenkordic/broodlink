@@ -1,9 +1,9 @@
 /*
  * Broodlink workspace-api — Scheduled Tasks endpoints.
- * Ported from the workspace app routes/task_routes.py. The data plane (CRUD, schedule
- * math, run history) is implemented here; the execution engine (actually
- * running LLM/action/research tasks) is the agent subsystem and is dispatched
- * to Broodlink's coordinator separately — `run_now` is a stub until that lands.
+ * Ported from the workspace app routes/task_routes.py. Full data plane (CRUD,
+ * schedule math, run history) plus a real execution engine: run_now and a 60s
+ * poller execute due tasks, run LLM tasks via chat::complete_text, record runs,
+ * reschedule, and chain then_task_id. (action-type tasks are not yet wired.)
  */
 
 use std::str::FromStr;

@@ -7,10 +7,10 @@
  * recurrence expansion, per-event/per-calendar colour, all-day vs timed +
  * is_utc serialization, .ics export, and CalDAV credential storage.
  *
- * Stubbed (network / LLM subsystems, mirrors the tasks-execution split):
- *   - POST /sync, /test   → CalDAV pull is not ported (returns not-configured)
- *   - POST /import        → .ics parser not ported yet
- *   - POST /quick-parse   → natural-language parsing needs the LLM
+ * Also implemented: .ics import (real VEVENT parser) and quick-parse
+ * (natural language -> event via the LLM).
+ *
+ * Stubbed (network subsystem): POST /sync, /test — CalDAV pull is not ported.
  *
  * Datetimes are stored NAIVE (Postgres TIMESTAMP) to preserve the workspace app's
  * wall-clock semantics; `is_utc` controls whether a `Z` suffix is emitted.
