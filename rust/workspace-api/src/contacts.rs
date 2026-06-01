@@ -1,8 +1,9 @@
 /*
  * Broodlink workspace-api — Contacts.
- * Ported from the workspace app contacts_routes. Implemented as a local
- * Postgres-backed address book (the original's JSON fallback). CardDAV sync is
- * stored-but-not-wired (network sync deferred, like the calendar CalDAV pull).
+ * Ported from the workspace app contacts_routes. Local Postgres-backed address
+ * book (CRUD, import/export). When CardDAV is configured, list() pulls live
+ * from the server (addressbook-query REPORT -> vCard parse) via the webdav
+ * module, falling back to the local table on error.
  */
 
 use std::sync::Arc;

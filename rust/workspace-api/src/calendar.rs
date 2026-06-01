@@ -10,7 +10,8 @@
  * Also implemented: .ics import (real VEVENT parser) and quick-parse
  * (natural language -> event via the LLM).
  *
- * Stubbed (network subsystem): POST /sync, /test — CalDAV pull is not ported.
+ * CalDAV /test (PROPFIND) and /sync (calendar-query REPORT) are implemented
+ * via the webdav module (needs a live DAV server to exercise).
  *
  * Datetimes are stored NAIVE (Postgres TIMESTAMP) to preserve the workspace app's
  * wall-clock semantics; `is_utc` controls whether a `Z` suffix is emitted.
