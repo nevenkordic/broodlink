@@ -26,9 +26,10 @@ uuid = { workspace = true }
 rand = "0.8"
 cron = "0.12"
 bcrypt = "0.15"
-imap = "2"
+imap = { version = "2", default-features = false }
 imap-proto = "0.10"
-native-tls = "0.2"
+rustls = { workspace = true }
+webpki-roots = "0.26"
 ring = "0.17"
 base64 = "0.13"
 sha2 = "0.10"
@@ -36,4 +37,4 @@ hmac = "0.12"
 hex = "0.4"
 sysinfo = "0.30"
 mailparse = "0.15"
-lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "native-tls", "builder"] }
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "rustls-tls", "builder"] }

@@ -24,23 +24,35 @@ pub struct MailCreds {
     pub smtp_pass: String,
 }
 
-pub type ImapSession = imap::Session<native_tls::TlsStream<std::net::TcpStream>>;
+pub type ImapSession =
+    imap::Session<rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>>;
 
-/// Open + authenticate an IMAP session over implicit TLS (port 993 etc.).
-/// (STARTTLS on plain :143 is not supported in this cut — Fastmail/Gmail/most
-/// providers use implicit TLS, which this covers.)
+fn io_err<E: std::fmt::Display>(e: E) -> imap::error::Error {
+    imap::error::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        e.to_string(),
+    ))
+}
+
+/// Open + authenticate an IMAP session over implicit TLS (port 993 etc.) using
+/// rustls + webpki roots (Broodlink bans native-tls/openssl). We bring our own
+/// TLS stream and hand it to imap::Client. STARTTLS on plain :143 is not
+/// supported in this cut — Fastmail/Gmail/most providers use implicit TLS.
 pub fn imap_session(c: &MailCreds) -> imap::error::Result<ImapSession> {
-    let tls = native_tls::TlsConnector::builder().build().map_err(|e| {
-        imap::error::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            e.to_string(),
-        ))
-    })?;
-    let client = imap::connect(
-        (c.imap_host.as_str(), c.imap_port),
-        c.imap_host.as_str(),
-        &tls,
-    )?;
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name =
+        rustls::pki_types::ServerName::try_from(c.imap_host.clone()).map_err(io_err)?;
+    let conn =
+        rustls::ClientConnection::new(std::sync::Arc::new(config), server_name).map_err(io_err)?;
+    let tcp = std::net::TcpStream::connect((c.imap_host.as_str(), c.imap_port)).map_err(io_err)?;
+    let tls = rustls::StreamOwned::new(conn, tcp);
+
+    let mut client = imap::Client::new(tls);
+    client.read_greeting()?;
     client.login(&c.imap_user, &c.imap_pass).map_err(|(e, _)| e)
 }
 
