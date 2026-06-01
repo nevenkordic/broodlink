@@ -36,6 +36,7 @@ mod skills;
 mod speech;
 mod tasks;
 mod vault;
+mod webdav;
 mod webhooks;
 
 use std::collections::HashMap;

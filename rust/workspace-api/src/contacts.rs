@@ -61,11 +61,82 @@ async fn all(
     .await?)
 }
 
+async fn load_carddav(state: &AppState, owner: &str) -> Option<(String, String, String)> {
+    let row = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT url, username, password FROM ws_carddav_config WHERE owner = $1",
+    )
+    .bind(owner)
+    .fetch_optional(&state.pg)
+    .await
+    .ok()
+    .flatten()?;
+    let (url, user, pass) = row;
+    if url.is_empty() {
+        return None;
+    }
+    Some((url, user, state.cipher.decrypt(&pass)))
+}
+
+/// Parse vCards into (name, emails, phones). Handles FN/N, EMAIL*, TEL*.
+pub fn parse_vcards(text: &str) -> Vec<(String, Vec<String>, Vec<String>)> {
+    let mut out = Vec::new();
+    let (mut name, mut emails, mut phones) = (String::new(), Vec::new(), Vec::new());
+    for line in text.replace("\r\n", "\n").lines() {
+        let l = line.trim();
+        let up = l.to_uppercase();
+        if up.starts_with("END:VCARD") {
+            if !name.is_empty() || !emails.is_empty() {
+                out.push((
+                    std::mem::take(&mut name),
+                    std::mem::take(&mut emails),
+                    std::mem::take(&mut phones),
+                ));
+            }
+        } else if let Some(v) = l.strip_prefix("FN:") {
+            name = v.to_string();
+        } else if up.starts_with("EMAIL") {
+            if let Some(val) = l.split(':').next_back() {
+                if !val.is_empty() {
+                    emails.push(val.to_string());
+                }
+            }
+        } else if up.starts_with("TEL") {
+            if let Some(val) = l.split(':').next_back() {
+                if !val.is_empty() {
+                    phones.push(val.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 pub async fn list(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, WsError> {
     let owner = owner_from(&headers);
+
+    // Prefer CardDAV when configured; fall back to the local table on error.
+    if let Some((url, user, pass)) = load_carddav(&state, &owner).await {
+        if let Ok(xml) =
+            crate::webdav::report(&url, &user, &pass, "1", crate::webdav::ADDRESSBOOK_QUERY).await
+        {
+            let blocks = crate::webdav::extract_data_blocks(&xml, "address-data");
+            let mut contacts = Vec::new();
+            for block in &blocks {
+                for (name, emails, phones) in parse_vcards(block) {
+                    contacts.push(json!({
+                        "uid": Uuid::new_v4().to_string(),
+                        "name": name, "emails": emails, "phones": phones
+                    }));
+                }
+            }
+            let count = contacts.len();
+            return Ok(Json(json!({ "contacts": contacts, "count": count })));
+        }
+    }
+
     let rows = all(&state, &owner).await?;
     let contacts: Vec<Value> = rows
         .iter()

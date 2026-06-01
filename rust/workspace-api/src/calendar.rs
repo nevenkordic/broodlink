@@ -885,17 +885,112 @@ pub async fn set_config(
 
 // --- Network / LLM stubs (see module docs) -------------------------------
 
-pub async fn test_config() -> Json<Value> {
-    Json(json!({ "ok": false, "error": "CalDAV connectivity test not yet ported" }))
+async fn load_caldav(state: &AppState, owner: &str) -> Option<(String, String, String)> {
+    let row = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT url, username, password FROM ws_caldav_config WHERE owner = $1",
+    )
+    .bind(owner)
+    .fetch_optional(&state.pg)
+    .await
+    .ok()
+    .flatten()?;
+    let (url, user, pass) = row;
+    if url.is_empty() {
+        return None;
+    }
+    Some((url, user, state.cipher.decrypt(&pass)))
 }
 
-pub async fn sync() -> Json<Value> {
-    Json(json!({
-        "calendars": 0,
-        "events": 0,
-        "deleted": 0,
-        "errors": ["CalDAV pull not yet ported"]
-    }))
+pub async fn test_config(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<Value> {
+    let owner = owner_from(&headers);
+    match load_caldav(&state, &owner).await {
+        None => Json(json!({ "ok": false, "error": "CalDAV is not configured" })),
+        Some((url, user, pass)) => match crate::webdav::propfind_ok(&url, &user, &pass).await {
+            Ok(_) => Json(json!({ "ok": true })),
+            Err(e) => Json(json!({ "ok": false, "error": e })),
+        },
+    }
+}
+
+pub async fn sync(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<Value> {
+    let owner = owner_from(&headers);
+    let (url, user, pass) = match load_caldav(&state, &owner).await {
+        Some(c) => c,
+        None => {
+            return Json(
+                json!({ "calendars": 0, "events": 0, "deleted": 0, "errors": ["CalDAV is not configured"] }),
+            )
+        }
+    };
+
+    let xml = match crate::webdav::report(&url, &user, &pass, "1", crate::webdav::CALENDAR_QUERY)
+        .await
+    {
+        Ok(x) => x,
+        Err(e) => return Json(json!({ "calendars": 0, "events": 0, "deleted": 0, "errors": [e] })),
+    };
+    let blocks = crate::webdav::extract_data_blocks(&xml, "calendar-data");
+
+    // Upsert into a dedicated CalDAV-source calendar for this owner.
+    let cal_id: String = match sqlx::query_scalar(
+        "SELECT id FROM ws_calendars WHERE owner = $1 AND source = 'caldav' LIMIT 1",
+    )
+    .bind(&owner)
+    .fetch_optional(&state.pg)
+    .await
+    {
+        Ok(Some(id)) => id,
+        _ => {
+            let id = Uuid::new_v4().to_string();
+            let _ = sqlx::query(
+                "INSERT INTO ws_calendars (id, owner, name, color, source) VALUES ($1,$2,'CalDAV',$3,'caldav')",
+            )
+            .bind(&id)
+            .bind(&owner)
+            .bind(DEFAULT_COLOR)
+            .execute(&state.pg)
+            .await;
+            id
+        }
+    };
+
+    // Replace the calendar's events with the freshly pulled set.
+    let before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ws_calendar_events WHERE calendar_id = $1")
+            .bind(&cal_id)
+            .fetch_one(&state.pg)
+            .await
+            .unwrap_or(0);
+    let _ = sqlx::query("DELETE FROM ws_calendar_events WHERE calendar_id = $1")
+        .bind(&cal_id)
+        .execute(&state.pg)
+        .await;
+
+    let mut events = 0i64;
+    for block in &blocks {
+        for ev in parse_ics(block) {
+            let _ = sqlx::query(
+                "INSERT INTO ws_calendar_events \
+                 (uid, calendar_id, summary, description, location, dtstart, dtend, all_day, is_utc, rrule) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(&cal_id)
+            .bind(&ev.summary)
+            .bind(&ev.description)
+            .bind(&ev.location)
+            .bind(ev.dtstart)
+            .bind(ev.dtend)
+            .bind(ev.all_day)
+            .bind(ev.is_utc)
+            .bind(&ev.rrule)
+            .execute(&state.pg)
+            .await;
+            events += 1;
+        }
+    }
+    let deleted = (before - events).max(0);
+    Json(json!({ "calendars": 1, "events": events, "deleted": deleted, "errors": [] }))
 }
 
 /// A parsed VEVENT.
