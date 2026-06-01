@@ -898,8 +898,209 @@ pub async fn sync() -> Json<Value> {
     }))
 }
 
-pub async fn import_ics() -> Result<Json<Value>, WsError> {
-    Err(WsError::BadRequest(".ics import not yet ported".into()))
+/// A parsed VEVENT.
+pub struct IcsEvent {
+    pub summary: String,
+    pub description: String,
+    pub location: String,
+    pub dtstart: NaiveDateTime,
+    pub dtend: NaiveDateTime,
+    pub all_day: bool,
+    pub is_utc: bool,
+    pub rrule: String,
+}
+
+/// Parse one ICS datetime value (+ whether the property was VALUE=DATE).
+fn parse_ics_dt(value: &str, is_date: bool) -> Option<(NaiveDateTime, bool, bool)> {
+    let v = value.trim();
+    if is_date || v.len() == 8 {
+        let d = NaiveDate::parse_from_str(v, "%Y%m%d").ok()?;
+        return Some((d.and_time(NaiveTime::MIN), false, true));
+    }
+    if let Some(stripped) = v.strip_suffix('Z') {
+        let dt = NaiveDateTime::parse_from_str(stripped, "%Y%m%dT%H%M%S").ok()?;
+        return Some((dt, true, false));
+    }
+    let dt = NaiveDateTime::parse_from_str(v, "%Y%m%dT%H%M%S").ok()?;
+    Some((dt, false, false))
+}
+
+/// Parse a full .ics document into VEVENTs (basic RFC-5545: line unfolding,
+/// param-aware property keys, common fields).
+pub fn parse_ics(text: &str) -> Vec<IcsEvent> {
+    // Unfold continuation lines (leading space/tab).
+    let mut lines: Vec<String> = Vec::new();
+    for raw in text.replace("\r\n", "\n").lines() {
+        if (raw.starts_with(' ') || raw.starts_with('\t')) && !lines.is_empty() {
+            lines.last_mut().unwrap().push_str(raw.trim_start());
+        } else {
+            lines.push(raw.to_string());
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut cur: Option<IcsEvent> = None;
+    for line in lines {
+        let l = line.trim();
+        if l.eq_ignore_ascii_case("BEGIN:VEVENT") {
+            cur = Some(IcsEvent {
+                summary: String::new(),
+                description: String::new(),
+                location: String::new(),
+                dtstart: NaiveDateTime::default(),
+                dtend: NaiveDateTime::default(),
+                all_day: false,
+                is_utc: false,
+                rrule: String::new(),
+            });
+            continue;
+        }
+        if l.eq_ignore_ascii_case("END:VEVENT") {
+            if let Some(ev) = cur.take() {
+                out.push(ev);
+            }
+            continue;
+        }
+        let ev = match cur.as_mut() {
+            Some(e) => e,
+            None => continue,
+        };
+        let (key, value) = match l.split_once(':') {
+            Some(kv) => kv,
+            None => continue,
+        };
+        let name = key.split(';').next().unwrap_or("").to_uppercase();
+        let is_date = key.to_uppercase().contains("VALUE=DATE");
+        let unescape = |s: &str| {
+            s.replace("\\n", "\n")
+                .replace("\\,", ",")
+                .replace("\\;", ";")
+                .replace("\\\\", "\\")
+        };
+        match name.as_str() {
+            "SUMMARY" => ev.summary = unescape(value),
+            "DESCRIPTION" => ev.description = unescape(value),
+            "LOCATION" => ev.location = unescape(value),
+            "RRULE" => ev.rrule = value.to_string(),
+            "DTSTART" => {
+                if let Some((dt, utc, all)) = parse_ics_dt(value, is_date) {
+                    ev.dtstart = dt;
+                    ev.is_utc = utc;
+                    ev.all_day = all;
+                }
+            }
+            "DTEND" => {
+                if let Some((dt, _, _)) = parse_ics_dt(value, is_date) {
+                    ev.dtend = dt;
+                }
+            }
+            _ => {}
+        }
+    }
+    // default dtend = dtstart + 1h (timed) / +1d (all-day)
+    for ev in &mut out {
+        if ev.dtend == NaiveDateTime::default() {
+            ev.dtend = if ev.all_day {
+                ev.dtstart + Duration::days(1)
+            } else {
+                ev.dtstart + Duration::hours(1)
+            };
+        }
+    }
+    out
+}
+
+pub async fn import_ics(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    mut mp: axum::extract::Multipart,
+) -> Result<Json<Value>, WsError> {
+    let owner = owner_from(&headers);
+    let mut ics = String::new();
+    let mut cal_name = "Imported".to_string();
+    while let Some(field) = mp
+        .next_field()
+        .await
+        .map_err(|e| WsError::BadRequest(e.to_string()))?
+    {
+        match field.name().unwrap_or("") {
+            "file" => ics = field.text().await.unwrap_or_default(),
+            "calendar_name" => {
+                let v = field.text().await.unwrap_or_default();
+                if !v.is_empty() {
+                    cal_name = v.chars().take(120).collect();
+                }
+            }
+            _ => {}
+        }
+    }
+    if ics.trim().is_empty() {
+        return Err(WsError::BadRequest("no .ics content".into()));
+    }
+    let events = parse_ics(&ics);
+
+    let cal_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO ws_calendars (id, owner, name, color, source) VALUES ($1,$2,$3,$4,'import')",
+    )
+    .bind(&cal_id)
+    .bind(&owner)
+    .bind(&cal_name)
+    .bind(DEFAULT_COLOR)
+    .execute(&state.pg)
+    .await?;
+
+    let mut imported = 0;
+    let mut skipped = 0;
+    let mut seen = std::collections::HashSet::new();
+    for ev in events {
+        let key = format!("{}|{}", ev.summary, ev.dtstart);
+        if !seen.insert(key) {
+            skipped += 1;
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO ws_calendar_events \
+             (uid, calendar_id, summary, description, location, dtstart, dtend, all_day, is_utc, rrule) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&cal_id)
+        .bind(&ev.summary)
+        .bind(&ev.description)
+        .bind(&ev.location)
+        .bind(ev.dtstart)
+        .bind(ev.dtend)
+        .bind(ev.all_day)
+        .bind(ev.is_utc)
+        .bind(&ev.rrule)
+        .execute(&state.pg)
+        .await?;
+        imported += 1;
+    }
+
+    Ok(Json(json!({
+        "ok": true, "imported": imported, "skipped": skipped,
+        "calendar": cal_name, "calendar_id": cal_id
+    })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_vevents() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:Team sync\r\nDTSTART:20240115T100000Z\r\nDTEND:20240115T103000Z\r\nLOCATION:Room A\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nSUMMARY:Holiday\r\nDTSTART;VALUE=DATE:20240120\r\nEND:VEVENT\r\nEND:VCALENDAR";
+        let evs = parse_ics(ics);
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[0].summary, "Team sync");
+        assert!(evs[0].is_utc && !evs[0].all_day);
+        assert_eq!(evs[0].rrule, "FREQ=WEEKLY");
+        assert!(evs[1].all_day);
+        // all-day default end = +1 day
+        assert_eq!(evs[1].dtend - evs[1].dtstart, Duration::days(1));
+    }
 }
 
 #[derive(Deserialize)]
