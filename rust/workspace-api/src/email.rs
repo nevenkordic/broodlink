@@ -3,20 +3,15 @@
  * Ported from the workspace app routes/email_routes.py + helpers. JSON contract
  * preserved so the existing email UI works unchanged.
  *
- * Implemented now (data/config plane, no network):
- *   - Account CRUD (ws_email_accounts), config get/put, set-default
- *   - Per-owner email settings + writing style (ws_email_settings)
- *   - Scheduled-send CRUD (ws_scheduled_emails)
+ * Implemented:
+ *   - Account CRUD + config + settings/writing-style + scheduled-send (+ poller)
+ *   - Live IMAP (folders, list, read, search, flags, move/delete, attachments)
+ *     and SMTP (send, draft, accounts/test) via the email_net module
+ *   - LLM triage: summarize + ai-reply (via chat::complete_text)
+ *   Account passwords are encrypted at rest (crypto module).
  *
- * Stubbed (PHASE 2 — needs IMAP/SMTP crates + a live server to verify, and the
- * LLM for triage; same data-plane-first split used for calendar/tasks):
- *   - IMAP read path: list, read, folders, search, flags, move/delete, attachments
- *   - SMTP: send, draft, accounts/test connectivity
- *   - LLM triage: summarize, ai-reply, extract-style, urgency
- * Stubs return the documented response SHAPES so the frontend never crashes.
- *
- * NOTE: account passwords are stored as-is for now; the workspace app encrypts them at
- * rest (Fernet). Wrapping these columns with broodlink-secrets is a follow-up.
+ * Still stubbed: extract-style (needs sent-mail sampling) and the auto-triage
+ * background poller (auto-tag/spam/urgency).
  */
 
 use std::sync::Arc;
