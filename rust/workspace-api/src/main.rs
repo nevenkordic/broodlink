@@ -319,6 +319,11 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/email/contacts", get(email::contacts))
         .route("/email/resolve-contact", get(email::contacts))
         .route("/email/read/:uid", get(email::read_mail))
+        .route("/email/attachments/:uid", get(email::attachments))
+        .route(
+            "/email/attachment/:uid/:index",
+            get(email::attachment_download),
+        )
         .route("/email/mark-read/:uid", post(email::mark_read))
         .route("/email/mark-unread/:uid", post(email::mark_unread))
         .route("/email/mark-answered/:uid", post(email::mark_answered))

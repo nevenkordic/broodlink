@@ -534,6 +534,118 @@ pub fn draft_blocking(c: MailCreds, mail: OutgoingMail) -> Value {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Search (IMAP TEXT search) + attachment fetch
+// ---------------------------------------------------------------------------
+
+pub fn search_blocking(
+    c: MailCreds,
+    folder: String,
+    query: String,
+    limit: usize,
+) -> imap::error::Result<(Vec<Value>, usize)> {
+    let mut s = imap_session(&c)?;
+    s.select(&folder)?;
+    let escaped = query.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut uids: Vec<u32> = s
+        .uid_search(format!("TEXT \"{escaped}\""))?
+        .into_iter()
+        .collect();
+    uids.sort_unstable();
+    let total = uids.len();
+    uids.reverse();
+    let window: Vec<u32> = uids.into_iter().take(limit).collect();
+    if window.is_empty() {
+        let _ = s.logout();
+        return Ok((Vec::new(), total));
+    }
+    let set = window
+        .iter()
+        .map(|u| u.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let fetches = s.uid_fetch(set, "(UID FLAGS ENVELOPE RFC822.SIZE)")?;
+    let mut by_uid: std::collections::HashMap<u32, Value> = std::collections::HashMap::new();
+    for f in fetches.iter() {
+        let uid = match f.uid {
+            Some(u) => u,
+            None => continue,
+        };
+        let env = f.envelope();
+        let (from_name, from_address) = env
+            .and_then(|e| e.from.as_ref())
+            .and_then(|v| v.first())
+            .map(addr_one)
+            .unwrap_or_default();
+        let date = env.map(|e| s8(&e.date)).unwrap_or_default();
+        by_uid.insert(
+            uid,
+            json!({
+                "uid": uid,
+                "message_id": env.map(|e| s8(&e.message_id)).unwrap_or_default(),
+                "subject": env.map(|e| s8(&e.subject)).unwrap_or_default(),
+                "from_name": from_name,
+                "from_address": from_address,
+                "date": date.clone(),
+                "date_display": date,
+                "size": f.size.unwrap_or(0),
+                "is_read": f.flags().iter().any(|fl| matches!(fl, imap::types::Flag::Seen)),
+                "has_attachments": false,
+                "tags": [],
+            }),
+        );
+    }
+    let _ = s.logout();
+    let ordered: Vec<Value> = window.iter().filter_map(|u| by_uid.remove(u)).collect();
+    Ok((ordered, total))
+}
+
+/// Fetch attachments of a message: (filename, content_type, bytes).
+pub fn fetch_attachments_blocking(
+    c: MailCreds,
+    folder: String,
+    uid: u32,
+) -> Result<Vec<(String, String, Vec<u8>)>, String> {
+    let mut s = imap_session(&c).map_err(|e| e.to_string())?;
+    s.select(&folder).map_err(|e| e.to_string())?;
+    let fetches = s
+        .uid_fetch(uid.to_string(), "(UID RFC822)")
+        .map_err(|e| e.to_string())?;
+    let body = fetches
+        .iter()
+        .next()
+        .and_then(|f| f.body().map(|b| b.to_vec()));
+    let _ = s.logout();
+    let body = match body {
+        Some(b) => b,
+        None => return Ok(Vec::new()),
+    };
+    let parsed = mailparse::parse_mail(&body).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    collect_attachments(&parsed, &mut out);
+    Ok(out)
+}
+
+fn collect_attachments(part: &mailparse::ParsedMail, out: &mut Vec<(String, String, Vec<u8>)>) {
+    let disp = part.get_content_disposition();
+    let is_attachment = matches!(disp.disposition, mailparse::DispositionType::Attachment)
+        || disp.params.contains_key("filename");
+    if is_attachment {
+        let filename = disp
+            .params
+            .get("filename")
+            .cloned()
+            .or_else(|| part.ctype.params.get("name").cloned())
+            .unwrap_or_else(|| "attachment".into());
+        let bytes = part.get_body_raw().unwrap_or_default();
+        out.push((filename, part.ctype.mimetype.clone(), bytes));
+        return;
+    }
+    for sub in &part.subparts {
+        collect_attachments(sub, out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

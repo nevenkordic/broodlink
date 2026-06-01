@@ -787,11 +787,103 @@ pub async fn folders(
 pub struct SearchQuery {
     #[serde(default)]
     q: String,
+    #[serde(default = "default_inbox")]
+    folder: String,
+    #[serde(default = "default_limit")]
+    limit: i64,
+    account_id: Option<String>,
 }
-pub async fn search(headers: HeaderMap, Query(s): Query<SearchQuery>) -> Json<Value> {
-    let _ = owner_from(&headers);
-    // Live search reuses list with an IMAP TEXT query — deferred; returns empty.
-    Json(json!({ "emails": [], "total": 0, "query": s.q }))
+
+pub async fn search(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<SearchQuery>,
+) -> Result<Json<Value>, WsError> {
+    let owner = owner_from(&headers);
+    if q.q.trim().is_empty() {
+        return Ok(Json(json!({ "emails": [], "total": 0, "query": q.q })));
+    }
+    let creds = creds_for(&state, &owner, &q.account_id).await?;
+    let (folder, query, limit) = (
+        q.folder.clone(),
+        q.q.clone(),
+        q.limit.clamp(1, 100) as usize,
+    );
+    let res = run_blocking(move || crate::email_net::search_blocking(creds, folder, query, limit))
+        .await?;
+    match res {
+        Ok((emails, total)) => Ok(Json(
+            json!({ "emails": emails, "total": total, "query": q.q }),
+        )),
+        Err(e) => Err(WsError::Internal(e.to_string())),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct AttQuery {
+    account_id: Option<String>,
+    #[serde(default = "default_inbox")]
+    folder: String,
+}
+
+pub async fn attachments(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(uid): Path<String>,
+    Query(q): Query<AttQuery>,
+) -> Result<Json<Value>, WsError> {
+    let owner = owner_from(&headers);
+    let uid: u32 = uid
+        .parse()
+        .map_err(|_| WsError::BadRequest("invalid uid".into()))?;
+    let creds = creds_for(&state, &owner, &q.account_id).await?;
+    let folder = q.folder.clone();
+    let res =
+        run_blocking(move || crate::email_net::fetch_attachments_blocking(creds, folder, uid))
+            .await?;
+    let atts = res.map_err(WsError::Internal)?;
+    let list: Vec<Value> = atts
+        .iter()
+        .enumerate()
+        .map(|(i, (name, ct, bytes))| json!({
+            "index": i, "filename": name, "content_type": ct, "size": bytes.len(), "is_inline": false
+        }))
+        .collect();
+    Ok(Json(json!({ "attachments": list, "uid": uid })))
+}
+
+pub async fn attachment_download(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((uid, index)): Path<(String, usize)>,
+    Query(q): Query<AttQuery>,
+) -> Result<axum::response::Response, WsError> {
+    use axum::response::IntoResponse;
+    let owner = owner_from(&headers);
+    let uid: u32 = uid
+        .parse()
+        .map_err(|_| WsError::BadRequest("invalid uid".into()))?;
+    let creds = creds_for(&state, &owner, &q.account_id).await?;
+    let folder = q.folder.clone();
+    let res =
+        run_blocking(move || crate::email_net::fetch_attachments_blocking(creds, folder, uid))
+            .await?;
+    let atts = res.map_err(WsError::Internal)?;
+    let (name, ct, bytes) = atts
+        .into_iter()
+        .nth(index)
+        .ok_or_else(|| WsError::NotFound("attachment not found".into()))?;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, ct),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{}\"", name.replace('"', "")),
+            ),
+        ],
+        axum::body::Body::from(bytes),
+    )
+        .into_response())
 }
 
 pub async fn contacts(headers: HeaderMap) -> Json<Value> {
