@@ -786,8 +786,9 @@ async fn main() {
     let port = state.config.workspace_api.port;
     let shared = Arc::new(state);
 
-    // Background dispatcher for scheduled emails.
+    // Background dispatchers: scheduled emails + scheduled tasks.
     tokio::spawn(email::run_scheduled_poller(Arc::clone(&shared)));
+    tokio::spawn(tasks::run_scheduled_poller(Arc::clone(&shared)));
 
     let app = build_router(Arc::clone(&shared));
     let addr = SocketAddr::from(([127, 0, 0, 1], port));

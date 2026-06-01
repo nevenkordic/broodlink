@@ -592,10 +592,124 @@ pub async fn run_now(
 ) -> Result<Json<Value>, WsError> {
     let owner = owner_from(&headers);
     fetch_owned(&state, &id, &owner).await?;
-    Ok(Json(json!({
-        "ok": false,
-        "message": "task execution engine not yet ported — dispatch to coordinator is pending"
-    })))
+    let st = Arc::clone(&state);
+    tokio::spawn(async move {
+        run_task(&st, &id).await;
+    });
+    Ok(Json(json!({ "ok": true, "message": "Task triggered" })))
+}
+
+/// Execute a single task: record a run, run the work (LLM tasks call the
+/// owner's default model), store result, bump counters, and reschedule.
+pub async fn run_task(state: &AppState, task_id: &str) {
+    let task = match sqlx::query_as::<_, TaskRow>(&format!("{SELECT} WHERE id = $1"))
+        .bind(task_id)
+        .fetch_optional(&state.pg)
+        .await
+    {
+        Ok(Some(t)) => t,
+        _ => return,
+    };
+    let owner = task.owner.clone().unwrap_or_default();
+    let run_id = Uuid::new_v4().to_string();
+    let _ = sqlx::query(
+        "INSERT INTO ws_task_runs (id, task_id, status, model) VALUES ($1,$2,'running',$3)",
+    )
+    .bind(&run_id)
+    .bind(task_id)
+    .bind(&task.model)
+    .execute(&state.pg)
+    .await;
+
+    // Run the work.
+    let (status, result, error): (&str, Option<String>, Option<String>) =
+        match task.task_type.as_str() {
+            "llm" | "research" => match &task.prompt {
+                Some(p) if !p.is_empty() => {
+                    match crate::chat::complete_text(
+                        state,
+                        &owner,
+                        "You are a helpful assistant running a scheduled task.",
+                        p,
+                    )
+                    .await
+                    {
+                        Ok(out) => ("success", Some(out), None),
+                        Err(e) => ("error", None, Some(e.to_string())),
+                    }
+                }
+                _ => ("error", None, Some("no prompt".into())),
+            },
+            other => (
+                "error",
+                None,
+                Some(format!("task type '{other}' not supported yet")),
+            ),
+        };
+
+    let _ = sqlx::query(
+        "UPDATE ws_task_runs SET status = $2, result = $3, error = $4, finished_at = now() WHERE id = $1",
+    )
+    .bind(&run_id)
+    .bind(status)
+    .bind(&result)
+    .bind(&error)
+    .execute(&state.pg)
+    .await;
+
+    // Bump counters + reschedule.
+    let next = if task.trigger_type == "schedule" && task.schedule.as_deref() != Some("once") {
+        compute_next_run(
+            &task.schedule,
+            &task.scheduled_time,
+            task.scheduled_day,
+            &task.scheduled_date,
+            &task.cron_expression,
+            Utc::now(),
+        )
+    } else {
+        None
+    };
+    let new_status = if task.schedule.as_deref() == Some("once") {
+        "completed"
+    } else {
+        "active"
+    };
+    let _ = sqlx::query(
+        "UPDATE ws_scheduled_tasks SET run_count = run_count + 1, last_run = now(), \
+            next_run = $2, status = CASE WHEN status = 'paused' THEN 'paused' ELSE $3 END, \
+            updated_at = now() WHERE id = $1",
+    )
+    .bind(task_id)
+    .bind(next)
+    .bind(new_status)
+    .execute(&state.pg)
+    .await;
+
+    // Chain: run the follow-up task if configured (then_task_id).
+    if status == "success" {
+        if let Some(then_id) = task.then_task_id.clone() {
+            Box::pin(run_task(state, &then_id)).await;
+        }
+    }
+}
+
+/// Background loop: every 60s, run due scheduled tasks.
+pub async fn run_scheduled_poller(state: Arc<AppState>) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+    loop {
+        ticker.tick().await;
+        let due: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM ws_scheduled_tasks WHERE status = 'active' AND trigger_type = 'schedule' \
+             AND next_run IS NOT NULL AND next_run <= now() LIMIT 20",
+        )
+        .fetch_all(&state.pg)
+        .await
+        .unwrap_or_default();
+        for id in due {
+            run_task(&state, &id).await;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
