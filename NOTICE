@@ -16,3 +16,21 @@ Infisical      MIT         — Infisical Inc
 Inter          OFL 1.1     — Rasmus Andersson
 JetBrains Mono OFL 1.1     — JetBrains
 Rust crates    MIT/Apache  — respective authors
+
+------------------------------------------------------------------------
+Workspace UI (the rust/workspace-api frontend in workspace-ui/)
+------------------------------------------------------------------------
+
+The workspace web UI was adapted from a self-hosted AI-workspace project
+released under the MIT License (Copyright (c) 2025 Odysseus Contributors).
+That code, and the third-party code it in turn adapted, is redistributed
+here under the terms below. Full license texts are in licenses/.
+
+Workspace UI         MIT         — Copyright (c) 2025 Odysseus Contributors
+                                   (licenses/workspace-ui-MIT-LICENSE.txt)
+opencode             MIT         — the opencode authors
+                                   (licenses/opencode-MIT-LICENSE.txt)
+llmfit               MIT         — Alex Jones
+                                   (licenses/llmfit-MIT-LICENSE.txt)
+Tongyi DeepResearch  Apache 2.0  — Alibaba-NLP / Tongyi Lab; modified.
+                                   (licenses/DeepResearch-Apache-2.0.txt)

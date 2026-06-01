@@ -45,6 +45,23 @@ pub trait SecretsProvider: Send + Sync {
     async fn list(&self) -> Result<Vec<String>, SecretsError>;
 }
 
+/// Environment-variable secrets provider (dev/CI). Each secret key is read
+/// directly from the process environment, e.g. BROODLINK_POSTGRES_PASSWORD.
+pub struct EnvProvider;
+
+#[async_trait::async_trait]
+impl SecretsProvider for EnvProvider {
+    async fn get(&self, key: &str) -> Result<String, SecretsError> {
+        std::env::var(key).map_err(|_| SecretsError::NotFound(key.to_string()))
+    }
+    async fn list(&self) -> Result<Vec<String>, SecretsError> {
+        Ok(std::env::vars()
+            .map(|(k, _)| k)
+            .filter(|k| k.starts_with("BROODLINK_"))
+            .collect())
+    }
+}
+
 struct CachedSecret {
     value: String,
     expires_at: Instant,
@@ -289,6 +306,7 @@ pub fn create_provider(
     infisical_token: Option<&str>,
 ) -> Result<Box<dyn SecretsProvider>, SecretsError> {
     match provider {
+        "env" => Ok(Box::new(EnvProvider)),
         "sops" => {
             let file = sops_file
                 .ok_or_else(|| SecretsError::Unavailable("sops_file not configured".to_string()))?;
