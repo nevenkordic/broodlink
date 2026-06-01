@@ -332,8 +332,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/email/send", post(email::send))
         .route("/email/draft", post(email::draft))
         .route("/email/urgency-state", get(email::urgency_state))
-        .route("/email/summarize", post(email::llm_action))
-        .route("/email/ai-reply", post(email::llm_action))
+        .route("/email/summarize", post(email::summarize))
+        .route("/email/ai-reply", post(email::ai_reply))
         .route("/email/extract-style", post(email::llm_action))
         // --- chat / sessions / models ---
         .route("/chat_stream", post(chat::chat_stream))

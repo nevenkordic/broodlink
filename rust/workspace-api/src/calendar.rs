@@ -902,6 +902,40 @@ pub async fn import_ics() -> Result<Json<Value>, WsError> {
     Err(WsError::BadRequest(".ics import not yet ported".into()))
 }
 
-pub async fn quick_parse() -> Json<Value> {
-    Json(json!({ "ok": false, "error": "natural-language parsing needs the LLM (not yet ported)" }))
+#[derive(Deserialize)]
+pub struct QuickParseBody {
+    #[serde(default)]
+    text: String,
+}
+
+pub async fn quick_parse(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<QuickParseBody>,
+) -> Json<Value> {
+    let owner = owner_from(&headers);
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let sys = format!(
+        "Today is {today}. Extract a single calendar event from the user's text. \
+         Respond with ONLY a JSON object (no markdown fences): \
+         {{\"summary\":string,\"dtstart\":\"YYYY-MM-DDTHH:MM:SS\",\"dtend\":\"YYYY-MM-DDTHH:MM:SS\",\"all_day\":bool,\"location\":string,\"description\":string}}. \
+         If no end time is implied use a 1-hour duration."
+    );
+    match crate::chat::complete_text(&state, &owner, &sys, &body.text).await {
+        Ok(s) => {
+            let cleaned = s
+                .trim()
+                .trim_start_matches("```json")
+                .trim_start_matches("```")
+                .trim_end_matches("```")
+                .trim();
+            match serde_json::from_str::<Value>(cleaned) {
+                Ok(ev) => Json(json!({ "ok": true, "event": ev, "confidence": 0.7 })),
+                Err(_) => {
+                    Json(json!({ "ok": false, "error": "could not parse model output", "raw": s }))
+                }
+            }
+        }
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
+    }
 }

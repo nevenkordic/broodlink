@@ -1223,3 +1223,55 @@ pub async fn llm_action(headers: HeaderMap) -> Json<Value> {
     let _ = owner_from(&headers);
     Json(json!({ "success": false, "error": LLM_PENDING }))
 }
+
+/// Summarize an email via the owner's default model.
+pub async fn summarize(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let owner = owner_from(&headers);
+    let text = format!(
+        "Subject: {}\nFrom: {}\n\n{}",
+        body["subject"].as_str().unwrap_or(""),
+        body["from"].as_str().unwrap_or(""),
+        body["body"].as_str().unwrap_or("")
+    );
+    let sys = "Summarize this email in 1-3 concise bullet points. Output only the bullets.";
+    match crate::chat::complete_text(&state, &owner, sys, &text).await {
+        Ok(s) => Json(json!({ "success": true, "summary": s.trim(), "model_used": "default" })),
+        Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
+    }
+}
+
+/// Draft a reply in the user's saved writing style.
+pub async fn ai_reply(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let owner = owner_from(&headers);
+    let style = load_settings(&state, &owner)
+        .await
+        .map(|s| s.writing_style)
+        .unwrap_or_default();
+    let sys = format!(
+        "You are writing an email reply AS the user (first person). Write only the reply body, \
+         no subject, no preamble, no signature block. Never invent facts. {}",
+        if style.is_empty() {
+            String::new()
+        } else {
+            format!("Match this writing style: {style}")
+        }
+    );
+    let user = format!(
+        "Reply to this email.\nTo: {}\nSubject: {}\n\n{}",
+        body["to"].as_str().unwrap_or(""),
+        body["subject"].as_str().unwrap_or(""),
+        body["original_body"].as_str().unwrap_or("")
+    );
+    match crate::chat::complete_text(&state, &owner, &sys, &user).await {
+        Ok(s) => Json(json!({ "success": true, "reply": s.trim(), "model_used": "default" })),
+        Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
+    }
+}

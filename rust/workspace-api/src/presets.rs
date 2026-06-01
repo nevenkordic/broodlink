@@ -193,10 +193,24 @@ pub async fn set_groups(
     Ok(Json(json!({ "ok": true })))
 }
 
-// Needs the LLM.
-pub async fn expand(headers: HeaderMap) -> Json<Value> {
-    let _ = owner_from(&headers);
-    Json(
-        json!({ "success": false, "prompt": Value::Null, "message": "prompt expansion needs the LLM (not yet ported)" }),
-    )
+/// Expand rough character/persona notes into a full system prompt via the LLM.
+pub async fn expand(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let owner = owner_from(&headers);
+    let sys = "Expand the user's rough character/persona notes into a complete, detailed \
+               system prompt for an AI assistant to roleplay. Output only the system prompt.";
+    let user = format!(
+        "Name: {}\nNotes: {}",
+        body["name"].as_str().unwrap_or(""),
+        body["prompt"].as_str().unwrap_or("")
+    );
+    match crate::chat::complete_text(&state, &owner, sys, &user).await {
+        Ok(s) => Json(json!({ "success": true, "prompt": s.trim(), "message": "" })),
+        Err(e) => {
+            Json(json!({ "success": false, "prompt": Value::Null, "message": e.to_string() }))
+        }
+    }
 }

@@ -503,6 +503,96 @@ async fn probe_models(base_url: &str, api_key: &str) -> Result<Vec<String>, Stri
 }
 
 // ---------------------------------------------------------------------------
+// Shared non-streaming completion (used by email/calendar/memory/preset LLM
+// assists). Resolves the owner's default model endpoint.
+// ---------------------------------------------------------------------------
+
+/// (chat_completions_url, model, decrypted_api_key) for the owner's default endpoint.
+pub async fn default_llm(state: &AppState, owner: &str) -> Option<(String, String, String)> {
+    let row = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT base_url, api_key, cached_models FROM ws_model_endpoints \
+         WHERE owner = $1 AND is_enabled = TRUE ORDER BY created_at ASC LIMIT 1",
+    )
+    .bind(owner)
+    .fetch_optional(&state.pg)
+    .await
+    .ok()
+    .flatten()?;
+    let (base_url, api_key, cached) = row;
+    let model = cached
+        .and_then(|c| serde_json::from_str::<Vec<String>>(&c).ok())
+        .and_then(|v| v.into_iter().next())?;
+    Some((
+        chat_completions_url(&base_url),
+        model,
+        state.cipher.decrypt(&api_key),
+    ))
+}
+
+/// One-shot (system, user) → text completion against the owner's default model.
+pub async fn complete_text(
+    state: &AppState,
+    owner: &str,
+    system: &str,
+    user: &str,
+) -> Result<String, WsError> {
+    let (url, model, key) = default_llm(state, owner)
+        .await
+        .ok_or_else(|| WsError::BadRequest("no model endpoint configured".into()))?;
+    let provider = detect_provider(&url);
+    let nurl = normalize_url(provider, &url);
+    let payload = match provider {
+        Provider::Anthropic => json!({
+            "model": model, "system": system,
+            "messages": [{"role": "user", "content": user}],
+            "max_tokens": 1024, "stream": false
+        }),
+        _ => json!({
+            "model": model,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "stream": false
+        }),
+    };
+    let client = reqwest::Client::new();
+    let req = client.post(&nurl).json(&payload);
+    let req = match provider {
+        Provider::Anthropic => req
+            .header("x-api-key", &key)
+            .header("anthropic-version", "2023-06-01"),
+        Provider::Ollama => req,
+        Provider::OpenAi => {
+            if key.is_empty() {
+                req
+            } else {
+                req.bearer_auth(&key)
+            }
+        }
+    };
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| WsError::Internal(e.to_string()))?;
+    if !resp.status().is_success() {
+        let s = resp.status().as_u16();
+        let t = resp.text().await.unwrap_or_default();
+        return Err(WsError::Internal(format!("upstream {s}: {t}")));
+    }
+    let v: Value = resp
+        .json()
+        .await
+        .map_err(|e| WsError::Internal(e.to_string()))?;
+    let text = match provider {
+        Provider::Anthropic => v["content"][0]["text"].as_str().unwrap_or("").to_string(),
+        Provider::Ollama => v["message"]["content"].as_str().unwrap_or("").to_string(),
+        Provider::OpenAi => v["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
+    };
+    Ok(text)
+}
+
+// ---------------------------------------------------------------------------
 // Provider plumbing
 // ---------------------------------------------------------------------------
 

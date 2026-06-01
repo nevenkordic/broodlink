@@ -348,9 +348,51 @@ pub async fn by_session(
 
 // --- LLM-dependent endpoints (deferred) -----------------------------------
 
-pub async fn extract(headers: HeaderMap) -> Json<Value> {
-    let _ = owner_from(&headers);
-    Json(json!({ "suggestions": [] }))
+#[derive(Deserialize)]
+pub struct ExtractForm {
+    #[serde(default)]
+    session: String,
+}
+
+/// Extract durable user facts from a chat session via the LLM.
+pub async fn extract(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Form(f): axum::extract::Form<ExtractForm>,
+) -> Json<Value> {
+    let owner = owner_from(&headers);
+    let mut rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT role, content FROM ws_chat_messages WHERE session_id = $1 ORDER BY created_at DESC LIMIT 6",
+    )
+    .bind(&f.session)
+    .fetch_all(&state.pg)
+    .await
+    .unwrap_or_default();
+    rows.reverse();
+    if rows.is_empty() {
+        return Json(json!({ "suggestions": [] }));
+    }
+    let transcript: String = rows
+        .iter()
+        .map(|(r, c)| format!("{r}: {c}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let sys = "Extract durable personal facts about the USER from this conversation. Max 2. \
+               Each under 15 words. Return ONLY a JSON array of objects {\"text\":..,\"category\":..}. \
+               Categories: identity, preference, fact, contact, project, goal. Return [] if nothing durable.";
+    match crate::chat::complete_text(&state, &owner, sys, &transcript).await {
+        Ok(s) => {
+            let cleaned = s
+                .trim()
+                .trim_start_matches("```json")
+                .trim_start_matches("```")
+                .trim_end_matches("```")
+                .trim();
+            let suggestions = serde_json::from_str::<Value>(cleaned).unwrap_or(json!([]));
+            Json(json!({ "suggestions": suggestions }))
+        }
+        Err(_) => Json(json!({ "suggestions": [] })),
+    }
 }
 
 pub async fn audit(
