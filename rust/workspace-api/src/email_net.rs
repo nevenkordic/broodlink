@@ -17,6 +17,8 @@ pub struct MailCreds {
     pub imap_port: u16,
     pub imap_user: String,
     pub imap_pass: String,
+    /// Reserved: only implicit TLS (993) is implemented today.
+    #[allow(dead_code)]
     pub imap_starttls: bool,
     pub smtp_host: String,
     pub smtp_port: u16,

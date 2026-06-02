@@ -41,6 +41,13 @@ ignore = [
   # the 0.103.x version; 0.101.x and 0.102.x await upstream upgrades.
   "RUSTSEC-2026-0098",
   "RUSTSEC-2026-0099",
+  # rustls-webpki reachable panic in CRL parsing — transitive via the rustls
+  # stack used by the workspace-api email/IMAP TLS path; low exploitability,
+  # awaiting upstream bump.
+  "RUSTSEC-2026-0104",
+  # core2 unmaintained / yanked — transitive dep (mailparse/quoted_printable
+  # tree); no functional impact, no upgrade path yet.
+  "RUSTSEC-2026-0105",
 ]
 
 [bans]

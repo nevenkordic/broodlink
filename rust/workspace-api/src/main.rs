@@ -436,6 +436,11 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/skills/:id/markdown",
             get(skills::get_markdown).post(skills::set_markdown),
         )
+        .route("/skills/:id/test", post(skills::llm_stub))
+        .route("/skills/:id/test-status", get(skills::llm_stub))
+        .route("/skills/audit-all", post(skills::llm_stub))
+        .route("/skills/audit-all/status", get(skills::llm_stub))
+        .route("/skills/audit-all/cancel", post(skills::llm_stub))
         // --- compare ---
         .route("/compare/start", post(compare::start))
         .route("/compare/record", post(compare::record))

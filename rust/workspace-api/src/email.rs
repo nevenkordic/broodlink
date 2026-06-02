@@ -760,8 +760,6 @@ pub async fn list_mail(
 #[derive(Deserialize)]
 pub struct AccountQuery {
     account_id: Option<String>,
-    #[serde(default = "default_inbox")]
-    folder: String,
 }
 
 pub async fn folders(
