@@ -81,6 +81,9 @@ pub struct Config {
     // --- proactive skills ---
     #[serde(default)]
     pub notifications: NotificationsConfig,
+    // --- workspace UI (absorbed from the workspace app): notes, tasks, calendar, email, docs ---
+    #[serde(default)]
+    pub workspace_api: WorkspaceApiConfig,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -243,6 +246,44 @@ pub struct StatusApiConfig {
     #[serde(default)]
     pub cors_origins: Vec<String>,
     pub api_key_name: String,
+}
+
+/// Config for the workspace-api service — the user-facing Broodlink web app
+/// (notes, tasks, calendar, email, documents) absorbed from the workspace app.
+#[derive(Deserialize, Clone, Debug)]
+pub struct WorkspaceApiConfig {
+    #[serde(default = "default_workspace_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_workspace_port")]
+    pub port: u16,
+    /// Directory holding the static SPA frontend (the workspace app's `static/`).
+    #[serde(default = "default_workspace_ui_dir")]
+    pub ui_dir: String,
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
+}
+
+impl Default for WorkspaceApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_workspace_enabled(),
+            port: default_workspace_port(),
+            ui_dir: default_workspace_ui_dir(),
+            cors_origins: Vec::new(),
+        }
+    }
+}
+
+fn default_workspace_enabled() -> bool {
+    true
+}
+
+fn default_workspace_port() -> u16 {
+    8800
+}
+
+fn default_workspace_ui_dir() -> String {
+    "workspace-ui".to_string()
 }
 
 #[derive(Deserialize, Clone, Debug)]
