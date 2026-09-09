@@ -26,6 +26,8 @@ purpose of operating hosted Broodlink services.
 - No `unwrap()` or `expect()` in production code
 - No secrets in committed files
 - AGPL-3.0-or-later header in every source file
+- Comments and headers attributed to Neven Kordic <neven@broodlink.ai> only
+- No `Co-authored-by` trailers on commits
 - `cargo deny check` must pass
 - WCAG 2.1 AA for all Hugo site changes
 
