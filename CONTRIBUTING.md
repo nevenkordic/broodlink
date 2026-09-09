@@ -34,6 +34,8 @@ bash scripts/install-git-hooks.sh
 - No `unwrap()` or `expect()` in production code
 - No secrets in committed files (`.env`, keys, SOPS payloads, live API keys)
 - AGPL-3.0-or-later header in every source file
+- Comments and headers attributed to Neven Kordic <neven@broodlink.ai> only
+- No `Co-authored-by` trailers on commits
 - `cargo deny check` must pass
 - `bash tests/security-audit.sh` must pass
 - WCAG 2.1 AA for all Hugo site changes

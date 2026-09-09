@@ -60,7 +60,9 @@ Thumbs.db
 .idea/
 .vscode/
 .claude/
-.cursor/
+.cursor/*
+!.cursor/rules/
+!.cursor/rules/**
 *.swp
 .aider.chat.history.md
 .aider.input.history
