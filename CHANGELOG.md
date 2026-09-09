@@ -481,6 +481,11 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
   only `.env.example`, and added a tracked pre-commit hook
   (`scripts/install-git-hooks.sh`). The audit treats `.env.example` as the
   sole public env template and rejects non-placeholder values.
+- **Config test isolation**: `Config::load_from` so broodlink-config unit tests
+  no longer race on the process-global `BROODLINK_CONFIG` env var.
+- **Dependency patches**: anyhow 1.0.104, crossbeam-epoch 0.9.21, h2 0.4.16.
+  Remaining transitive advisories (h2 0.3.x, lopdf via pdf-extract) ignored
+  in deny.toml until upstream upgrades.
 
 ### Added
 
