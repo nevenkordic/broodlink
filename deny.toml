@@ -48,6 +48,10 @@ ignore = [
   # core2 unmaintained / yanked — transitive dep (mailparse/quoted_printable
   # tree); no functional impact, no upgrade path yet.
   "RUSTSEC-2026-0105",
+  # lopdf unbounded recursion / stack overflow on crafted PDFs — transitive
+  # via pdf-extract 0.7 → lopdf 0.34. Fixed in lopdf 0.42 / pdf-extract 0.12;
+  # that bump needs a newer rustc (let-chains) and is a separate upgrade.
+  "RUSTSEC-2026-0187",
 ]
 
 [bans]

@@ -94,6 +94,7 @@ jobs:
           --ignore RUSTSEC-2026-0099
           --ignore RUSTSEC-2026-0104
           --ignore RUSTSEC-2026-0105
+          --ignore RUSTSEC-2026-0187
 
   shellcheck:
     name: ShellCheck
