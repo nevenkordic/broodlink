@@ -28,6 +28,8 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
   tools. The child gets its own JWT, allow-listed tools, and budget. Parent
   joins on a summary only. Telegram / Slack / Teams chat can call the same
   tools (local or docker only; worker JWTs are stripped from replies).
+  Phrases like “spawn a worker to …” run the tool directly so a weak
+  chat model cannot talk instead of spawning.
 - **Pluggable runtimes**: `[runtimes.<name>]` with `local`, `docker`, `ssh`,
   and `remote-idle`. Coordinator picks the runtime (default `local`). Local
   and Docker plans share the same audit payload for a given task.
