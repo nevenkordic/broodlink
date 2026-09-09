@@ -28,6 +28,8 @@ purpose of operating hosted Broodlink services.
 - AGPL-3.0-or-later header in every source file
 - Comments and headers attributed to Neven Kordic <neven@broodlink.ai> only
 - No `Co-authored-by` trailers on commits
+- Work locally; push and open a PR only when the change is finished
+- This repository is public — never push secrets or unfinished experiments
 - `cargo deny check` must pass
 - WCAG 2.1 AA for all Hugo site changes
 
