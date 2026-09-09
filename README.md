@@ -381,7 +381,7 @@ Broodlink applies defence-in-depth across all services:
 | **Resilience** | Fail-closed guardrails, fail-closed condition evaluation, circuit breakers, rate limiting, SSE stream caps (100 max, 1h TTL) |
 | **Network** | Explicit CORS origin allowlist, parameterized SQL queries throughout, sanitized error responses (no internal details leaked to clients) |
 | **Container** | `read_only: true`, `no-new-privileges`, dropped capabilities in production compose |
-| **CI** | `cargo-deny` license and advisory audit, `cargo fmt` enforcement, gitleaks + `tests/security-audit.sh` secret scan |
+| **CI** | `cargo-deny` license and advisory audit, `cargo fmt` enforcement, gitleaks + `tests/security-audit.sh` secret scan. Release compile is a separate **Build** workflow (`.github/workflows/build.yml`) |
 
 ## External Integrations
 

@@ -251,6 +251,20 @@ else
   fail "CI workflow missing secret scan"
 fi
 
+if [[ -f .github/workflows/build.yml ]] \
+  && grep -qE '^name: Build$' .github/workflows/build.yml \
+  && grep -qE 'cargo build --workspace --release' .github/workflows/build.yml; then
+  pass "Build is a separate GitHub Actions workflow"
+else
+  fail "Build workflow missing or not named Build"
+fi
+
+if grep -qE 'cargo build --workspace --release' .github/workflows/ci.yml; then
+  fail "CI workflow still contains the release build (must live in Build)"
+else
+  pass "CI workflow does not include the release build"
+fi
+
 echo ""
 echo "=== Policy self-tests ==="
 

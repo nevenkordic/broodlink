@@ -475,6 +475,9 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 
 ### Security
 
+- **Separate Build workflow**: Release `cargo build` moved from `CI` into
+  `.github/workflows/build.yml` so lint/test/secret-scan stay independent of
+  the compile check.
 - **Public-repo secret leak prevention**: CI now runs `tests/security-audit.sh`
   and gitleaks (working tree + git history) on every pull request. Tightened
   `.gitignore` (env files, keystores, SSH keys, local config), allowlisted

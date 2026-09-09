@@ -52,22 +52,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
-  build:
-    name: Build (release)
-    runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, security, secrets]
-    env:
-      RUSTFLAGS: "-D warnings"
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Hugo
-        run: curl -fsSL "https://github.com/gohugoio/hugo/releases/download/v${HUGO_VERSION}/hugo_extended_${HUGO_VERSION}_linux-amd64.tar.gz" | tar xz -C /usr/local/bin hugo
-      - name: Build static assets
-        run: hugo --minify --source status-site
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace --release
-
   security:
     name: Security audit
     runs-on: ubuntu-latest
