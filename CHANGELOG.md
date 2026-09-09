@@ -9,9 +9,10 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 
 ### Changed
 
-- **Chat thinking is now configurable**: `[chat] thinking_enabled` (default
-  `true`) controls whether Telegram/chat sends `think: true` to Ollama.
-  Set `false` to skip hidden reasoning tokens and reply faster.
+- **Chat thinking is now configurable**: `[chat] thinking_mode` is `on`,
+  `off`, or `auto`. `auto` thinks only for tool use and complex tasks
+  (including coding), not small talk. `[chat] thinking_enabled` remains
+  the fallback when `thinking_mode` is unset (`true` → on, `false` → off).
 
 ### Added
 

@@ -4655,10 +4655,13 @@ async fn handle_ollama_recovery(
         "model": primary_model,
         "messages": messages,
         "stream": false,
-        "think": chat_should_think(
+        "think": chat_think_for_turn(
             primary_model,
             is_vision_model,
-            state.config.chat.thinking_enabled
+            &state.config.chat.thinking_mode,
+            state.config.chat.thinking_enabled,
+            last_user_from_messages(messages),
+            false,
         ),
         "options": {
             "temperature": 0.7,
@@ -4795,6 +4798,7 @@ async fn handle_ollama_recovery(
         fallback_model,
         messages,
         num_ctx,
+        &state.config.chat.thinking_mode,
         state.config.chat.thinking_enabled,
     )
     .await
@@ -4809,6 +4813,7 @@ async fn fallback_chat(
     fallback_model: &str,
     messages: &[serde_json::Value],
     num_ctx: u32,
+    thinking_mode: &str,
     thinking_enabled: bool,
 ) -> String {
     // Replace the system prompt with one suited for the fallback model
@@ -4829,7 +4834,14 @@ async fn fallback_chat(
         "model": fallback_model,
         "messages": fallback_messages,
         "stream": false,
-        "think": chat_should_think(fallback_model, false, thinking_enabled),
+        "think": chat_think_for_turn(
+            fallback_model,
+            false,
+            thinking_mode,
+            thinking_enabled,
+            last_user_from_messages(messages),
+            false,
+        ),
         "options": {
             "temperature": 0.7,
             "num_predict": 4096_u32,
@@ -5781,14 +5793,139 @@ async fn is_unrestricted_code_mode(state: &AppState) -> bool {
 }
 
 /// Whether a chat/Ollama request should enable thinking tokens.
-/// `thinking_enabled` is `[chat].thinking_enabled` — Telegram waits on hidden
-/// reasoning when this is true.
+/// `thinking_enabled` is the master/capability switch after mode resolution.
 fn chat_should_think(model: &str, has_images: bool, thinking_enabled: bool) -> bool {
     if !thinking_enabled {
         return false;
     }
     let is_legacy_gemma = model.starts_with("gemma") && !model.starts_with("gemma4");
     !has_images && !is_legacy_gemma && !model.contains("-coder")
+}
+
+/// Resolve `[chat].thinking_mode` with `thinking_enabled` as fallback.
+fn resolve_thinking_mode(thinking_mode: &str, thinking_enabled: bool) -> &'static str {
+    match thinking_mode.trim().to_ascii_lowercase().as_str() {
+        "on" | "always" => "on",
+        "off" | "never" => "off",
+        "auto" | "selective" => "auto",
+        _ if thinking_enabled => "on",
+        _ => "off",
+    }
+}
+
+/// User text that likely needs a tool (search, schedule, files, commands).
+fn chat_has_tool_intent(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    const TOOL_PHRASES: &[&str] = &[
+        "search the web",
+        "search online",
+        "look up",
+        "look it up",
+        "google ",
+        "browse ",
+        "check online",
+        "latest news",
+        "current price",
+        "schedule ",
+        "remind me",
+        "cancel the task",
+        "cancel task",
+        "list scheduled",
+        "read the file",
+        "read file",
+        "write the file",
+        "write file",
+        "edit the file",
+        "run the test",
+        "run tests",
+        "run the command",
+        "run command",
+        "use tools",
+        "use a tool",
+        "fetch the page",
+        "open the url",
+    ];
+    TOOL_PHRASES.iter().any(|p| lower.contains(p))
+}
+
+/// Non-code work that still benefits from a reasoning pass.
+fn chat_is_complex(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if classify_model_domain(trimmed) == "code" {
+        return true;
+    }
+    if trimmed.chars().count() >= 400 {
+        return true;
+    }
+    let question_marks = trimmed.matches('?').count();
+    if question_marks >= 2 {
+        return true;
+    }
+    let lower = trimmed.to_lowercase();
+    const COMPLEX_PHRASES: &[&str] = &[
+        "step by step",
+        "trade-off",
+        "tradeoff",
+        "root cause",
+        "compare ",
+        "contrast ",
+        "analyze ",
+        "analyse ",
+        "evaluate ",
+        "design ",
+        "architect",
+        "plan a ",
+        "plan the ",
+        "diagnose",
+        "debug",
+        "optimize",
+        "optimise",
+        "prove ",
+        "derive ",
+        "walk me through",
+        "break down",
+    ];
+    if COMPLEX_PHRASES.iter().any(|p| lower.contains(p)) {
+        return true;
+    }
+    let has_why = lower.starts_with("why ") || lower.contains(" why ");
+    let has_how = lower.starts_with("how ") || lower.contains(" how ");
+    has_why && has_how
+}
+
+/// Auto mode: think when tools are in play or the task is complex (incl. code).
+fn chat_auto_should_think(text: &str, using_tools: bool) -> bool {
+    using_tools || chat_is_complex(text) || chat_has_tool_intent(text)
+}
+
+fn last_user_from_messages(messages: &[serde_json::Value]) -> &str {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        .and_then(|m| m.get("content").and_then(|c| c.as_str()))
+        .unwrap_or("")
+}
+
+fn chat_think_for_turn(
+    model: &str,
+    has_images: bool,
+    thinking_mode: &str,
+    thinking_enabled: bool,
+    last_user: &str,
+    using_tools: bool,
+) -> bool {
+    match resolve_thinking_mode(thinking_mode, thinking_enabled) {
+        "off" => false,
+        "on" => chat_should_think(model, has_images, true),
+        _ => {
+            chat_should_think(model, has_images, true)
+                && chat_auto_should_think(last_user, using_tools)
+        }
+    }
 }
 
 async fn call_ollama_chat(
@@ -6459,6 +6596,7 @@ async fn call_ollama_chat(
                 fallback,
                 &messages,
                 state.config.ollama.num_ctx,
+                &state.config.chat.thinking_mode,
                 state.config.chat.thinking_enabled,
             )
             .await;
@@ -6468,11 +6606,7 @@ async fn call_ollama_chat(
     // Some models don't support thinking mode (legacy vision models, qwen3-coder).
     // Gemma 4 supports thinking and tool calling natively; only legacy gemma3 is excluded.
     let is_legacy_gemma = model.starts_with("gemma") && !model.starts_with("gemma4");
-    let is_think_capable = chat_should_think(
-        model,
-        params.images.is_some(),
-        state.config.chat.thinking_enabled,
-    );
+    let last_user = last_user_msg.unwrap_or("");
 
     for round in 0..=max_rounds {
         // Include tools only on rounds where the model can still call them.
@@ -6480,7 +6614,19 @@ async fn call_ollama_chat(
         // Gemma 4 has native vision + tool calling, so it is NOT excluded here.
         let is_vision = params.images.is_some() && is_legacy_gemma;
         let include_tools = !is_vision && round < max_rounds && tools_def.is_some();
-        let use_think = is_think_capable;
+        let using_tools = round > 0 || (include_tools && chat_has_tool_intent(last_user));
+        let use_think = chat_think_for_turn(
+            model,
+            params.images.is_some(),
+            &state.config.chat.thinking_mode,
+            state.config.chat.thinking_enabled,
+            last_user,
+            using_tools,
+        );
+        info!(
+            think = use_think,
+            round, using_tools, "chat thinking decision"
+        );
         // With think:true, thinking tokens eat into num_predict budget.
         // qwen3.5 thinking chains can use 3000-6000+ tokens alone.
         // Must give enough room for thinking + full content.
@@ -7352,10 +7498,13 @@ async fn call_ollama_chat(
                     "model": model,
                     "messages": retry_msgs,
                     "stream": false,
-                    "think": chat_should_think(
+                    "think": chat_think_for_turn(
                         model,
                         false,
-                        state.config.chat.thinking_enabled
+                        &state.config.chat.thinking_mode,
+                        state.config.chat.thinking_enabled,
+                        last_user,
+                        true,
                     ),
                     "tools": schedule_tools,
                     "options": {
@@ -7499,10 +7648,13 @@ async fn call_ollama_chat(
                                     "model": model,
                                     "messages": summarize_msgs,
                                     "stream": false,
-                                    "think": chat_should_think(
+                                    "think": chat_think_for_turn(
                                         model,
                                         false,
-                                        state.config.chat.thinking_enabled
+                                        &state.config.chat.thinking_mode,
+                                        state.config.chat.thinking_enabled,
+                                        last_user,
+                                        true,
                                     ),
                                     "options": {
                                         "temperature": 0.3,
@@ -8824,6 +8976,79 @@ mod tests {
             !chat_should_think("gemma4:31b", true, true),
             "image turns skip thinking"
         );
+    }
+
+    #[test]
+    fn test_resolve_thinking_mode() {
+        assert_eq!(resolve_thinking_mode("auto", false), "auto");
+        assert_eq!(resolve_thinking_mode("on", false), "on");
+        assert_eq!(resolve_thinking_mode("off", true), "off");
+        assert_eq!(resolve_thinking_mode("", true), "on");
+        assert_eq!(resolve_thinking_mode("", false), "off");
+    }
+
+    #[test]
+    fn test_chat_simple_stays_fast() {
+        assert!(!chat_is_complex("Who are you?"));
+        assert!(!chat_is_complex("What's the weather like today?"));
+        assert!(!chat_has_tool_intent("Who are you?"));
+        assert!(!chat_auto_should_think("You there?", false));
+        assert!(
+            !chat_think_for_turn(
+                "glm-4.7-flash:q8_0",
+                false,
+                "auto",
+                true,
+                "Who are you and what llm model are you?",
+                false
+            ),
+            "small talk must not think in auto mode"
+        );
+    }
+
+    #[test]
+    fn test_chat_thinks_on_tools_and_complex() {
+        assert!(chat_has_tool_intent(
+            "Search the web for the latest GLM release"
+        ));
+        assert!(chat_has_tool_intent(
+            "Remind me tomorrow to restart the stack"
+        ));
+        assert!(chat_is_complex(
+            "Compare SQLite and Postgres for a multi-tenant SaaS and recommend one"
+        ));
+        assert!(chat_is_complex(
+            "Why did this fail and how do we fix the retry path?"
+        ));
+        assert!(chat_auto_should_think("You there?", true));
+        assert!(chat_auto_should_think(
+            "implement a function that handles the API endpoint",
+            false
+        ));
+        assert!(chat_think_for_turn(
+            "glm-4.7-flash:q8_0",
+            false,
+            "auto",
+            true,
+            "Search the web for rust 2024 edition notes",
+            false
+        ));
+        assert!(chat_think_for_turn(
+            "glm-4.7-flash:q8_0",
+            false,
+            "auto",
+            true,
+            "hi",
+            true
+        ));
+        assert!(!chat_think_for_turn(
+            "glm-4.7-flash:q8_0",
+            false,
+            "off",
+            true,
+            "Search the web for rust",
+            true
+        ));
     }
 
     // -----------------------------------------------------------------------
