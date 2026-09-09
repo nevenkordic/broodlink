@@ -327,6 +327,8 @@ struct AppState {
     pending_commands: tokio::sync::RwLock<HashMap<String, PendingCommandEntry>>,
     // v0.12.0: Cached runtime setting — unrestricted code mode (10s TTL)
     unrestricted_code_mode: tokio::sync::RwLock<Option<(bool, std::time::Instant)>>,
+    /// Fingerprint of configured chat/code/vision/fallback models last synced to memory.
+    last_runtime_identity: tokio::sync::RwLock<Option<String>>,
 }
 
 /// v0.10.0: Pending write approval waiting for user confirmation.
@@ -572,6 +574,7 @@ async fn async_main() {
         pending_writes: tokio::sync::RwLock::new(HashMap::new()),
         pending_commands: tokio::sync::RwLock::new(HashMap::new()),
         unrestricted_code_mode: tokio::sync::RwLock::new(None),
+        last_runtime_identity: tokio::sync::RwLock::new(None),
     });
 
     // Spawn chat reply delivery loop
@@ -4820,8 +4823,11 @@ async fn fallback_chat(
     let mut fallback_messages = Vec::with_capacity(messages.len());
     fallback_messages.push(serde_json::json!({
         "role": "system",
-        "content": "You are Broodlink, a knowledgeable AI assistant. You can discuss any topic. \
-            Be extremely brief — 1-3 short sentences max. Just give the answer."
+        "content": format!(
+            "You are Broodlink, a knowledgeable AI assistant. You can discuss any topic. \
+             Be extremely brief — 1-3 short sentences max. Just give the answer.{}",
+            chat_model_identity_block(fallback_model)
+        )
     }));
     // Copy user/assistant messages (skip original system prompt)
     for msg in messages {
@@ -5014,6 +5020,13 @@ async fn extract_and_store_memory(state: Arc<AppState>, user_msg: String, assist
             .trim()
             .to_string();
         if topic.is_empty() || content.is_empty() {
+            continue;
+        }
+        if should_skip_identity_memory(&topic, &content) {
+            info!(
+                topic = %topic,
+                "auto-memory: skipped model-identity fact (runtime-owned)"
+            );
             continue;
         }
         match bridge_call(
@@ -5928,6 +5941,409 @@ fn chat_think_for_turn(
     }
 }
 
+const IDENTITY_MEMORY_TOPICS: &[&str] = &[
+    "assistant-identity",
+    "assistant-model-knowledge",
+    "assistant-runtime-model",
+    "assistant-model",
+];
+const RUNTIME_IDENTITY_HEADING: &str = "## Runtime identity";
+
+fn chat_model_family(model: &str) -> String {
+    let name = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .split(':')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    if name.contains("glm") || name.contains("chatglm") {
+        "glm".into()
+    } else if name.contains("gemma") || name.contains("gemini") {
+        "gemma".into()
+    } else if name.contains("qwen") {
+        "qwen".into()
+    } else if name.contains("deepseek") {
+        "deepseek".into()
+    } else if name.contains("llama") {
+        "llama".into()
+    } else if name.contains("mistral") || name.contains("mixtral") {
+        "mistral".into()
+    } else if name.contains("phi") {
+        "phi".into()
+    } else if name.contains("kimi") || name.contains("moonshot") {
+        "kimi".into()
+    } else if name.contains("gpt") || name.contains("chatgpt") {
+        "gpt".into()
+    } else if name.contains("claude") {
+        "claude".into()
+    } else {
+        name.split(['-', '.']).next().unwrap_or(&name).to_string()
+    }
+}
+
+fn model_family_aliases(family: &str) -> &'static [&'static str] {
+    match family {
+        "glm" => &["glm", "zhipu", "z.ai", "chatglm"],
+        "gemma" => &["gemma", "gemini"],
+        "qwen" => &["qwen", "tongyi", "alibaba"],
+        "deepseek" => &["deepseek"],
+        "llama" => &["llama", "meta"],
+        "mistral" => &["mistral", "mixtral"],
+        "phi" => &["phi"],
+        "kimi" => &["kimi", "moonshot"],
+        "gpt" => &["gpt", "chatgpt", "openai"],
+        "claude" => &["claude", "anthropic"],
+        _ => &[],
+    }
+}
+
+fn content_claims_google_model(content_lower: &str) -> bool {
+    content_lower.contains("trained by google")
+        || content_lower.contains("developed by google")
+        || content_lower.contains("created by google")
+        || content_lower.contains("made by google")
+        || content_lower.contains("google's gemma")
+        || content_lower.contains("google gemma")
+}
+
+fn is_self_referential_identity(content_lower: &str) -> bool {
+    content_lower.contains("i am")
+        || content_lower.contains("i'm")
+        || content_lower.contains("assistant")
+        || content_lower.contains("this model")
+        || content_lower.contains("my model")
+        || content_lower.contains("language model")
+        || content_lower.contains("trained by")
+        || content_lower.contains("developed by")
+        || content_lower.contains("created by")
+        || content_lower.contains("made by")
+}
+
+fn mentions_known_model_or_vendor(content_lower: &str) -> bool {
+    const NEEDLES: &[&str] = &[
+        "gemma",
+        "gemini",
+        "glm",
+        "qwen",
+        "deepseek",
+        "llama",
+        "mistral",
+        "mixtral",
+        "chatgpt",
+        "openai",
+        "claude",
+        "anthropic",
+        "zhipu",
+        "alibaba",
+        "tongyi",
+        "moonshot",
+        "kimi",
+        "trained by google",
+        "developed by google",
+        "created by google",
+        "made by google",
+    ];
+    NEEDLES.iter().any(|n| content_lower.contains(n))
+}
+
+fn is_identity_memory_topic(topic: &str) -> bool {
+    let t = topic.trim().to_ascii_lowercase();
+    IDENTITY_MEMORY_TOPICS.iter().any(|known| t == *known)
+        || t.contains("assistant-identity")
+        || t.contains("assistant-model")
+        || t.contains("runtime-model")
+}
+
+fn is_assistant_identity_claim(topic: &str, content: &str) -> bool {
+    if is_identity_memory_topic(topic) {
+        return true;
+    }
+    let c = content.to_ascii_lowercase();
+    is_self_referential_identity(&c) && mentions_known_model_or_vendor(&c)
+}
+
+fn should_skip_identity_memory(topic: &str, content: &str) -> bool {
+    is_identity_memory_topic(topic) || is_assistant_self_model_claim(content)
+}
+
+fn is_assistant_self_model_claim(content: &str) -> bool {
+    let c = content.to_ascii_lowercase();
+    if !mentions_known_model_or_vendor(&c) {
+        return false;
+    }
+    c.contains("trained by")
+        || c.contains("developed by")
+        || c.contains("created by")
+        || c.contains("made by")
+        || c.contains("this model")
+        || c.contains("language model")
+        || c.contains("the assistant")
+        || ((c.contains("i am") || c.contains("i'm a") || c.contains("i'm "))
+            && (c.contains("gemma")
+                || c.contains("gemini")
+                || c.contains("glm")
+                || c.contains("qwen")
+                || c.contains("gpt")
+                || c.contains("claude")
+                || c.contains("llama")
+                || c.contains("mistral")
+                || c.contains("deepseek")))
+}
+
+fn identity_claim_matches_serving_model(content: &str, serving_model: &str) -> bool {
+    let c = content.to_ascii_lowercase();
+    let model_l = serving_model.to_ascii_lowercase();
+    if !model_l.is_empty() && c.contains(&model_l) {
+        return true;
+    }
+    let family = chat_model_family(serving_model);
+    if model_family_aliases(&family)
+        .iter()
+        .any(|alias| c.contains(alias))
+    {
+        return true;
+    }
+    family == "gemma" && content_claims_google_model(&c)
+}
+
+fn memory_is_stale_identity(topic: &str, content: &str, serving_model: &str) -> bool {
+    is_assistant_identity_claim(topic, content)
+        && !identity_claim_matches_serving_model(content, serving_model)
+}
+
+fn chat_model_identity_block(serving_model: &str) -> String {
+    format!(
+        "\n\n{RUNTIME_IDENTITY_HEADING}\n\
+         You are Broodlink, a local assistant. This turn is served by `{serving_model}` via Ollama.\n\
+         When asked who you are or which model you are, answer with that exact model name.\n\
+         Do not claim to be a different model, a hosted vendor product, or trained by another lab \
+         unless that matches `{serving_model}`.\n\
+         Ignore any memory that names a different model or vendor."
+    )
+}
+
+fn strip_runtime_identity_section(prompt: &str) -> String {
+    let marker = format!("\n\n{RUNTIME_IDENTITY_HEADING}\n");
+    let Some(start) = prompt.find(&marker) else {
+        return prompt.to_string();
+    };
+    let after = &prompt[start + 2..];
+    if let Some(next_rel) = after.find("\n\n## ") {
+        let end = start + 2 + next_rel;
+        let mut out = String::with_capacity(prompt.len() - (end - start));
+        out.push_str(&prompt[..start]);
+        out.push_str(&prompt[end..]);
+        out
+    } else {
+        prompt[..start].to_string()
+    }
+}
+
+fn filter_stale_identity_memory_lines(prompt: &str, serving_model: &str) -> String {
+    prompt
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix("- ") else {
+                return true;
+            };
+            let (topic, content) = rest.split_once(": ").unwrap_or(("", rest));
+            !memory_is_stale_identity(topic, content, serving_model)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn rewrite_system_prompt_for_serving_model(prompt: &str, serving_model: &str) -> String {
+    let stripped = strip_runtime_identity_section(prompt);
+    let mut filtered = filter_stale_identity_memory_lines(&stripped, serving_model);
+    filtered.push_str(&chat_model_identity_block(serving_model));
+    filtered
+}
+
+fn apply_serving_model_identity(messages: &mut [serde_json::Value], serving_model: &str) {
+    let Some(sys) = messages
+        .iter_mut()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+    else {
+        return;
+    };
+    let Some(content) = sys.get("content").and_then(|c| c.as_str()) else {
+        return;
+    };
+    sys["content"] = serde_json::json!(rewrite_system_prompt_for_serving_model(
+        content,
+        serving_model
+    ));
+}
+
+fn chat_runtime_identity_fingerprint(chat: &broodlink_config::ChatConfig) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        chat.chat_model.trim(),
+        chat.chat_code_model.trim(),
+        chat.chat_vision_model.trim(),
+        chat.chat_fallback_model.trim()
+    )
+}
+
+fn chat_runtime_identity_content(chat: &broodlink_config::ChatConfig) -> String {
+    let code = if chat.chat_code_model.is_empty() {
+        chat.chat_model.as_str()
+    } else {
+        chat.chat_code_model.as_str()
+    };
+    let vision = if chat.chat_vision_model.is_empty() {
+        "none"
+    } else {
+        chat.chat_vision_model.as_str()
+    };
+    let fallback = if chat.chat_fallback_model.is_empty() {
+        "none"
+    } else {
+        chat.chat_fallback_model.as_str()
+    };
+    format!(
+        "Broodlink is a local assistant on Ollama. Current chat model: {}. \
+         Code model: {}. Vision model: {}. Fallback model: {}. \
+         This is not a hosted vendor chatbot.",
+        chat.chat_model, code, vision, fallback
+    )
+}
+
+fn runtime_identity_changed(previous_fingerprint: Option<&str>, current_fingerprint: &str) -> bool {
+    previous_fingerprint != Some(current_fingerprint)
+}
+
+async fn sync_runtime_model_identity(state: &AppState) {
+    if !state.config.chat.memory_enabled {
+        return;
+    }
+    let fingerprint = chat_runtime_identity_fingerprint(&state.config.chat);
+    {
+        let cached = state.last_runtime_identity.read().await;
+        if !runtime_identity_changed(cached.as_deref(), &fingerprint) {
+            return;
+        }
+    }
+
+    let expected = chat_runtime_identity_content(&state.config.chat);
+    let recalled = bridge_call(
+        state,
+        "recall_memory",
+        serde_json::json!({
+            "topic_search": "assistant-runtime-model",
+            "limit": 10
+        }),
+    )
+    .await;
+    let stored = recalled.ok().and_then(|data| {
+        data.get("memories")
+            .and_then(|m| m.as_array())
+            .and_then(|rows| {
+                rows.iter().find_map(|row| {
+                    let topic = row.get("topic").and_then(|t| t.as_str()).unwrap_or("");
+                    if topic == "assistant-runtime-model" {
+                        row.get("content")
+                            .and_then(|c| c.as_str())
+                            .map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+            })
+    });
+    if stored.as_deref().map(str::trim) == Some(expected.trim()) {
+        *state.last_runtime_identity.write().await = Some(fingerprint);
+        return;
+    }
+
+    info!(
+        models = %fingerprint,
+        "configured models changed — refreshing runtime identity memories"
+    );
+
+    for topic in IDENTITY_MEMORY_TOPICS {
+        if let Err(e) = bridge_call(
+            state,
+            "delete_memory",
+            serde_json::json!({ "topic": topic }),
+        )
+        .await
+        {
+            warn!(error = %e, topic = %topic, "failed to delete stale identity memory");
+        }
+    }
+
+    if let Ok(data) = bridge_call(
+        state,
+        "recall_memory",
+        serde_json::json!({
+            "topic_search": "assistant-",
+            "limit": 50
+        }),
+    )
+    .await
+    {
+        if let Some(rows) = data.get("memories").and_then(|m| m.as_array()) {
+            for row in rows {
+                let topic = row.get("topic").and_then(|t| t.as_str()).unwrap_or("");
+                let content = row.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                if topic.is_empty() || IDENTITY_MEMORY_TOPICS.contains(&topic) {
+                    continue;
+                }
+                if is_assistant_identity_claim(topic, content) {
+                    if let Err(e) = bridge_call(
+                        state,
+                        "delete_memory",
+                        serde_json::json!({ "topic": topic }),
+                    )
+                    .await
+                    {
+                        warn!(
+                            error = %e,
+                            topic = %topic,
+                            "failed to delete extra stale identity memory"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let identity_content = format!(
+        "Broodlink is currently served by {} via local Ollama. \
+         It is a local assistant, not a hosted vendor chatbot.",
+        state.config.chat.chat_model
+    );
+    let mut stored_ok = true;
+    for (topic, content) in [
+        ("assistant-runtime-model", expected.as_str()),
+        ("assistant-identity", identity_content.as_str()),
+    ] {
+        if let Err(e) = bridge_call(
+            state,
+            "store_memory",
+            serde_json::json!({
+                "topic": topic,
+                "content": content,
+                "tags": "runtime,identity"
+            }),
+        )
+        .await
+        {
+            stored_ok = false;
+            warn!(error = %e, topic = %topic, "failed to store runtime identity memory");
+        }
+    }
+
+    if stored_ok {
+        *state.last_runtime_identity.write().await = Some(fingerprint);
+    }
+}
+
 async fn call_ollama_chat(
     state: &AppState,
     history: &[(String, String)],
@@ -6547,6 +6963,7 @@ async fn call_ollama_chat(
 
     let model = &resolved_model;
     let fallback = &chat_cfg.chat_fallback_model;
+    sync_runtime_model_identity(state).await;
 
     // Degraded mode: skip primary model if it recently failed with OOM.
     // Periodically retry (every DEGRADED_RETRY_INTERVAL) to detect recovery.
@@ -6602,6 +7019,9 @@ async fn call_ollama_chat(
             .await;
         }
     }
+
+    apply_serving_model_identity(&mut messages, model);
+    info!(model = %model, "chat using model");
 
     // Some models don't support thinking mode (legacy vision models, qwen3-coder).
     // Gemma 4 supports thinking and tool calling natively; only legacy gemma3 is excluded.
@@ -6865,6 +7285,12 @@ async fn call_ollama_chat(
 
                             if content.is_empty() {
                                 "Error: content is required for remember tool.".to_string()
+                            } else if should_skip_identity_memory(&topic, &content) {
+                                info!(
+                                    topic = %topic,
+                                    "remember: skipped model-identity fact (runtime-owned)"
+                                );
+                                "Skipped: model identity is managed automatically from the current serving model.".to_string()
                             } else {
                                 match bridge_call(
                                     state,
@@ -9049,6 +9475,117 @@ mod tests {
             "Search the web for rust",
             true
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // dynamic serving-model identity
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_chat_model_family_from_tags() {
+        assert_eq!(chat_model_family("glm-4.7-flash:q8_0"), "glm");
+        assert_eq!(chat_model_family("library/qwen3.6:35b"), "qwen");
+        assert_eq!(chat_model_family("gemma4:e4b"), "gemma");
+        assert_eq!(chat_model_family("deepseek-r1:32b"), "deepseek");
+    }
+
+    #[test]
+    fn test_identity_block_names_serving_model() {
+        let block = chat_model_identity_block("glm-4.7-flash:q8_0");
+        assert!(block.contains("glm-4.7-flash:q8_0"));
+        assert!(block.contains(RUNTIME_IDENTITY_HEADING));
+        assert!(!block.contains("gemma4:e4b"));
+    }
+
+    #[test]
+    fn test_stale_google_identity_dropped_for_glm() {
+        assert!(memory_is_stale_identity(
+            "assistant-identity",
+            "The assistant is trained by Google.",
+            "glm-4.7-flash:q8_0"
+        ));
+        assert!(memory_is_stale_identity(
+            "assistant-model-knowledge",
+            "This model was developed by Google.",
+            "glm-4.7-flash:q8_0"
+        ));
+        assert!(!memory_is_stale_identity(
+            "ads-account",
+            "User runs a Google Ads campaign for Broodlink.",
+            "glm-4.7-flash:q8_0"
+        ));
+        assert!(!memory_is_stale_identity(
+            "assistant-runtime-model",
+            "Broodlink is currently served by glm-4.7-flash:q8_0 via local Ollama.",
+            "glm-4.7-flash:q8_0"
+        ));
+    }
+
+    #[test]
+    fn test_rewrite_prompt_filters_stale_identity_and_injects_model() {
+        let prompt = "You are Broodlink.\n\n## Relevant context from memory:\n\
+- assistant-identity: trained by Google\n\
+- user-project: Google Ads campaign\n\
+- assistant-runtime-model: Broodlink is currently served by glm-4.7-flash:q8_0 via local Ollama.";
+        let rewritten = rewrite_system_prompt_for_serving_model(prompt, "glm-4.7-flash:q8_0");
+        assert!(
+            !rewritten.contains("trained by Google"),
+            "stale vendor identity must not reach the model"
+        );
+        assert!(
+            rewritten.contains("Google Ads campaign"),
+            "project memories that mention Google must stay"
+        );
+        assert!(rewritten.contains("served by `glm-4.7-flash:q8_0`"));
+        assert_eq!(
+            rewritten.matches(RUNTIME_IDENTITY_HEADING).count(),
+            1,
+            "identity block must be unique"
+        );
+    }
+
+    #[test]
+    fn test_identity_updates_when_serving_model_changes() {
+        let glm_prompt =
+            rewrite_system_prompt_for_serving_model("You are Broodlink.", "glm-4.7-flash:q8_0");
+        let qwen_prompt = rewrite_system_prompt_for_serving_model(&glm_prompt, "qwen3.6:35b");
+        assert!(qwen_prompt.contains("qwen3.6:35b"));
+        assert!(
+            !qwen_prompt.contains("glm-4.7-flash:q8_0"),
+            "previous serving model must be replaced"
+        );
+        assert_eq!(qwen_prompt.matches(RUNTIME_IDENTITY_HEADING).count(), 1);
+    }
+
+    #[test]
+    fn test_skip_auto_memory_identity_claims() {
+        assert!(should_skip_identity_memory(
+            "assistant-identity",
+            "trained by Google"
+        ));
+        assert!(should_skip_identity_memory(
+            "chat-note",
+            "I am Gemma, a language model developed by Google."
+        ));
+        assert!(!should_skip_identity_memory(
+            "user-project",
+            "User prefers Google Ads for the campaign."
+        ));
+    }
+
+    #[test]
+    fn test_runtime_identity_fingerprint_changes_with_models() {
+        let mut chat = broodlink_config::ChatConfig::default();
+        chat.chat_model = "glm-4.7-flash:q8_0".into();
+        chat.chat_code_model = "glm-4.7-flash:q8_0".into();
+        chat.chat_vision_model = "qwen3.6:35b".into();
+        chat.chat_fallback_model = "gemma4:e4b".into();
+        let before = chat_runtime_identity_fingerprint(&chat);
+        chat.chat_model = "qwen3.6:35b".into();
+        let after = chat_runtime_identity_fingerprint(&chat);
+        assert!(runtime_identity_changed(Some(&before), &after));
+        assert!(!runtime_identity_changed(Some(&after), &after));
+        assert!(chat_runtime_identity_content(&chat).contains("qwen3.6:35b"));
     }
 
     // -----------------------------------------------------------------------
