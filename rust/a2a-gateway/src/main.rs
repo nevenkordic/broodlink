@@ -4655,7 +4655,11 @@ async fn handle_ollama_recovery(
         "model": primary_model,
         "messages": messages,
         "stream": false,
-        "think": !is_vision_model,
+        "think": chat_should_think(
+            primary_model,
+            is_vision_model,
+            state.config.chat.thinking_enabled
+        ),
         "options": {
             "temperature": 0.7,
             "num_predict": 4096_u32,
@@ -4791,6 +4795,7 @@ async fn handle_ollama_recovery(
         fallback_model,
         messages,
         num_ctx,
+        state.config.chat.thinking_enabled,
     )
     .await
 }
@@ -4804,6 +4809,7 @@ async fn fallback_chat(
     fallback_model: &str,
     messages: &[serde_json::Value],
     num_ctx: u32,
+    thinking_enabled: bool,
 ) -> String {
     // Replace the system prompt with one suited for the fallback model
     let mut fallback_messages = Vec::with_capacity(messages.len());
@@ -4823,7 +4829,7 @@ async fn fallback_chat(
         "model": fallback_model,
         "messages": fallback_messages,
         "stream": false,
-        "think": true,
+        "think": chat_should_think(fallback_model, false, thinking_enabled),
         "options": {
             "temperature": 0.7,
             "num_predict": 4096_u32,
@@ -5774,6 +5780,17 @@ async fn is_unrestricted_code_mode(state: &AppState) -> bool {
     enabled
 }
 
+/// Whether a chat/Ollama request should enable thinking tokens.
+/// `thinking_enabled` is `[chat].thinking_enabled` — Telegram waits on hidden
+/// reasoning when this is true.
+fn chat_should_think(model: &str, has_images: bool, thinking_enabled: bool) -> bool {
+    if !thinking_enabled {
+        return false;
+    }
+    let is_legacy_gemma = model.starts_with("gemma") && !model.starts_with("gemma4");
+    !has_images && !is_legacy_gemma && !model.contains("-coder")
+}
+
 async fn call_ollama_chat(
     state: &AppState,
     history: &[(String, String)],
@@ -6442,6 +6459,7 @@ async fn call_ollama_chat(
                 fallback,
                 &messages,
                 state.config.ollama.num_ctx,
+                state.config.chat.thinking_enabled,
             )
             .await;
         }
@@ -6450,8 +6468,11 @@ async fn call_ollama_chat(
     // Some models don't support thinking mode (legacy vision models, qwen3-coder).
     // Gemma 4 supports thinking and tool calling natively; only legacy gemma3 is excluded.
     let is_legacy_gemma = model.starts_with("gemma") && !model.starts_with("gemma4");
-    let is_think_capable =
-        !params.images.is_some() && !is_legacy_gemma && !model.contains("-coder");
+    let is_think_capable = chat_should_think(
+        model,
+        params.images.is_some(),
+        state.config.chat.thinking_enabled,
+    );
 
     for round in 0..=max_rounds {
         // Include tools only on rounds where the model can still call them.
@@ -7331,7 +7352,11 @@ async fn call_ollama_chat(
                     "model": model,
                     "messages": retry_msgs,
                     "stream": false,
-                    "think": true,
+                    "think": chat_should_think(
+                        model,
+                        false,
+                        state.config.chat.thinking_enabled
+                    ),
                     "tools": schedule_tools,
                     "options": {
                         "temperature": 0.3,
@@ -7474,7 +7499,11 @@ async fn call_ollama_chat(
                                     "model": model,
                                     "messages": summarize_msgs,
                                     "stream": false,
-                                    "think": true,
+                                    "think": chat_should_think(
+                                        model,
+                                        false,
+                                        state.config.chat.thinking_enabled
+                                    ),
                                     "options": {
                                         "temperature": 0.3,
                                         "num_predict": 4096_u32,
@@ -8762,6 +8791,38 @@ mod tests {
         assert_eq!(
             strip_confidence_tag("Before [CONFIDENCE: 2/5] after"),
             "Before after"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // chat thinking gate
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_chat_should_think_respects_config() {
+        assert!(
+            chat_should_think("glm-4.7-flash:q8_0", false, true),
+            "GLM chat thinks when enabled"
+        );
+        assert!(
+            !chat_should_think("glm-4.7-flash:q8_0", false, false),
+            "GLM chat must not think when thinking_enabled is false"
+        );
+        assert!(
+            !chat_should_think("gemma3:27b", false, true),
+            "legacy gemma3 is not think-capable"
+        );
+        assert!(
+            chat_should_think("gemma4:31b", false, true),
+            "gemma4 thinks when enabled"
+        );
+        assert!(
+            !chat_should_think("qwen2.5-coder:32b", false, true),
+            "*-coder models skip thinking"
+        );
+        assert!(
+            !chat_should_think("gemma4:31b", true, true),
+            "image turns skip thinking"
         );
     }
 

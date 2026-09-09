@@ -7,6 +7,12 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Chat thinking is now configurable**: `[chat] thinking_enabled` (default
+  `true`) controls whether Telegram/chat sends `think: true` to Ollama.
+  Set `false` to skip hidden reasoning tokens and reply faster.
+
 ### Added
 
 - **Operator setup CLI**: `./broodctl setup`, `model`, and `tools` write
