@@ -17,16 +17,24 @@ purpose of operating hosted Broodlink services.
 3. Make your changes following the code rules below
 4. Ensure `cargo deny check` passes
 5. Ensure `cargo test --workspace` passes
-6. Ensure all source files have the AGPL-3.0-or-later header
-7. Commit using conventional commits: `<type>(<scope>): <description>`
-8. Submit a pull request
+6. Ensure `bash tests/security-audit.sh` passes
+7. Ensure all source files have the AGPL-3.0-or-later header
+8. Commit using conventional commits: `<type>(<scope>): <description>`
+9. Submit a pull request
+
+Install local secret-scan hooks once per clone:
+
+```bash
+bash scripts/install-git-hooks.sh
+```
 
 ## Code Rules
 
 - No `unwrap()` or `expect()` in production code
-- No secrets in committed files
+- No secrets in committed files (`.env`, keys, SOPS payloads, live API keys)
 - AGPL-3.0-or-later header in every source file
 - `cargo deny check` must pass
+- `bash tests/security-audit.sh` must pass
 - WCAG 2.1 AA for all Hugo site changes
 
 ## Security Rules

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Broodlink — Multi-agent AI orchestration
+# Copyright (C) 2025–2026 Neven Kordic <neven@broodlink.ai>
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Blocks commits that would track secrets, keys, or private data.
+# Enable with: bash scripts/install-git-hooks.sh
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+exec bash "$ROOT/tests/security-audit.sh"

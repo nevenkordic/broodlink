@@ -473,6 +473,15 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 
 ## [Unreleased]
 
+### Security
+
+- **Public-repo secret leak prevention**: CI now runs `tests/security-audit.sh`
+  and gitleaks (working tree + git history) on every pull request. Tightened
+  `.gitignore` (env files, keystores, SSH keys, local config), allowlisted
+  only `.env.example`, and added a tracked pre-commit hook
+  (`scripts/install-git-hooks.sh`). The audit treats `.env.example` as the
+  sole public env template and rejects non-placeholder values.
+
 ### Added
 
 - **Visual Workflow Editor**: New standalone `/workflows/` dashboard page with

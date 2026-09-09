@@ -4,13 +4,33 @@
 secrets.enc.toml.key
 *.pem
 *.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+*.ppk
+*.kdbx
 .env
 .env.*
+!.env.example
+.envrc
 .sops.yaml
 secrets.skeleton.toml
 secrets.skeleton.json
 secrets.enc.toml
 secrets.enc.json
+config.local.toml
+*.local.toml
+credentials.json
+service-account*.json
+google-services.json
+GoogleService-Info.plist
+*.sqlite
+*.sqlite3
 
 # Spec (local only)
 broodlink-prompt.md
