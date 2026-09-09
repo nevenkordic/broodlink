@@ -200,6 +200,13 @@ max_command_timeout_secs = 60
 blocked_commands = ["rm -rf /", "shutdown", "reboot", "mkfs", "dd if=", ":(){", "> /dev/sd", "chmod -R 777 /"]
 command_approval_timeout_secs = 120
 
+[runtimes.local]
+backend = "local"
+
+[runtimes.docker]
+backend = "docker"
+image   = "curlimages/curl:8.13.0"
+
 [notifications]
 enabled = true
 default_cooldown_minutes = 30

@@ -84,6 +84,39 @@ pub struct Config {
     // --- workspace UI (absorbed from the workspace app): notes, tasks, calendar, email, docs ---
     #[serde(default)]
     pub workspace_api: WorkspaceApiConfig,
+    // --- isolated workers / pluggable runtimes ---
+    #[serde(default)]
+    pub runtimes: HashMap<String, RuntimeConfig>,
+}
+
+/// Named isolation backend used by `spawn_worker`.
+///
+/// Configured as `[runtimes.<name>]`. The coordinator (and beads-bridge)
+/// pick a runtime per worker; default is an implicit `local` backend.
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct RuntimeConfig {
+    /// One of: `local`, `docker`, `ssh`, `remote-idle`.
+    #[serde(default = "default_runtime_backend")]
+    pub backend: String,
+    /// Container image for the `docker` backend.
+    #[serde(default)]
+    pub image: Option<String>,
+    /// SSH host for the `ssh` backend.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// SSH user for the `ssh` backend.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Working directory inside the isolated runtime.
+    #[serde(default)]
+    pub workdir: Option<String>,
+    /// Seconds of inactivity before a `remote-idle` runtime hibernates.
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
+}
+
+fn default_runtime_backend() -> String {
+    "local".to_string()
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -1382,8 +1415,8 @@ fn expand_tilde(path: &str) -> String {
 }
 
 impl Config {
-    /// Load configuration from file path specified by `BROODLINK_CONFIG` env var,
-    /// with environment variable overrides.
+    /// Load configuration from `BROODLINK_CONFIG` (or `config.toml`) with
+    /// environment variable overrides.
     ///
     /// # Errors
     ///
@@ -1392,9 +1425,19 @@ impl Config {
     pub fn load() -> Result<Self, config::ConfigError> {
         let config_path =
             std::env::var("BROODLINK_CONFIG").unwrap_or_else(|_| "config.toml".to_string());
+        Self::load_from(&config_path)
+    }
 
+    /// Load configuration from an explicit path (tests should use this to
+    /// avoid racing on `BROODLINK_CONFIG`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `config::ConfigError` if the config file is missing, malformed,
+    /// or required fields are absent.
+    pub fn load_from(config_path: &str) -> Result<Self, config::ConfigError> {
         let settings = config::Config::builder()
-            .add_source(config::File::with_name(&config_path))
+            .add_source(config::File::with_name(config_path))
             .add_source(
                 config::Environment::with_prefix("BROODLINK")
                     .separator("_")
@@ -1484,6 +1527,22 @@ impl Config {
             return Err(err(
                 "memory_search.kg_entity_similarity_threshold must be in [0.0, 1.0]",
             ));
+        }
+
+        for (name, runtime) in &self.runtimes {
+            if !matches!(
+                runtime.backend.as_str(),
+                "local" | "docker" | "ssh" | "remote-idle"
+            ) {
+                return Err(err(&format!(
+                    "runtimes.{name}.backend must be local, docker, ssh, or remote-idle"
+                )));
+            }
+            if runtime.backend == "ssh" && runtime.host.as_deref().unwrap_or("").is_empty() {
+                return Err(err(&format!(
+                    "runtimes.{name}.host is required when backend = \"ssh\""
+                )));
+            }
         }
 
         Ok(())
@@ -1772,5 +1831,77 @@ api_key_name = "STATUS_API_KEY"
         );
 
         std::env::remove_var("BROODLINK_CONFIG");
+    }
+
+    #[test]
+    fn test_runtimes_default_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, valid_toml()).unwrap();
+
+        let cfg = Config::load_from(config_path.to_str().unwrap()).unwrap();
+        assert!(
+            cfg.runtimes.is_empty(),
+            "runtimes should default to an empty map"
+        );
+    }
+
+    #[test]
+    fn test_runtimes_named_backends() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+[runtimes.local]
+backend = "local"
+
+[runtimes.docker]
+backend = "docker"
+image = "broodlink/worker:latest"
+
+[runtimes.lab]
+backend = "ssh"
+host = "lab.example"
+user = "broodlink"
+
+[runtimes.burst]
+backend = "remote-idle"
+idle_timeout_secs = 300
+"#,
+        );
+        std::fs::write(&config_path, toml).unwrap();
+
+        let cfg = Config::load_from(config_path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.runtimes.len(), 4);
+        assert_eq!(cfg.runtimes["local"].backend, "local");
+        assert_eq!(
+            cfg.runtimes["docker"].image.as_deref(),
+            Some("broodlink/worker:latest")
+        );
+        assert_eq!(cfg.runtimes["lab"].host.as_deref(), Some("lab.example"));
+        assert_eq!(cfg.runtimes["burst"].idle_timeout_secs, Some(300));
+    }
+
+    #[test]
+    fn test_runtimes_reject_unknown_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let mut toml = valid_toml();
+        toml.push_str(
+            r#"
+[runtimes.bad]
+backend = "kubernetes"
+"#,
+        );
+        std::fs::write(&config_path, toml).unwrap();
+
+        let err = Config::load_from(config_path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("backend"),
+            "unknown runtime backend should fail validation: {err}"
+        );
     }
 }

@@ -5,6 +5,27 @@ All notable changes to Broodlink are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Operator setup CLI**: `./broodctl setup`, `model`, and `tools` write
+  `chat_model` and tool groups (`core`, `files`, `web`, `commands`) so a new
+  machine can go install → setup → first message without hand-editing TOML.
+  `./broodctl drafts` lists, confirms, or dismisses formula drafts.
+- **Self-authoring formulas**: heartbeat drafts a custom formula from a
+  verified multi-step workflow; operator confirm publishes to `custom/` and
+  `formula_registry` (never `is_system`). Searchable by name and tags; later
+  confirms of the same skill bump `version`.
+- **Isolated workers**: `spawn_worker`, `list_workers`, and `join_worker`
+  tools. The child gets its own JWT, allow-listed tools, and budget. Parent
+  joins on a summary only.
+- **Pluggable runtimes**: `[runtimes.<name>]` with `local`, `docker`, `ssh`,
+  and `remote-idle`. Coordinator picks the runtime (default `local`). Local
+  and Docker plans share the same audit payload for a given task.
+- **Schema**: migration `032_formula_drafts_workers` (`formula_drafts`,
+  `workers`). `db-setup.sh` now applies migrations 025–032.
+
 ## [0.12.5] - 2026-04-15
 
 ### Security

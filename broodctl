@@ -6,6 +6,10 @@
 # broodctl — single command to manage the entire Broodlink stack.
 #
 # Usage:
+#   ./broodctl setup    — pick model + tool groups, write config (no hand-edit)
+#   ./broodctl model    — show or set chat_model
+#   ./broodctl tools    — show or set tool groups (core,files,web,commands)
+#   ./broodctl drafts   — list / confirm / dismiss formula drafts
 #   ./broodctl up       — start everything (infra + services)
 #   ./broodctl down     — stop everything
 #   ./broodctl restart  — restart all services (rebuild first)
@@ -409,6 +413,302 @@ do_doctor() {
 }
 
 # ============================================================================
+# Operator setup (model + tool groups → config.toml)
+# ============================================================================
+# Tool groups:
+#   core     — chat + memory (always on)
+#   files    — file / pdf tools
+#   web      — web search
+#   commands — command execution
+
+ensure_config() {
+  if [[ -f "$CONFIG" ]]; then
+    return 0
+  fi
+  if [[ -f "$BROOD_DIR/config.toml" ]] && [[ "$CONFIG" != "$BROOD_DIR/config.toml" ]]; then
+    cp "$BROOD_DIR/config.toml" "$CONFIG"
+    ok "Copied starter config to $CONFIG"
+    return 0
+  fi
+  cat > "$CONFIG" <<'TOML'
+[broodlink]
+env = "local"
+version = "0.1.0"
+
+[profile]
+name = "dev"
+
+[residency]
+region = "local"
+data_classification = "internal"
+
+[dolt]
+host = "127.0.0.1"
+port = 3307
+database = "agent_ledger"
+user = "root"
+password_key = "BROODLINK_DOLT_PASSWORD"
+
+[postgres]
+host = "127.0.0.1"
+port = 5432
+database = "broodlink_hot"
+user = "broodlink"
+password_key = "BROODLINK_PG_PASSWORD"
+
+[nats]
+url = "nats://127.0.0.1:4222"
+subject_prefix = "broodlink"
+
+[qdrant]
+url = "http://127.0.0.1:6333"
+collection = "broodlink_memory"
+api_key = ""
+
+[beads]
+workspace = "~/.beads"
+bd_binary = "bd"
+formulas_dir = ".beads/formulas"
+
+[ollama]
+url = "http://127.0.0.1:11434"
+embedding_model = "nomic-embed-text"
+
+[secrets]
+provider = "sops"
+
+[status_api]
+port = 3312
+api_key_name = "STATUS_API_KEY"
+
+[rate_limits]
+
+[chat]
+enabled = true
+chat_model = "gemma4:31b"
+
+[chat.tools]
+web_search_enabled = false
+file_tools_enabled = false
+command_tools_enabled = false
+
+[runtimes.local]
+backend = "local"
+TOML
+  ok "Wrote starter config to $CONFIG"
+}
+
+# Patch [chat] / [chat.tools] in a TOML file. Empty model or tools leave that part unchanged.
+patch_chat_config() {
+  local config_path="$1"
+  local model="$2"
+  local tools_csv="$3"
+  python3 - "$config_path" "$model" "$tools_csv" <<'PY'
+import pathlib, sys
+
+path = pathlib.Path(sys.argv[1])
+model = sys.argv[2].strip()
+tools_csv = sys.argv[3].strip()
+text = path.read_text() if path.exists() else ""
+
+def upsert_key(body: str, key: str, value: str) -> str:
+    import re
+    pattern = re.compile(rf"^({re.escape(key)}\s*=\s*).+$", re.MULTILINE)
+    if pattern.search(body):
+        return pattern.sub(rf"\1{value}", body, count=1)
+    if not body.endswith("\n"):
+        body += "\n"
+    return body + f"{key} = {value}\n"
+
+def ensure_section(body: str, header: str) -> str:
+    if f"[{header}]" in body:
+        return body
+    if body and not body.endswith("\n"):
+        body += "\n"
+    return body + f"\n[{header}]\n"
+
+if model:
+    text = ensure_section(text, "chat")
+    text = upsert_key(text, "chat_model", f'"{model}"')
+    text = upsert_key(text, "enabled", "true")
+
+if tools_csv:
+    groups = {g.strip().lower() for g in tools_csv.split(",") if g.strip()}
+    unknown = groups - {"core", "files", "web", "commands"}
+    if unknown:
+        raise SystemExit(f"unknown tool group(s): {', '.join(sorted(unknown))}")
+    files = "true" if "files" in groups else "false"
+    web = "true" if "web" in groups else "false"
+    commands = "true" if "commands" in groups else "false"
+    text = ensure_section(text, "chat.tools")
+    text = upsert_key(text, "file_tools_enabled", files)
+    text = upsert_key(text, "pdf_tools_enabled", files)
+    text = upsert_key(text, "web_search_enabled", web)
+    text = upsert_key(text, "command_tools_enabled", commands)
+
+path.write_text(text)
+print(path)
+PY
+}
+
+read_chat_setting() {
+  local key="$1"
+  python3 - "$CONFIG" "$key" <<'PY'
+import pathlib, sys, re
+text = pathlib.Path(sys.argv[1]).read_text() if pathlib.Path(sys.argv[1]).exists() else ""
+key = sys.argv[2]
+m = re.search(rf"^{re.escape(key)}\s*=\s*(.+)$", text, re.MULTILINE)
+print(m.group(1).strip().strip('"') if m else "")
+PY
+}
+
+cmd_setup() {
+  local non_interactive=false
+  local model=""
+  local tools=""
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --non-interactive|-y) non_interactive=true; shift ;;
+      --model) model="${2:-}"; shift 2 ;;
+      --tools) tools="${2:-}"; shift 2 ;;
+      --config) CONFIG="$2"; shift 2 ;;
+      *)
+        fail "unknown setup flag: $1"
+        exit 1
+        ;;
+    esac
+  done
+
+  header "Operator setup"
+  ensure_config
+
+  if ! $non_interactive && [[ -t 0 ]]; then
+    local current_model
+    current_model=$(read_chat_setting chat_model)
+    current_model="${current_model:-gemma4:31b}"
+    if [[ -z "$model" ]]; then
+      printf "  Chat model [%s]: " "$current_model"
+      read -r model
+      model="${model:-$current_model}"
+    fi
+    if [[ -z "$tools" ]]; then
+      printf "  Tool groups (core,files,web,commands) [core,files]: "
+      read -r tools
+      tools="${tools:-core,files}"
+    fi
+  else
+    model="${model:-$(read_chat_setting chat_model)}"
+    model="${model:-gemma4:31b}"
+    tools="${tools:-core,files}"
+  fi
+
+  patch_chat_config "$CONFIG" "$model" "$tools"
+  ok "Wrote $CONFIG"
+  info "model=$model"
+  info "tools=$tools"
+  echo ""
+  printf "Next: ${BOLD}./broodctl up${NC} then send a first chat message.\n"
+}
+
+cmd_model() {
+  local value=""
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --config) CONFIG="$2"; shift 2 ;;
+      --help|-h)
+        echo "Usage: ./broodctl model [name] [--config path]"
+        return 0
+        ;;
+      *) value="$1"; shift ;;
+    esac
+  done
+  ensure_config
+  if [[ -z "$value" ]]; then
+    echo "$(read_chat_setting chat_model)"
+    return 0
+  fi
+  patch_chat_config "$CONFIG" "$value" ""
+  ok "chat_model=$value ($CONFIG)"
+}
+
+cmd_tools() {
+  local value=""
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --config) CONFIG="$2"; shift 2 ;;
+      --help|-h)
+        echo "Usage: ./broodctl tools [core,files,web,commands] [--config path]"
+        return 0
+        ;;
+      *) value="$1"; shift ;;
+    esac
+  done
+  ensure_config
+  if [[ -z "$value" ]]; then
+    python3 - "$CONFIG" <<'PY'
+import pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text()
+def flag(key):
+    m = re.search(rf"^{re.escape(key)}\s*=\s*(true|false)", text, re.I | re.M)
+    return m and m.group(1).lower() == "true"
+groups = ["core"]
+if flag("file_tools_enabled"):
+    groups.append("files")
+if flag("web_search_enabled"):
+    groups.append("web")
+if flag("command_tools_enabled"):
+    groups.append("commands")
+print(",".join(groups))
+PY
+    return 0
+  fi
+  patch_chat_config "$CONFIG" "" "$value"
+  ok "tools=$value ($CONFIG)"
+}
+
+cmd_drafts() {
+  local action="${2:-list}"
+  local draft_id="${3:-}"
+  local status_url="http://127.0.0.1:3312"
+  local api_key="${STATUS_API_KEY:-dev-api-key}"
+  case "$action" in
+    list|"")
+      curl -sf -H "X-Broodlink-Api-Key: $api_key" \
+        "$status_url/api/v1/formula-drafts" || {
+        fail "status-api not reachable — start the stack with ./broodctl up"
+        return 1
+      }
+      echo ""
+      ;;
+    confirm)
+      [[ -n "$draft_id" ]] || { fail "usage: ./broodctl drafts confirm <id>"; return 1; }
+      curl -sf -X POST -H "X-Broodlink-Api-Key: $api_key" \
+        "$status_url/api/v1/formula-drafts/${draft_id}/confirm" || {
+        fail "confirm failed"
+        return 1
+      }
+      echo ""
+      ;;
+    dismiss)
+      [[ -n "$draft_id" ]] || { fail "usage: ./broodctl drafts dismiss <id>"; return 1; }
+      curl -sf -X POST -H "X-Broodlink-Api-Key: $api_key" \
+        "$status_url/api/v1/formula-drafts/${draft_id}/dismiss" || {
+        fail "dismiss failed"
+        return 1
+      }
+      echo ""
+      ;;
+    *)
+      fail "usage: ./broodctl drafts [list|confirm|dismiss] [id]"
+      return 1
+      ;;
+  esac
+}
+
+# ============================================================================
 # Main
 # ============================================================================
 case "${1:-help}" in
@@ -470,6 +770,19 @@ case "${1:-help}" in
     do_doctor
     echo ""
     ;;
+  setup)
+    cmd_setup "$@"
+    echo ""
+    ;;
+  model)
+    cmd_model "$@"
+    ;;
+  tools)
+    cmd_tools "$@"
+    ;;
+  drafts)
+    cmd_drafts "$@"
+    ;;
   *)
     echo ""
     echo "Broodlink Stack Manager"
@@ -477,6 +790,10 @@ case "${1:-help}" in
     echo "Usage: ./broodctl <command>"
     echo ""
     echo "Commands:"
+    echo "  setup     Write model + tool groups to config (install → setup → chat)"
+    echo "  model     Show or set chat_model"
+    echo "  tools     Show or set tool groups (core,files,web,commands)"
+    echo "  drafts    List / confirm / dismiss formula drafts"
     echo "  up        Start everything (infrastructure + services)"
     echo "  down      Stop everything"
     echo "  restart   Restart all services (keeps infrastructure)"
@@ -488,6 +805,7 @@ case "${1:-help}" in
     echo "  doctor    Diagnose common problems"
     echo ""
     echo "Examples:"
+    echo "  ./broodctl setup --non-interactive --model gemma4:31b --tools core,files,web"
     echo "  ./broodctl up           # start the whole stack"
     echo "  ./broodctl logs a2a-gateway   # tail a2a-gateway log"
     echo "  ./broodctl rebuild      # rebuild + restart"

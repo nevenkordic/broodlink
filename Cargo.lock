@@ -552,6 +552,9 @@ version = "0.12.5"
 dependencies = [
  "async-nats",
  "broodlink-config",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
 ]

@@ -581,6 +581,20 @@ async fn run_cycle(state: &AppState) -> Result<(), BroodlinkError> {
     }
 
     // -----------------------------------------------------------------------
+    // 5l2. Draft custom formulas from verified multi-step workflows
+    // -----------------------------------------------------------------------
+    match draft_formulas_from_completed_workflows(&state.pg).await {
+        Ok(drafted) => {
+            if drafted > 0 {
+                info!(drafts = drafted, "formula drafts created from workflows");
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "formula draft scan failed");
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // 5m. Skill registry sync (config → Dolt)
     // -----------------------------------------------------------------------
     match sync_skill_registry(&state.dolt, &state.config).await {
@@ -1908,6 +1922,77 @@ async fn sync_formula_registry(
     }
 
     Ok(stats)
+}
+
+async fn draft_formulas_from_completed_workflows(pg: &PgPool) -> Result<u32, BroodlinkError> {
+    let rows: Vec<(
+        String,
+        String,
+        i32,
+        serde_json::Value,
+        Option<i64>,
+    )> = sqlx::query_as(
+        "SELECT wr.id, wr.formula_name, wr.total_steps, wr.step_results,
+                (EXTRACT(EPOCH FROM (COALESCE(wr.completed_at, wr.updated_at) - wr.created_at)))::BIGINT
+         FROM workflow_runs wr
+         WHERE wr.status = 'completed'
+           AND wr.updated_at > NOW() - INTERVAL '6 hours'
+           AND NOT EXISTS (
+               SELECT 1 FROM formula_drafts fd WHERE fd.workflow_run_id = wr.id
+           )
+         ORDER BY wr.updated_at DESC
+         LIMIT 20",
+    )
+    .fetch_all(pg)
+    .await?;
+
+    let mut drafted = 0_u32;
+    for (id, formula_name, total_steps, step_results, duration) in rows {
+        let total = u32::try_from(total_steps.max(0)).unwrap_or(0);
+        let duration_secs = u64::try_from(duration.unwrap_or(0).max(0)).unwrap_or(0);
+        let outcome = broodlink_formulas::WorkflowOutcome::from_run(
+            id.clone(),
+            formula_name.clone(),
+            total,
+            duration_secs,
+            step_results,
+        );
+        if !broodlink_formulas::is_worth_saving(&outcome) {
+            continue;
+        }
+        let draft = broodlink_formulas::draft_from_workflow(&outcome);
+        let definition = broodlink_formulas::formula_to_jsonb(&draft);
+        let hash = broodlink_formulas::definition_hash(&definition);
+        let tags = broodlink_formulas::draft_tags(&formula_name);
+        let draft_id = Uuid::new_v4().to_string();
+        let display = broodlink_formulas::title_case(&draft.formula.name);
+        let description = draft.formula.description.clone();
+        let result = sqlx::query(
+            "INSERT INTO formula_drafts
+             (id, workflow_run_id, suggested_name, display_name, description, definition, tags, source_hash, status)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
+             ON CONFLICT (workflow_run_id) DO NOTHING",
+        )
+        .bind(&draft_id)
+        .bind(&id)
+        .bind(&draft.formula.name)
+        .bind(&display)
+        .bind(&description)
+        .bind(&definition)
+        .bind(&tags)
+        .bind(&hash)
+        .execute(pg)
+        .await?;
+        if result.rows_affected() > 0 {
+            info!(
+                draft = %draft.formula.name,
+                workflow = %id,
+                "formula draft waiting for operator confirm"
+            );
+            drafted += 1;
+        }
+    }
+    Ok(drafted)
 }
 
 // ---------------------------------------------------------------------------
