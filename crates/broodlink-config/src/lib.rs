@@ -1044,6 +1044,13 @@ pub struct ChatConfig {
     // auto-memory: extract and store memorable facts after each response
     #[serde(default = "default_auto_memory_enabled")]
     pub auto_memory_enabled: bool,
+    /// When false and `thinking_mode` is empty, chat/Telegram skips thinking.
+    #[serde(default = "default_thinking_enabled")]
+    pub thinking_enabled: bool,
+    /// `on` = always think, `off` = never, `auto` = tools and complex tasks only.
+    /// Empty falls back to `thinking_enabled` (`true` → on, `false` → off).
+    #[serde(default)]
+    pub thinking_mode: String,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -1145,6 +1152,8 @@ impl Default for ChatConfig {
             max_attachment_bytes: default_max_attachment_bytes(),
             voice_transcription_enabled: false,
             auto_memory_enabled: default_auto_memory_enabled(),
+            thinking_enabled: default_thinking_enabled(),
+            thinking_mode: String::new(),
         }
     }
 }
@@ -1205,6 +1214,10 @@ fn default_transcription_url() -> String {
 }
 fn default_max_attachment_bytes() -> u64 {
     20_971_520
+}
+
+fn default_thinking_enabled() -> bool {
+    true
 }
 
 fn default_chat_enabled() -> bool {
@@ -1829,8 +1842,44 @@ api_key_name = "STATUS_API_KEY"
             !cfg.chat.voice_transcription_enabled,
             "voice_transcription_enabled should default to false"
         );
+        assert!(
+            cfg.chat.thinking_enabled,
+            "thinking_enabled should default to true when omitted"
+        );
 
         std::env::remove_var("BROODLINK_CONFIG");
+    }
+
+    #[test]
+    fn test_chat_thinking_enabled_false_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let toml = format!("{}\n[chat]\nthinking_enabled = false\n", valid_toml());
+        std::fs::write(&config_path, toml).unwrap();
+
+        let cfg = Config::load_from(config_path.to_str().unwrap()).unwrap();
+        assert!(
+            !cfg.chat.thinking_enabled,
+            "thinking_enabled = false must parse from [chat]"
+        );
+        assert!(
+            cfg.chat.thinking_mode.is_empty(),
+            "thinking_mode should default to empty"
+        );
+    }
+
+    #[test]
+    fn test_chat_thinking_mode_auto_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let toml = format!("{}\n[chat]\nthinking_mode = \"auto\"\n", valid_toml());
+        std::fs::write(&config_path, toml).unwrap();
+
+        let cfg = Config::load_from(config_path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            cfg.chat.thinking_mode, "auto",
+            "thinking_mode = auto must parse from [chat]"
+        );
     }
 
     #[test]

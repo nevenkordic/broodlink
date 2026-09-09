@@ -327,6 +327,8 @@ struct AppState {
     pending_commands: tokio::sync::RwLock<HashMap<String, PendingCommandEntry>>,
     // v0.12.0: Cached runtime setting — unrestricted code mode (10s TTL)
     unrestricted_code_mode: tokio::sync::RwLock<Option<(bool, std::time::Instant)>>,
+    /// Fingerprint of configured chat/code/vision/fallback models last synced to memory.
+    last_runtime_identity: tokio::sync::RwLock<Option<String>>,
 }
 
 /// v0.10.0: Pending write approval waiting for user confirmation.
@@ -572,6 +574,7 @@ async fn async_main() {
         pending_writes: tokio::sync::RwLock::new(HashMap::new()),
         pending_commands: tokio::sync::RwLock::new(HashMap::new()),
         unrestricted_code_mode: tokio::sync::RwLock::new(None),
+        last_runtime_identity: tokio::sync::RwLock::new(None),
     });
 
     // Spawn chat reply delivery loop
@@ -4655,7 +4658,14 @@ async fn handle_ollama_recovery(
         "model": primary_model,
         "messages": messages,
         "stream": false,
-        "think": !is_vision_model,
+        "think": chat_think_for_turn(
+            primary_model,
+            is_vision_model,
+            &state.config.chat.thinking_mode,
+            state.config.chat.thinking_enabled,
+            last_user_from_messages(messages),
+            false,
+        ),
         "options": {
             "temperature": 0.7,
             "num_predict": 4096_u32,
@@ -4791,6 +4801,8 @@ async fn handle_ollama_recovery(
         fallback_model,
         messages,
         num_ctx,
+        &state.config.chat.thinking_mode,
+        state.config.chat.thinking_enabled,
     )
     .await
 }
@@ -4804,13 +4816,18 @@ async fn fallback_chat(
     fallback_model: &str,
     messages: &[serde_json::Value],
     num_ctx: u32,
+    thinking_mode: &str,
+    thinking_enabled: bool,
 ) -> String {
     // Replace the system prompt with one suited for the fallback model
     let mut fallback_messages = Vec::with_capacity(messages.len());
     fallback_messages.push(serde_json::json!({
         "role": "system",
-        "content": "You are Broodlink, a knowledgeable AI assistant. You can discuss any topic. \
-            Be extremely brief — 1-3 short sentences max. Just give the answer."
+        "content": format!(
+            "You are Broodlink, a knowledgeable AI assistant. You can discuss any topic. \
+             Be extremely brief — 1-3 short sentences max. Just give the answer.{}",
+            chat_model_identity_block(fallback_model)
+        )
     }));
     // Copy user/assistant messages (skip original system prompt)
     for msg in messages {
@@ -4823,7 +4840,14 @@ async fn fallback_chat(
         "model": fallback_model,
         "messages": fallback_messages,
         "stream": false,
-        "think": true,
+        "think": chat_think_for_turn(
+            fallback_model,
+            false,
+            thinking_mode,
+            thinking_enabled,
+            last_user_from_messages(messages),
+            false,
+        ),
         "options": {
             "temperature": 0.7,
             "num_predict": 4096_u32,
@@ -4903,6 +4927,9 @@ async fn fetch_memory_context(state: &AppState, query: &str, limit: u32) -> Stri
 /// Runs as a background task — does not block response delivery.
 async fn extract_and_store_memory(state: Arc<AppState>, user_msg: String, assistant_reply: String) {
     if user_msg.len() < 30 {
+        return;
+    }
+    if parse_direct_worker_command(&user_msg).is_some() {
         return;
     }
 
@@ -4996,6 +5023,13 @@ async fn extract_and_store_memory(state: Arc<AppState>, user_msg: String, assist
             .trim()
             .to_string();
         if topic.is_empty() || content.is_empty() {
+            continue;
+        }
+        if should_skip_identity_memory(&topic, &content) {
+            info!(
+                topic = %topic,
+                "auto-memory: skipped model-identity fact (runtime-owned)"
+            );
             continue;
         }
         match bridge_call(
@@ -5774,11 +5808,896 @@ async fn is_unrestricted_code_mode(state: &AppState) -> bool {
     enabled
 }
 
+/// Whether a chat/Ollama request should enable thinking tokens.
+/// `thinking_enabled` is the master/capability switch after mode resolution.
+fn chat_should_think(model: &str, has_images: bool, thinking_enabled: bool) -> bool {
+    if !thinking_enabled {
+        return false;
+    }
+    let is_legacy_gemma = model.starts_with("gemma") && !model.starts_with("gemma4");
+    !has_images && !is_legacy_gemma && !model.contains("-coder")
+}
+
+/// Resolve `[chat].thinking_mode` with `thinking_enabled` as fallback.
+fn resolve_thinking_mode(thinking_mode: &str, thinking_enabled: bool) -> &'static str {
+    match thinking_mode.trim().to_ascii_lowercase().as_str() {
+        "on" | "always" => "on",
+        "off" | "never" => "off",
+        "auto" | "selective" => "auto",
+        _ if thinking_enabled => "on",
+        _ => "off",
+    }
+}
+
+/// User text that likely needs a tool (search, schedule, files, commands).
+fn chat_has_tool_intent(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    const TOOL_PHRASES: &[&str] = &[
+        "search the web",
+        "search online",
+        "look up",
+        "look it up",
+        "google ",
+        "browse ",
+        "check online",
+        "latest news",
+        "current price",
+        "schedule ",
+        "remind me",
+        "cancel the task",
+        "cancel task",
+        "list scheduled",
+        "read the file",
+        "read file",
+        "write the file",
+        "write file",
+        "edit the file",
+        "run the test",
+        "run tests",
+        "run the command",
+        "run command",
+        "use tools",
+        "use a tool",
+        "fetch the page",
+        "open the url",
+        "spawn a worker",
+        "spawn worker",
+        "start a worker",
+        "start worker",
+        "list workers",
+        "join worker",
+        "join the worker",
+        "isolated worker",
+    ];
+    TOOL_PHRASES.iter().any(|p| lower.contains(p))
+}
+
+fn parse_chat_tool_args(args_raw: Option<&serde_json::Value>) -> serde_json::Value {
+    args_raw
+        .and_then(|a| {
+            if let Some(s) = a.as_str() {
+                serde_json::from_str::<serde_json::Value>(s).ok()
+            } else {
+                Some(a.clone())
+            }
+        })
+        .unwrap_or_default()
+}
+
+const SECRET_JSON_KEYS: &[&str] = &[
+    "jwt",
+    "token",
+    "access_token",
+    "refresh_token",
+    "authorization",
+    "password",
+    "secret",
+    "api_key",
+];
+
+fn redact_secret_fields(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                if SECRET_JSON_KEYS
+                    .iter()
+                    .any(|secret| k.eq_ignore_ascii_case(secret))
+                {
+                    continue;
+                }
+                out.insert(k, redact_secret_fields(v));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(redact_secret_fields).collect())
+        }
+        other => other,
+    }
+}
+
+fn format_bridge_json(value: &serde_json::Value) -> String {
+    let redacted = redact_secret_fields(value.clone());
+    serde_json::to_string_pretty(&redacted).unwrap_or_else(|_| redacted.to_string())
+}
+
+fn build_spawn_worker_params(parsed: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let goal = parsed
+        .get("goal")
+        .and_then(|g| g.as_str())
+        .unwrap_or("")
+        .trim();
+    if goal.is_empty() {
+        return Err("Error: goal is required.".to_string());
+    }
+    let mut params = serde_json::json!({ "goal": goal });
+    if let Some(tools) = parsed.get("allowed_tools") {
+        params["allowed_tools"] = tools.clone();
+    }
+    if let Some(timeout) = parsed.get("timeout_secs").and_then(|v| v.as_u64()) {
+        params["timeout_secs"] = serde_json::json!(timeout.clamp(5, 600));
+    }
+    let isolation = parsed
+        .get("isolation")
+        .and_then(|v| v.as_str())
+        .or_else(|| parsed.get("runtime").and_then(|v| v.as_str()))
+        .unwrap_or("local")
+        .trim();
+    let isolation_l = isolation.to_ascii_lowercase();
+    if isolation_l == "ssh" || isolation_l == "remote-idle" {
+        return Err("Error: chat can spawn local or docker workers only.".to_string());
+    }
+    params["isolation"] = serde_json::json!(if isolation.is_empty() {
+        "local"
+    } else {
+        isolation
+    });
+    if let Some(budget) = parsed.get("budget_tokens") {
+        params["budget_tokens"] = budget.clone();
+    }
+    Ok(params)
+}
+
+async fn execute_chat_worker_tool(
+    state: &AppState,
+    name: &str,
+    parsed: &serde_json::Value,
+) -> String {
+    let params = match name {
+        "spawn_worker" => match build_spawn_worker_params(parsed) {
+            Ok(p) => p,
+            Err(e) => return e,
+        },
+        "list_workers" => {
+            let mut params = serde_json::json!({});
+            if let Some(status) = parsed.get("status").and_then(|v| v.as_str()) {
+                params["status"] = serde_json::json!(status);
+            }
+            params
+        }
+        "join_worker" => {
+            let worker_id = parsed
+                .get("worker_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if worker_id.is_empty() {
+                return "Error: worker_id is required.".to_string();
+            }
+            let mut params = serde_json::json!({ "worker_id": worker_id });
+            if let Some(wait) = parsed.get("wait_secs").and_then(|v| v.as_u64()) {
+                params["wait_secs"] = serde_json::json!(wait.min(60));
+            }
+            params
+        }
+        _ => return format!("Unknown worker tool: {name}"),
+    };
+    match bridge_call(state, name, params).await {
+        Ok(resp) => {
+            info!(tool = name, "worker tool via chat");
+            format_bridge_json(&resp)
+        }
+        Err(e) => {
+            warn!(error = %e, tool = name, "worker tool failed");
+            format!("Failed to {name}: {e}")
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DirectWorkerCommand {
+    Spawn { goal: String },
+    List { status: Option<String> },
+    Join { worker_id: String },
+}
+
+fn collapse_ws(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn looks_like_worker_id(value: &str) -> bool {
+    let value = value.trim();
+    if value.len() == 36 && value.chars().filter(|c| *c == '-').count() == 4 {
+        return value.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+    }
+    value.starts_with("worker-") && value.len() >= 8
+}
+
+fn parse_direct_worker_command(text: &str) -> Option<DirectWorkerCommand> {
+    let collapsed = collapse_ws(&text.trim().to_ascii_lowercase());
+    if collapsed.is_empty() {
+        return None;
+    }
+
+    if collapsed == "list workers"
+        || collapsed == "list the workers"
+        || collapsed == "show workers"
+        || collapsed == "show the workers"
+    {
+        return Some(DirectWorkerCommand::List { status: None });
+    }
+    if let Some(rest) = collapsed.strip_prefix("list workers ") {
+        let status = rest.trim();
+        return Some(DirectWorkerCommand::List {
+            status: (!status.is_empty()).then(|| status.to_string()),
+        });
+    }
+
+    for prefix in ["join worker ", "join the worker "] {
+        if let Some(rest) = collapsed.strip_prefix(prefix) {
+            let id = rest.split_whitespace().next().unwrap_or("");
+            if looks_like_worker_id(id) {
+                return Some(DirectWorkerCommand::Join {
+                    worker_id: id.to_string(),
+                });
+            }
+        }
+    }
+
+    const SPAWN_TO: &[&str] = &[
+        "spawn a worker to ",
+        "spawn an isolated worker to ",
+        "spawn worker to ",
+        "start a worker to ",
+        "start worker to ",
+    ];
+    for prefix in SPAWN_TO {
+        if let Some(rest) = collapsed.strip_prefix(prefix) {
+            let goal = rest.trim();
+            return Some(DirectWorkerCommand::Spawn {
+                goal: if goal.is_empty() {
+                    "ping".to_string()
+                } else {
+                    goal.to_string()
+                },
+            });
+        }
+    }
+    const SPAWN_BARE: &[&str] = &[
+        "spawn a worker ",
+        "spawn worker ",
+        "start a worker ",
+        "start worker ",
+    ];
+    for prefix in SPAWN_BARE {
+        if let Some(rest) = collapsed.strip_prefix(prefix) {
+            let goal = rest.trim();
+            if !goal.is_empty() {
+                return Some(DirectWorkerCommand::Spawn {
+                    goal: goal.to_string(),
+                });
+            }
+        }
+    }
+    if matches!(
+        collapsed.as_str(),
+        "spawn a worker" | "spawn worker" | "start a worker" | "start worker"
+    ) {
+        return Some(DirectWorkerCommand::Spawn {
+            goal: "ping".to_string(),
+        });
+    }
+    None
+}
+
+fn format_direct_worker_reply(name: &str, raw: &str) -> String {
+    if raw.starts_with("Error:") || raw.starts_with("Failed to") {
+        return raw.to_string();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return raw.to_string();
+    };
+    match name {
+        "spawn_worker" => {
+            let id = value
+                .get("worker_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let status = value
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let runtime = value
+                .get("runtime")
+                .and_then(|v| v.as_str())
+                .unwrap_or("local");
+            format!(
+                "Started worker `{id}` ({status}) on {runtime}. \
+                 The child pings the bridge with its own credentials, then exits. \
+                 Say \"list workers\" or \"join worker {id}\" for the summary."
+            )
+        }
+        "list_workers" => {
+            let workers = value
+                .get("workers")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if workers.is_empty() {
+                return "No workers yet.".to_string();
+            }
+            let mut out = format!("{} worker(s):", workers.len());
+            for worker in workers {
+                let id = worker
+                    .get("worker_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let status = worker.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                let goal = worker.get("goal").and_then(|v| v.as_str()).unwrap_or("");
+                let summary = worker
+                    .get("result_summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                out.push_str(&format!("\n- `{id}` {status}"));
+                if !goal.is_empty() {
+                    out.push_str(&format!(" — {goal}"));
+                }
+                if !summary.is_empty() {
+                    out.push_str(&format!(" ({summary})"));
+                }
+            }
+            out
+        }
+        "join_worker" => {
+            let id = value
+                .get("worker_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let status = value
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let summary = value
+                .get("result_summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("no summary yet");
+            format!("Worker `{id}` is {status}. {summary}")
+        }
+        _ => raw.to_string(),
+    }
+}
+
+async fn run_direct_worker_command(state: &AppState, command: DirectWorkerCommand) -> String {
+    let (name, parsed) = match command {
+        DirectWorkerCommand::Spawn { goal } => {
+            ("spawn_worker", serde_json::json!({ "goal": goal }))
+        }
+        DirectWorkerCommand::List { status } => {
+            let mut parsed = serde_json::json!({});
+            if let Some(status) = status {
+                parsed["status"] = serde_json::json!(status);
+            }
+            ("list_workers", parsed)
+        }
+        DirectWorkerCommand::Join { worker_id } => (
+            "join_worker",
+            serde_json::json!({ "worker_id": worker_id, "wait_secs": 15 }),
+        ),
+    };
+    let raw = execute_chat_worker_tool(state, name, &parsed).await;
+    format_direct_worker_reply(name, &raw)
+}
+
+/// Non-code work that still benefits from a reasoning pass.
+fn chat_is_complex(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if classify_model_domain(trimmed) == "code" {
+        return true;
+    }
+    if trimmed.chars().count() >= 400 {
+        return true;
+    }
+    let question_marks = trimmed.matches('?').count();
+    if question_marks >= 2 {
+        return true;
+    }
+    let lower = trimmed.to_lowercase();
+    const COMPLEX_PHRASES: &[&str] = &[
+        "step by step",
+        "trade-off",
+        "tradeoff",
+        "root cause",
+        "compare ",
+        "contrast ",
+        "analyze ",
+        "analyse ",
+        "evaluate ",
+        "design ",
+        "architect",
+        "plan a ",
+        "plan the ",
+        "diagnose",
+        "debug",
+        "optimize",
+        "optimise",
+        "prove ",
+        "derive ",
+        "walk me through",
+        "break down",
+    ];
+    if COMPLEX_PHRASES.iter().any(|p| lower.contains(p)) {
+        return true;
+    }
+    let has_why = lower.starts_with("why ") || lower.contains(" why ");
+    let has_how = lower.starts_with("how ") || lower.contains(" how ");
+    has_why && has_how
+}
+
+/// Auto mode: think when tools are in play or the task is complex (incl. code).
+fn chat_auto_should_think(text: &str, using_tools: bool) -> bool {
+    using_tools || chat_is_complex(text) || chat_has_tool_intent(text)
+}
+
+fn last_user_from_messages(messages: &[serde_json::Value]) -> &str {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        .and_then(|m| m.get("content").and_then(|c| c.as_str()))
+        .unwrap_or("")
+}
+
+fn chat_think_for_turn(
+    model: &str,
+    has_images: bool,
+    thinking_mode: &str,
+    thinking_enabled: bool,
+    last_user: &str,
+    using_tools: bool,
+) -> bool {
+    match resolve_thinking_mode(thinking_mode, thinking_enabled) {
+        "off" => false,
+        "on" => chat_should_think(model, has_images, true),
+        _ => {
+            chat_should_think(model, has_images, true)
+                && chat_auto_should_think(last_user, using_tools)
+        }
+    }
+}
+
+const IDENTITY_MEMORY_TOPICS: &[&str] = &[
+    "assistant-identity",
+    "assistant-model-knowledge",
+    "assistant-runtime-model",
+    "assistant-model",
+];
+const RUNTIME_IDENTITY_HEADING: &str = "## Runtime identity";
+
+fn chat_model_family(model: &str) -> String {
+    let name = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .split(':')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    if name.contains("glm") || name.contains("chatglm") {
+        "glm".into()
+    } else if name.contains("gemma") || name.contains("gemini") {
+        "gemma".into()
+    } else if name.contains("qwen") {
+        "qwen".into()
+    } else if name.contains("deepseek") {
+        "deepseek".into()
+    } else if name.contains("llama") {
+        "llama".into()
+    } else if name.contains("mistral") || name.contains("mixtral") {
+        "mistral".into()
+    } else if name.contains("phi") {
+        "phi".into()
+    } else if name.contains("kimi") || name.contains("moonshot") {
+        "kimi".into()
+    } else if name.contains("gpt") || name.contains("chatgpt") {
+        "gpt".into()
+    } else if name.contains("claude") {
+        "claude".into()
+    } else {
+        name.split(['-', '.']).next().unwrap_or(&name).to_string()
+    }
+}
+
+fn model_family_aliases(family: &str) -> &'static [&'static str] {
+    match family {
+        "glm" => &["glm", "zhipu", "z.ai", "chatglm"],
+        "gemma" => &["gemma", "gemini"],
+        "qwen" => &["qwen", "tongyi", "alibaba"],
+        "deepseek" => &["deepseek"],
+        "llama" => &["llama", "meta"],
+        "mistral" => &["mistral", "mixtral"],
+        "phi" => &["phi"],
+        "kimi" => &["kimi", "moonshot"],
+        "gpt" => &["gpt", "chatgpt", "openai"],
+        "claude" => &["claude", "anthropic"],
+        _ => &[],
+    }
+}
+
+fn content_claims_google_model(content_lower: &str) -> bool {
+    content_lower.contains("trained by google")
+        || content_lower.contains("developed by google")
+        || content_lower.contains("created by google")
+        || content_lower.contains("made by google")
+        || content_lower.contains("google's gemma")
+        || content_lower.contains("google gemma")
+}
+
+fn is_self_referential_identity(content_lower: &str) -> bool {
+    content_lower.contains("i am")
+        || content_lower.contains("i'm")
+        || content_lower.contains("assistant")
+        || content_lower.contains("this model")
+        || content_lower.contains("my model")
+        || content_lower.contains("language model")
+        || content_lower.contains("trained by")
+        || content_lower.contains("developed by")
+        || content_lower.contains("created by")
+        || content_lower.contains("made by")
+}
+
+fn mentions_known_model_or_vendor(content_lower: &str) -> bool {
+    const NEEDLES: &[&str] = &[
+        "gemma",
+        "gemini",
+        "glm",
+        "qwen",
+        "deepseek",
+        "llama",
+        "mistral",
+        "mixtral",
+        "chatgpt",
+        "openai",
+        "claude",
+        "anthropic",
+        "zhipu",
+        "alibaba",
+        "tongyi",
+        "moonshot",
+        "kimi",
+        "trained by google",
+        "developed by google",
+        "created by google",
+        "made by google",
+    ];
+    NEEDLES.iter().any(|n| content_lower.contains(n))
+}
+
+fn is_identity_memory_topic(topic: &str) -> bool {
+    let t = topic.trim().to_ascii_lowercase();
+    IDENTITY_MEMORY_TOPICS.iter().any(|known| t == *known)
+        || t.contains("assistant-identity")
+        || t.contains("assistant-model")
+        || t.contains("runtime-model")
+}
+
+fn is_assistant_identity_claim(topic: &str, content: &str) -> bool {
+    if is_identity_memory_topic(topic) {
+        return true;
+    }
+    let c = content.to_ascii_lowercase();
+    is_self_referential_identity(&c) && mentions_known_model_or_vendor(&c)
+}
+
+fn should_skip_identity_memory(topic: &str, content: &str) -> bool {
+    is_identity_memory_topic(topic) || is_assistant_self_model_claim(content)
+}
+
+fn is_assistant_self_model_claim(content: &str) -> bool {
+    let c = content.to_ascii_lowercase();
+    if !mentions_known_model_or_vendor(&c) {
+        return false;
+    }
+    c.contains("trained by")
+        || c.contains("developed by")
+        || c.contains("created by")
+        || c.contains("made by")
+        || c.contains("this model")
+        || c.contains("language model")
+        || c.contains("the assistant")
+        || ((c.contains("i am") || c.contains("i'm a") || c.contains("i'm "))
+            && (c.contains("gemma")
+                || c.contains("gemini")
+                || c.contains("glm")
+                || c.contains("qwen")
+                || c.contains("gpt")
+                || c.contains("claude")
+                || c.contains("llama")
+                || c.contains("mistral")
+                || c.contains("deepseek")))
+}
+
+fn identity_claim_matches_serving_model(content: &str, serving_model: &str) -> bool {
+    let c = content.to_ascii_lowercase();
+    let model_l = serving_model.to_ascii_lowercase();
+    if !model_l.is_empty() && c.contains(&model_l) {
+        return true;
+    }
+    let family = chat_model_family(serving_model);
+    if model_family_aliases(&family)
+        .iter()
+        .any(|alias| c.contains(alias))
+    {
+        return true;
+    }
+    family == "gemma" && content_claims_google_model(&c)
+}
+
+fn memory_is_stale_identity(topic: &str, content: &str, serving_model: &str) -> bool {
+    is_assistant_identity_claim(topic, content)
+        && !identity_claim_matches_serving_model(content, serving_model)
+}
+
+fn chat_model_identity_block(serving_model: &str) -> String {
+    format!(
+        "\n\n{RUNTIME_IDENTITY_HEADING}\n\
+         You are Broodlink, a local assistant. This turn is served by `{serving_model}` via Ollama.\n\
+         When asked who you are or which model you are, answer with that exact model name.\n\
+         Do not claim to be a different model, a hosted vendor product, or trained by another lab \
+         unless that matches `{serving_model}`.\n\
+         Ignore any memory that names a different model or vendor."
+    )
+}
+
+fn strip_runtime_identity_section(prompt: &str) -> String {
+    let marker = format!("\n\n{RUNTIME_IDENTITY_HEADING}\n");
+    let Some(start) = prompt.find(&marker) else {
+        return prompt.to_string();
+    };
+    let after = &prompt[start + 2..];
+    if let Some(next_rel) = after.find("\n\n## ") {
+        let end = start + 2 + next_rel;
+        let mut out = String::with_capacity(prompt.len() - (end - start));
+        out.push_str(&prompt[..start]);
+        out.push_str(&prompt[end..]);
+        out
+    } else {
+        prompt[..start].to_string()
+    }
+}
+
+fn filter_stale_identity_memory_lines(prompt: &str, serving_model: &str) -> String {
+    prompt
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix("- ") else {
+                return true;
+            };
+            let (topic, content) = rest.split_once(": ").unwrap_or(("", rest));
+            !memory_is_stale_identity(topic, content, serving_model)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn rewrite_system_prompt_for_serving_model(prompt: &str, serving_model: &str) -> String {
+    let stripped = strip_runtime_identity_section(prompt);
+    let mut filtered = filter_stale_identity_memory_lines(&stripped, serving_model);
+    filtered.push_str(&chat_model_identity_block(serving_model));
+    filtered
+}
+
+fn apply_serving_model_identity(messages: &mut [serde_json::Value], serving_model: &str) {
+    let Some(sys) = messages
+        .iter_mut()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+    else {
+        return;
+    };
+    let Some(content) = sys.get("content").and_then(|c| c.as_str()) else {
+        return;
+    };
+    sys["content"] = serde_json::json!(rewrite_system_prompt_for_serving_model(
+        content,
+        serving_model
+    ));
+}
+
+fn chat_runtime_identity_fingerprint(chat: &broodlink_config::ChatConfig) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        chat.chat_model.trim(),
+        chat.chat_code_model.trim(),
+        chat.chat_vision_model.trim(),
+        chat.chat_fallback_model.trim()
+    )
+}
+
+fn chat_runtime_identity_content(chat: &broodlink_config::ChatConfig) -> String {
+    let code = if chat.chat_code_model.is_empty() {
+        chat.chat_model.as_str()
+    } else {
+        chat.chat_code_model.as_str()
+    };
+    let vision = if chat.chat_vision_model.is_empty() {
+        "none"
+    } else {
+        chat.chat_vision_model.as_str()
+    };
+    let fallback = if chat.chat_fallback_model.is_empty() {
+        "none"
+    } else {
+        chat.chat_fallback_model.as_str()
+    };
+    format!(
+        "Broodlink is a local assistant on Ollama. Current chat model: {}. \
+         Code model: {}. Vision model: {}. Fallback model: {}. \
+         This is not a hosted vendor chatbot.",
+        chat.chat_model, code, vision, fallback
+    )
+}
+
+fn runtime_identity_changed(previous_fingerprint: Option<&str>, current_fingerprint: &str) -> bool {
+    previous_fingerprint != Some(current_fingerprint)
+}
+
+async fn sync_runtime_model_identity(state: &AppState) {
+    if !state.config.chat.memory_enabled {
+        return;
+    }
+    let fingerprint = chat_runtime_identity_fingerprint(&state.config.chat);
+    {
+        let cached = state.last_runtime_identity.read().await;
+        if !runtime_identity_changed(cached.as_deref(), &fingerprint) {
+            return;
+        }
+    }
+
+    let expected = chat_runtime_identity_content(&state.config.chat);
+    let recalled = bridge_call(
+        state,
+        "recall_memory",
+        serde_json::json!({
+            "topic_search": "assistant-runtime-model",
+            "limit": 10
+        }),
+    )
+    .await;
+    let stored = recalled.ok().and_then(|data| {
+        data.get("memories")
+            .and_then(|m| m.as_array())
+            .and_then(|rows| {
+                rows.iter().find_map(|row| {
+                    let topic = row.get("topic").and_then(|t| t.as_str()).unwrap_or("");
+                    if topic == "assistant-runtime-model" {
+                        row.get("content")
+                            .and_then(|c| c.as_str())
+                            .map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+            })
+    });
+    if stored.as_deref().map(str::trim) == Some(expected.trim()) {
+        *state.last_runtime_identity.write().await = Some(fingerprint);
+        return;
+    }
+
+    info!(
+        models = %fingerprint,
+        "configured models changed — refreshing runtime identity memories"
+    );
+
+    for topic in IDENTITY_MEMORY_TOPICS {
+        if let Err(e) = bridge_call(
+            state,
+            "delete_memory",
+            serde_json::json!({ "topic": topic }),
+        )
+        .await
+        {
+            warn!(error = %e, topic = %topic, "failed to delete stale identity memory");
+        }
+    }
+
+    if let Ok(data) = bridge_call(
+        state,
+        "recall_memory",
+        serde_json::json!({
+            "topic_search": "assistant-",
+            "limit": 50
+        }),
+    )
+    .await
+    {
+        if let Some(rows) = data.get("memories").and_then(|m| m.as_array()) {
+            for row in rows {
+                let topic = row.get("topic").and_then(|t| t.as_str()).unwrap_or("");
+                let content = row.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                if topic.is_empty() || IDENTITY_MEMORY_TOPICS.contains(&topic) {
+                    continue;
+                }
+                if is_assistant_identity_claim(topic, content) {
+                    if let Err(e) = bridge_call(
+                        state,
+                        "delete_memory",
+                        serde_json::json!({ "topic": topic }),
+                    )
+                    .await
+                    {
+                        warn!(
+                            error = %e,
+                            topic = %topic,
+                            "failed to delete extra stale identity memory"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let identity_content = format!(
+        "Broodlink is currently served by {} via local Ollama. \
+         It is a local assistant, not a hosted vendor chatbot.",
+        state.config.chat.chat_model
+    );
+    let mut stored_ok = true;
+    for (topic, content) in [
+        ("assistant-runtime-model", expected.as_str()),
+        ("assistant-identity", identity_content.as_str()),
+    ] {
+        if let Err(e) = bridge_call(
+            state,
+            "store_memory",
+            serde_json::json!({
+                "topic": topic,
+                "content": content,
+                "tags": "runtime,identity"
+            }),
+        )
+        .await
+        {
+            stored_ok = false;
+            warn!(error = %e, topic = %topic, "failed to store runtime identity memory");
+        }
+    }
+
+    if stored_ok {
+        *state.last_runtime_identity.write().await = Some(fingerprint);
+    }
+}
+
 async fn call_ollama_chat(
     state: &AppState,
     history: &[(String, String)],
     params: &ChatParams<'_>,
 ) -> String {
+    let last_user_early = history
+        .iter()
+        .rev()
+        .find(|(role, _)| role == "user")
+        .map(|(_, content)| content.as_str())
+        .unwrap_or("");
+    if let Some(command) = parse_direct_worker_command(last_user_early) {
+        info!(text = %last_user_early, "direct worker command, skipping model");
+        return run_direct_worker_command(state, command).await;
+    }
+
     let model_override = params.model_override;
     let default_url = state.ollama_pool.primary_url().to_string();
     let ollama_url = params
@@ -5837,6 +6756,10 @@ async fn call_ollama_chat(
            done later, at a specific time, or on a recurring basis.\n\
          - **list_scheduled_tasks**: Show all active scheduled tasks.\n\
          - **cancel_scheduled_task**: Cancel a scheduled task by ID.\n\
+         - **spawn_worker**: Start an isolated child worker (local or docker) with its own JWT and budget. \
+           The current worker entrypoint proves isolation with a ping, then exits. Tell the user the worker_id and status — never a token.\n\
+         - **list_workers**: List workers spawned from this chat agent.\n\
+         - **join_worker**: Get a worker's status and summary by worker_id.\n\
          - **read_file / write_file / view_image**: Read, write, or analyze local files.\n\
          - **read_pdf / read_docx**: Extract text from PDF or Word documents.\n\
          - **run_command**: Execute a shell command (requires user approval). Use for builds, tests, git.\n\n\
@@ -6292,6 +7215,72 @@ async fn call_ollama_chat(
             }
         }
     }));
+    tools_vec.push(serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "spawn_worker",
+            "description": "Spawn an isolated child worker with its own JWT and budget. The child currently proves isolation with a ping and returns a summary. Use when the user asks to spawn, start, or run an isolated worker.",
+            "parameters": {
+                "type": "object",
+                "required": ["goal"],
+                "properties": {
+                    "goal": {
+                        "type": "string",
+                        "description": "What the child should accomplish"
+                    },
+                    "allowed_tools": {
+                        "type": "string",
+                        "description": "Comma-separated tool names the child may call (default: ping)"
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": "Seconds before the child is marked timeout (default 300, max 600)"
+                    },
+                    "isolation": {
+                        "type": "string",
+                        "description": "Runtime: local (default) or docker"
+                    }
+                }
+            }
+        }
+    }));
+    tools_vec.push(serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "list_workers",
+            "description": "List isolated workers spawned by this chat agent.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "description": "Filter by status: pending, running, completed, failed, timeout"
+                    }
+                }
+            }
+        }
+    }));
+    tools_vec.push(serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "join_worker",
+            "description": "Get an isolated worker's status and summary by ID.",
+            "parameters": {
+                "type": "object",
+                "required": ["worker_id"],
+                "properties": {
+                    "worker_id": {
+                        "type": "string",
+                        "description": "Worker ID returned by spawn_worker"
+                    },
+                    "wait_secs": {
+                        "type": "integer",
+                        "description": "Seconds to wait for a terminal status (default 0, max 60)"
+                    }
+                }
+            }
+        }
+    }));
 
     let tools_def = if tools_vec.is_empty() {
         None
@@ -6393,6 +7382,7 @@ async fn call_ollama_chat(
 
     let model = &resolved_model;
     let fallback = &chat_cfg.chat_fallback_model;
+    sync_runtime_model_identity(state).await;
 
     // Degraded mode: skip primary model if it recently failed with OOM.
     // Periodically retry (every DEGRADED_RETRY_INTERVAL) to detect recovery.
@@ -6442,16 +7432,20 @@ async fn call_ollama_chat(
                 fallback,
                 &messages,
                 state.config.ollama.num_ctx,
+                &state.config.chat.thinking_mode,
+                state.config.chat.thinking_enabled,
             )
             .await;
         }
     }
 
+    apply_serving_model_identity(&mut messages, model);
+    info!(model = %model, "chat using model");
+
     // Some models don't support thinking mode (legacy vision models, qwen3-coder).
     // Gemma 4 supports thinking and tool calling natively; only legacy gemma3 is excluded.
     let is_legacy_gemma = model.starts_with("gemma") && !model.starts_with("gemma4");
-    let is_think_capable =
-        !params.images.is_some() && !is_legacy_gemma && !model.contains("-coder");
+    let last_user = last_user_msg.unwrap_or("");
 
     for round in 0..=max_rounds {
         // Include tools only on rounds where the model can still call them.
@@ -6459,7 +7453,19 @@ async fn call_ollama_chat(
         // Gemma 4 has native vision + tool calling, so it is NOT excluded here.
         let is_vision = params.images.is_some() && is_legacy_gemma;
         let include_tools = !is_vision && round < max_rounds && tools_def.is_some();
-        let use_think = is_think_capable;
+        let using_tools = round > 0 || (include_tools && chat_has_tool_intent(last_user));
+        let use_think = chat_think_for_turn(
+            model,
+            params.images.is_some(),
+            &state.config.chat.thinking_mode,
+            state.config.chat.thinking_enabled,
+            last_user,
+            using_tools,
+        );
+        info!(
+            think = use_think,
+            round, using_tools, "chat thinking decision"
+        );
         // With think:true, thinking tokens eat into num_predict budget.
         // qwen3.5 thinking chains can use 3000-6000+ tokens alone.
         // Must give enough room for thinking + full content.
@@ -6698,6 +7704,12 @@ async fn call_ollama_chat(
 
                             if content.is_empty() {
                                 "Error: content is required for remember tool.".to_string()
+                            } else if should_skip_identity_memory(&topic, &content) {
+                                info!(
+                                    topic = %topic,
+                                    "remember: skipped model-identity fact (runtime-owned)"
+                                );
+                                "Skipped: model identity is managed automatically from the current serving model.".to_string()
                             } else {
                                 match bridge_call(
                                     state,
@@ -7178,6 +8190,10 @@ async fn call_ollama_chat(
                                 }
                             }
                         }
+                        "spawn_worker" | "list_workers" | "join_worker" => {
+                            execute_chat_worker_tool(state, name, &parse_chat_tool_args(args_raw))
+                                .await
+                        }
                         _ => format!("Unknown tool: {name}"),
                     };
 
@@ -7331,7 +8347,14 @@ async fn call_ollama_chat(
                     "model": model,
                     "messages": retry_msgs,
                     "stream": false,
-                    "think": true,
+                    "think": chat_think_for_turn(
+                        model,
+                        false,
+                        &state.config.chat.thinking_mode,
+                        state.config.chat.thinking_enabled,
+                        last_user,
+                        true,
+                    ),
                     "tools": schedule_tools,
                     "options": {
                         "temperature": 0.3,
@@ -7474,7 +8497,14 @@ async fn call_ollama_chat(
                                     "model": model,
                                     "messages": summarize_msgs,
                                     "stream": false,
-                                    "think": true,
+                                    "think": chat_think_for_turn(
+                                        model,
+                                        false,
+                                        &state.config.chat.thinking_mode,
+                                        state.config.chat.thinking_enabled,
+                                        last_user,
+                                        true,
+                                    ),
                                     "options": {
                                         "temperature": 0.3,
                                         "num_predict": 4096_u32,
@@ -8763,6 +9793,300 @@ mod tests {
             strip_confidence_tag("Before [CONFIDENCE: 2/5] after"),
             "Before after"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // chat thinking gate
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_chat_should_think_respects_config() {
+        assert!(
+            chat_should_think("glm-4.7-flash:q8_0", false, true),
+            "GLM chat thinks when enabled"
+        );
+        assert!(
+            !chat_should_think("glm-4.7-flash:q8_0", false, false),
+            "GLM chat must not think when thinking_enabled is false"
+        );
+        assert!(
+            !chat_should_think("gemma3:27b", false, true),
+            "legacy gemma3 is not think-capable"
+        );
+        assert!(
+            chat_should_think("gemma4:31b", false, true),
+            "gemma4 thinks when enabled"
+        );
+        assert!(
+            !chat_should_think("qwen2.5-coder:32b", false, true),
+            "*-coder models skip thinking"
+        );
+        assert!(
+            !chat_should_think("gemma4:31b", true, true),
+            "image turns skip thinking"
+        );
+    }
+
+    #[test]
+    fn test_resolve_thinking_mode() {
+        assert_eq!(resolve_thinking_mode("auto", false), "auto");
+        assert_eq!(resolve_thinking_mode("on", false), "on");
+        assert_eq!(resolve_thinking_mode("off", true), "off");
+        assert_eq!(resolve_thinking_mode("", true), "on");
+        assert_eq!(resolve_thinking_mode("", false), "off");
+    }
+
+    #[test]
+    fn test_chat_simple_stays_fast() {
+        assert!(!chat_is_complex("Who are you?"));
+        assert!(!chat_is_complex("What's the weather like today?"));
+        assert!(!chat_has_tool_intent("Who are you?"));
+        assert!(!chat_auto_should_think("You there?", false));
+        assert!(
+            !chat_think_for_turn(
+                "glm-4.7-flash:q8_0",
+                false,
+                "auto",
+                true,
+                "Who are you and what llm model are you?",
+                false
+            ),
+            "small talk must not think in auto mode"
+        );
+    }
+
+    #[test]
+    fn test_chat_thinks_on_tools_and_complex() {
+        assert!(chat_has_tool_intent(
+            "Search the web for the latest GLM release"
+        ));
+        assert!(chat_has_tool_intent(
+            "Remind me tomorrow to restart the stack"
+        ));
+        assert!(chat_has_tool_intent("Spawn a worker to ping the bridge"));
+        assert!(chat_has_tool_intent("List workers that are running"));
+        assert!(chat_is_complex(
+            "Compare SQLite and Postgres for a multi-tenant SaaS and recommend one"
+        ));
+        assert!(chat_is_complex(
+            "Why did this fail and how do we fix the retry path?"
+        ));
+        assert!(chat_auto_should_think("You there?", true));
+        assert!(chat_auto_should_think(
+            "implement a function that handles the API endpoint",
+            false
+        ));
+        assert!(chat_think_for_turn(
+            "glm-4.7-flash:q8_0",
+            false,
+            "auto",
+            true,
+            "Search the web for rust 2024 edition notes",
+            false
+        ));
+        assert!(chat_think_for_turn(
+            "glm-4.7-flash:q8_0",
+            false,
+            "auto",
+            true,
+            "hi",
+            true
+        ));
+        assert!(!chat_think_for_turn(
+            "glm-4.7-flash:q8_0",
+            false,
+            "off",
+            true,
+            "Search the web for rust",
+            true
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // dynamic serving-model identity
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_chat_model_family_from_tags() {
+        assert_eq!(chat_model_family("glm-4.7-flash:q8_0"), "glm");
+        assert_eq!(chat_model_family("library/qwen3.6:35b"), "qwen");
+        assert_eq!(chat_model_family("gemma4:e4b"), "gemma");
+        assert_eq!(chat_model_family("deepseek-r1:32b"), "deepseek");
+    }
+
+    #[test]
+    fn test_identity_block_names_serving_model() {
+        let block = chat_model_identity_block("glm-4.7-flash:q8_0");
+        assert!(block.contains("glm-4.7-flash:q8_0"));
+        assert!(block.contains(RUNTIME_IDENTITY_HEADING));
+        assert!(!block.contains("gemma4:e4b"));
+    }
+
+    #[test]
+    fn test_stale_google_identity_dropped_for_glm() {
+        assert!(memory_is_stale_identity(
+            "assistant-identity",
+            "The assistant is trained by Google.",
+            "glm-4.7-flash:q8_0"
+        ));
+        assert!(memory_is_stale_identity(
+            "assistant-model-knowledge",
+            "This model was developed by Google.",
+            "glm-4.7-flash:q8_0"
+        ));
+        assert!(!memory_is_stale_identity(
+            "ads-account",
+            "User runs a Google Ads campaign for Broodlink.",
+            "glm-4.7-flash:q8_0"
+        ));
+        assert!(!memory_is_stale_identity(
+            "assistant-runtime-model",
+            "Broodlink is currently served by glm-4.7-flash:q8_0 via local Ollama.",
+            "glm-4.7-flash:q8_0"
+        ));
+    }
+
+    #[test]
+    fn test_rewrite_prompt_filters_stale_identity_and_injects_model() {
+        let prompt = "You are Broodlink.\n\n## Relevant context from memory:\n\
+- assistant-identity: trained by Google\n\
+- user-project: Google Ads campaign\n\
+- assistant-runtime-model: Broodlink is currently served by glm-4.7-flash:q8_0 via local Ollama.";
+        let rewritten = rewrite_system_prompt_for_serving_model(prompt, "glm-4.7-flash:q8_0");
+        assert!(
+            !rewritten.contains("trained by Google"),
+            "stale vendor identity must not reach the model"
+        );
+        assert!(
+            rewritten.contains("Google Ads campaign"),
+            "project memories that mention Google must stay"
+        );
+        assert!(rewritten.contains("served by `glm-4.7-flash:q8_0`"));
+        assert_eq!(
+            rewritten.matches(RUNTIME_IDENTITY_HEADING).count(),
+            1,
+            "identity block must be unique"
+        );
+    }
+
+    #[test]
+    fn test_identity_updates_when_serving_model_changes() {
+        let glm_prompt =
+            rewrite_system_prompt_for_serving_model("You are Broodlink.", "glm-4.7-flash:q8_0");
+        let qwen_prompt = rewrite_system_prompt_for_serving_model(&glm_prompt, "qwen3.6:35b");
+        assert!(qwen_prompt.contains("qwen3.6:35b"));
+        assert!(
+            !qwen_prompt.contains("glm-4.7-flash:q8_0"),
+            "previous serving model must be replaced"
+        );
+        assert_eq!(qwen_prompt.matches(RUNTIME_IDENTITY_HEADING).count(), 1);
+    }
+
+    #[test]
+    fn test_skip_auto_memory_identity_claims() {
+        assert!(should_skip_identity_memory(
+            "assistant-identity",
+            "trained by Google"
+        ));
+        assert!(should_skip_identity_memory(
+            "chat-note",
+            "I am Gemma, a language model developed by Google."
+        ));
+        assert!(!should_skip_identity_memory(
+            "user-project",
+            "User prefers Google Ads for the campaign."
+        ));
+    }
+
+    #[test]
+    fn test_runtime_identity_fingerprint_changes_with_models() {
+        let mut chat = broodlink_config::ChatConfig::default();
+        chat.chat_model = "glm-4.7-flash:q8_0".into();
+        chat.chat_code_model = "glm-4.7-flash:q8_0".into();
+        chat.chat_vision_model = "qwen3.6:35b".into();
+        chat.chat_fallback_model = "gemma4:e4b".into();
+        let before = chat_runtime_identity_fingerprint(&chat);
+        chat.chat_model = "qwen3.6:35b".into();
+        let after = chat_runtime_identity_fingerprint(&chat);
+        assert!(runtime_identity_changed(Some(&before), &after));
+        assert!(!runtime_identity_changed(Some(&after), &after));
+        assert!(chat_runtime_identity_content(&chat).contains("qwen3.6:35b"));
+    }
+
+    #[test]
+    fn test_redact_worker_jwt_from_tool_result() {
+        let raw = serde_json::json!({
+            "worker_id": "abc",
+            "jwt": "header.payload.sig",
+            "token": "should-not-leak",
+            "nested": { "api_key": "k", "status": "running" }
+        });
+        let text = format_bridge_json(&raw);
+        assert!(text.contains("abc"));
+        assert!(text.contains("running"));
+        assert!(!text.contains("header.payload.sig"));
+        assert!(!text.contains("should-not-leak"));
+        assert!(!text.contains("\"k\""));
+    }
+
+    #[test]
+    fn test_spawn_worker_params_default_local_and_reject_ssh() {
+        let ok = build_spawn_worker_params(&serde_json::json!({
+            "goal": "ping the bridge"
+        }))
+        .unwrap();
+        assert_eq!(ok["goal"], "ping the bridge");
+        assert_eq!(ok["isolation"], "local");
+
+        let docker = build_spawn_worker_params(&serde_json::json!({
+            "goal": "ping",
+            "isolation": "docker",
+            "timeout_secs": 9000
+        }))
+        .unwrap();
+        assert_eq!(docker["isolation"], "docker");
+        assert_eq!(docker["timeout_secs"], 600);
+
+        assert!(build_spawn_worker_params(&serde_json::json!({
+            "goal": "x",
+            "isolation": "ssh"
+        }))
+        .is_err());
+        assert!(build_spawn_worker_params(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn test_parse_direct_worker_command() {
+        assert_eq!(
+            parse_direct_worker_command("Spawn a worker to ping the bridge"),
+            Some(DirectWorkerCommand::Spawn {
+                goal: "ping the bridge".into()
+            })
+        );
+        assert_eq!(
+            parse_direct_worker_command("list workers"),
+            Some(DirectWorkerCommand::List { status: None })
+        );
+        assert_eq!(
+            parse_direct_worker_command("join worker ae1d3424-d910-4448-b1ee-91f220871b27"),
+            Some(DirectWorkerCommand::Join {
+                worker_id: "ae1d3424-d910-4448-b1ee-91f220871b27".into()
+            })
+        );
+        assert_eq!(parse_direct_worker_command("Who are you?"), None);
+    }
+
+    #[test]
+    fn test_format_direct_worker_spawn_reply() {
+        let raw = r#"{
+            "worker_id": "abc-123",
+            "status": "running",
+            "runtime": "local"
+        }"#;
+        let reply = format_direct_worker_reply("spawn_worker", raw);
+        assert!(reply.contains("abc-123"));
+        assert!(reply.contains("running"));
+        assert!(!reply.contains("jwt"));
     }
 
     // -----------------------------------------------------------------------

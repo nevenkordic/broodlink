@@ -7,6 +7,13 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Chat thinking is now configurable**: `[chat] thinking_mode` is `on`,
+  `off`, or `auto`. `auto` thinks only for tool use and complex tasks
+  (including coding), not small talk. `[chat] thinking_enabled` remains
+  the fallback when `thinking_mode` is unset (`true` → on, `false` → off).
+
 ### Added
 
 - **Operator setup CLI**: `./broodctl setup`, `model`, and `tools` write
@@ -19,7 +26,10 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
   confirms of the same skill bump `version`.
 - **Isolated workers**: `spawn_worker`, `list_workers`, and `join_worker`
   tools. The child gets its own JWT, allow-listed tools, and budget. Parent
-  joins on a summary only.
+  joins on a summary only. Telegram / Slack / Teams chat can call the same
+  tools (local or docker only; worker JWTs are stripped from replies).
+  Phrases like “spawn a worker to …” run the tool directly so a weak
+  chat model cannot talk instead of spawning.
 - **Pluggable runtimes**: `[runtimes.<name>]` with `local`, `docker`, `ssh`,
   and `remote-idle`. Coordinator picks the runtime (default `local`). Local
   and Docker plans share the same audit payload for a given task.
