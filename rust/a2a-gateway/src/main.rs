@@ -4929,6 +4929,9 @@ async fn extract_and_store_memory(state: Arc<AppState>, user_msg: String, assist
     if user_msg.len() < 30 {
         return;
     }
+    if parse_direct_worker_command(&user_msg).is_some() {
+        return;
+    }
 
     let model = state.config.chat.chat_fallback_model.clone();
     if model.is_empty() {
@@ -6002,6 +6005,200 @@ async fn execute_chat_worker_tool(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum DirectWorkerCommand {
+    Spawn { goal: String },
+    List { status: Option<String> },
+    Join { worker_id: String },
+}
+
+fn collapse_ws(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn looks_like_worker_id(value: &str) -> bool {
+    let value = value.trim();
+    if value.len() == 36 && value.chars().filter(|c| *c == '-').count() == 4 {
+        return value.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+    }
+    value.starts_with("worker-") && value.len() >= 8
+}
+
+fn parse_direct_worker_command(text: &str) -> Option<DirectWorkerCommand> {
+    let collapsed = collapse_ws(&text.trim().to_ascii_lowercase());
+    if collapsed.is_empty() {
+        return None;
+    }
+
+    if collapsed == "list workers"
+        || collapsed == "list the workers"
+        || collapsed == "show workers"
+        || collapsed == "show the workers"
+    {
+        return Some(DirectWorkerCommand::List { status: None });
+    }
+    if let Some(rest) = collapsed.strip_prefix("list workers ") {
+        let status = rest.trim();
+        return Some(DirectWorkerCommand::List {
+            status: (!status.is_empty()).then(|| status.to_string()),
+        });
+    }
+
+    for prefix in ["join worker ", "join the worker "] {
+        if let Some(rest) = collapsed.strip_prefix(prefix) {
+            let id = rest.split_whitespace().next().unwrap_or("");
+            if looks_like_worker_id(id) {
+                return Some(DirectWorkerCommand::Join {
+                    worker_id: id.to_string(),
+                });
+            }
+        }
+    }
+
+    const SPAWN_TO: &[&str] = &[
+        "spawn a worker to ",
+        "spawn an isolated worker to ",
+        "spawn worker to ",
+        "start a worker to ",
+        "start worker to ",
+    ];
+    for prefix in SPAWN_TO {
+        if let Some(rest) = collapsed.strip_prefix(prefix) {
+            let goal = rest.trim();
+            return Some(DirectWorkerCommand::Spawn {
+                goal: if goal.is_empty() {
+                    "ping".to_string()
+                } else {
+                    goal.to_string()
+                },
+            });
+        }
+    }
+    const SPAWN_BARE: &[&str] = &[
+        "spawn a worker ",
+        "spawn worker ",
+        "start a worker ",
+        "start worker ",
+    ];
+    for prefix in SPAWN_BARE {
+        if let Some(rest) = collapsed.strip_prefix(prefix) {
+            let goal = rest.trim();
+            if !goal.is_empty() {
+                return Some(DirectWorkerCommand::Spawn {
+                    goal: goal.to_string(),
+                });
+            }
+        }
+    }
+    if matches!(
+        collapsed.as_str(),
+        "spawn a worker" | "spawn worker" | "start a worker" | "start worker"
+    ) {
+        return Some(DirectWorkerCommand::Spawn {
+            goal: "ping".to_string(),
+        });
+    }
+    None
+}
+
+fn format_direct_worker_reply(name: &str, raw: &str) -> String {
+    if raw.starts_with("Error:") || raw.starts_with("Failed to") {
+        return raw.to_string();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return raw.to_string();
+    };
+    match name {
+        "spawn_worker" => {
+            let id = value
+                .get("worker_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let status = value
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let runtime = value
+                .get("runtime")
+                .and_then(|v| v.as_str())
+                .unwrap_or("local");
+            format!(
+                "Started worker `{id}` ({status}) on {runtime}. \
+                 The child pings the bridge with its own credentials, then exits. \
+                 Say \"list workers\" or \"join worker {id}\" for the summary."
+            )
+        }
+        "list_workers" => {
+            let workers = value
+                .get("workers")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if workers.is_empty() {
+                return "No workers yet.".to_string();
+            }
+            let mut out = format!("{} worker(s):", workers.len());
+            for worker in workers {
+                let id = worker
+                    .get("worker_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let status = worker.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                let goal = worker.get("goal").and_then(|v| v.as_str()).unwrap_or("");
+                let summary = worker
+                    .get("result_summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                out.push_str(&format!("\n- `{id}` {status}"));
+                if !goal.is_empty() {
+                    out.push_str(&format!(" — {goal}"));
+                }
+                if !summary.is_empty() {
+                    out.push_str(&format!(" ({summary})"));
+                }
+            }
+            out
+        }
+        "join_worker" => {
+            let id = value
+                .get("worker_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let status = value
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let summary = value
+                .get("result_summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("no summary yet");
+            format!("Worker `{id}` is {status}. {summary}")
+        }
+        _ => raw.to_string(),
+    }
+}
+
+async fn run_direct_worker_command(state: &AppState, command: DirectWorkerCommand) -> String {
+    let (name, parsed) = match command {
+        DirectWorkerCommand::Spawn { goal } => {
+            ("spawn_worker", serde_json::json!({ "goal": goal }))
+        }
+        DirectWorkerCommand::List { status } => {
+            let mut parsed = serde_json::json!({});
+            if let Some(status) = status {
+                parsed["status"] = serde_json::json!(status);
+            }
+            ("list_workers", parsed)
+        }
+        DirectWorkerCommand::Join { worker_id } => (
+            "join_worker",
+            serde_json::json!({ "worker_id": worker_id, "wait_secs": 15 }),
+        ),
+    };
+    let raw = execute_chat_worker_tool(state, name, &parsed).await;
+    format_direct_worker_reply(name, &raw)
+}
+
 /// Non-code work that still benefits from a reasoning pass.
 fn chat_is_complex(text: &str) -> bool {
     let trimmed = text.trim();
@@ -6490,6 +6687,17 @@ async fn call_ollama_chat(
     history: &[(String, String)],
     params: &ChatParams<'_>,
 ) -> String {
+    let last_user_early = history
+        .iter()
+        .rev()
+        .find(|(role, _)| role == "user")
+        .map(|(_, content)| content.as_str())
+        .unwrap_or("");
+    if let Some(command) = parse_direct_worker_command(last_user_early) {
+        info!(text = %last_user_early, "direct worker command, skipping model");
+        return run_direct_worker_command(state, command).await;
+    }
+
     let model_override = params.model_override;
     let default_url = state.ollama_pool.primary_url().to_string();
     let ollama_url = params
@@ -9845,6 +10053,40 @@ mod tests {
         }))
         .is_err());
         assert!(build_spawn_worker_params(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn test_parse_direct_worker_command() {
+        assert_eq!(
+            parse_direct_worker_command("Spawn a worker to ping the bridge"),
+            Some(DirectWorkerCommand::Spawn {
+                goal: "ping the bridge".into()
+            })
+        );
+        assert_eq!(
+            parse_direct_worker_command("list workers"),
+            Some(DirectWorkerCommand::List { status: None })
+        );
+        assert_eq!(
+            parse_direct_worker_command("join worker ae1d3424-d910-4448-b1ee-91f220871b27"),
+            Some(DirectWorkerCommand::Join {
+                worker_id: "ae1d3424-d910-4448-b1ee-91f220871b27".into()
+            })
+        );
+        assert_eq!(parse_direct_worker_command("Who are you?"), None);
+    }
+
+    #[test]
+    fn test_format_direct_worker_spawn_reply() {
+        let raw = r#"{
+            "worker_id": "abc-123",
+            "status": "running",
+            "runtime": "local"
+        }"#;
+        let reply = format_direct_worker_reply("spawn_worker", raw);
+        assert!(reply.contains("abc-123"));
+        assert!(reply.contains("running"));
+        assert!(!reply.contains("jwt"));
     }
 
     // -----------------------------------------------------------------------
