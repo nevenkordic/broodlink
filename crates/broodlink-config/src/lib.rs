@@ -1392,9 +1392,13 @@ impl Config {
     pub fn load() -> Result<Self, config::ConfigError> {
         let config_path =
             std::env::var("BROODLINK_CONFIG").unwrap_or_else(|_| "config.toml".to_string());
+        Self::load_from(&config_path)
+    }
 
+    /// Load from an explicit path so tests do not race on `BROODLINK_CONFIG`.
+    fn load_from(config_path: &str) -> Result<Self, config::ConfigError> {
         let settings = config::Config::builder()
-            .add_source(config::File::with_name(&config_path))
+            .add_source(config::File::with_name(config_path))
             .add_source(
                 config::Environment::with_prefix("BROODLINK")
                     .separator("_")
@@ -1559,10 +1563,7 @@ api_key_name = "STATUS_API_KEY"
         let config_path = dir.path().join("config.toml");
         std::fs::write(&config_path, valid_toml()).unwrap();
 
-        // Point Config::load() at our temp file
-        std::env::set_var("BROODLINK_CONFIG", config_path.to_str().unwrap());
-
-        let cfg = Config::load().unwrap();
+        let cfg = Config::load_from(config_path.to_str().unwrap()).unwrap();
 
         assert_eq!(cfg.broodlink.env, "test");
         assert_eq!(cfg.broodlink.version, "0.1.0");
@@ -1575,25 +1576,15 @@ api_key_name = "STATUS_API_KEY"
         assert_eq!(cfg.ollama.embedding_model, "nomic-embed-text");
         assert_eq!(cfg.status_api.port, 3312);
         assert_eq!(cfg.residency.region, "us-west-2");
-
-        // Clean up env var
-        std::env::remove_var("BROODLINK_CONFIG");
     }
 
     #[test]
     fn test_load_missing_file() {
-        std::env::set_var(
-            "BROODLINK_CONFIG",
-            "/tmp/broodlink_nonexistent_config_12345.toml",
-        );
-
-        let result = Config::load();
+        let result = Config::load_from("/tmp/broodlink_nonexistent_config_12345.toml");
         assert!(
             result.is_err(),
             "loading a nonexistent file should return an error"
         );
-
-        std::env::remove_var("BROODLINK_CONFIG");
     }
 
     #[test]
@@ -1602,9 +1593,7 @@ api_key_name = "STATUS_API_KEY"
         let config_path = dir.path().join("config.toml");
         std::fs::write(&config_path, valid_toml()).unwrap();
 
-        std::env::set_var("BROODLINK_CONFIG", config_path.to_str().unwrap());
-
-        let cfg = Config::load().unwrap();
+        let cfg = Config::load_from(config_path.to_str().unwrap()).unwrap();
 
         // Dolt defaults
         assert_eq!(
@@ -1658,8 +1647,6 @@ api_key_name = "STATUS_API_KEY"
             cfg.agents.is_empty(),
             "agents should default to empty HashMap"
         );
-
-        std::env::remove_var("BROODLINK_CONFIG");
     }
 
     #[test]
@@ -1668,9 +1655,7 @@ api_key_name = "STATUS_API_KEY"
         let config_path = dir.path().join("config.toml");
         std::fs::write(&config_path, valid_toml()).unwrap();
 
-        std::env::set_var("BROODLINK_CONFIG", config_path.to_str().unwrap());
-
-        let cfg = Config::load().unwrap();
+        let cfg = Config::load_from(config_path.to_str().unwrap()).unwrap();
 
         // Telemetry defaults
         assert!(
@@ -1735,8 +1720,6 @@ api_key_name = "STATUS_API_KEY"
         assert!((cfg.memory_search.kg_entity_similarity_threshold - 0.85).abs() < f64::EPSILON);
         assert_eq!(cfg.memory_search.kg_max_hops, 3);
         assert_eq!(cfg.memory_search.kg_extraction_timeout_seconds, 120);
-
-        std::env::remove_var("BROODLINK_CONFIG");
     }
 
     #[test]
@@ -1745,9 +1728,7 @@ api_key_name = "STATUS_API_KEY"
         let config_path = dir.path().join("config.toml");
         std::fs::write(&config_path, valid_toml()).unwrap();
 
-        std::env::set_var("BROODLINK_CONFIG", config_path.to_str().unwrap());
-
-        let cfg = Config::load().unwrap();
+        let cfg = Config::load_from(config_path.to_str().unwrap()).unwrap();
 
         // v0.11.0: Multi-modal attachment config defaults
         assert_eq!(
@@ -1770,7 +1751,14 @@ api_key_name = "STATUS_API_KEY"
             !cfg.chat.voice_transcription_enabled,
             "voice_transcription_enabled should default to false"
         );
+    }
 
-        std::env::remove_var("BROODLINK_CONFIG");
+    #[test]
+    fn test_load_from_does_not_require_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, valid_toml()).unwrap();
+        let cfg = Config::load_from(config_path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.broodlink.env, "test");
     }
 }

@@ -48,6 +48,12 @@ ignore = [
   # core2 unmaintained / yanked — transitive dep (mailparse/quoted_printable
   # tree); no functional impact, no upgrade path yet.
   "RUSTSEC-2026-0105",
+  # h2 unbounded empty DATA frames — 0.4.x is patched; remaining 0.3.x
+  # (legacy hyper 0.14 path) has no upstream patch.
+  "RUSTSEC-2026-0258",
+  # lopdf stack overflow on nested PDF objects — pulled in by pdf-extract
+  # 0.7.x which pins lopdf 0.34; no upgrade path until pdf-extract bumps.
+  "RUSTSEC-2026-0187",
 ]
 
 [bans]
