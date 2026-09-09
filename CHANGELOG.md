@@ -26,7 +26,8 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
   confirms of the same skill bump `version`.
 - **Isolated workers**: `spawn_worker`, `list_workers`, and `join_worker`
   tools. The child gets its own JWT, allow-listed tools, and budget. Parent
-  joins on a summary only.
+  joins on a summary only. Telegram / Slack / Teams chat can call the same
+  tools (local or docker only; worker JWTs are stripped from replies).
 - **Pluggable runtimes**: `[runtimes.<name>]` with `local`, `docker`, `ssh`,
   and `remote-idle`. Coordinator picks the runtime (default `local`). Local
   and Docker plans share the same audit payload for a given task.

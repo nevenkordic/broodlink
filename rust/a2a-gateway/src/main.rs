@@ -5857,8 +5857,149 @@ fn chat_has_tool_intent(text: &str) -> bool {
         "use a tool",
         "fetch the page",
         "open the url",
+        "spawn a worker",
+        "spawn worker",
+        "start a worker",
+        "start worker",
+        "list workers",
+        "join worker",
+        "join the worker",
+        "isolated worker",
     ];
     TOOL_PHRASES.iter().any(|p| lower.contains(p))
+}
+
+fn parse_chat_tool_args(args_raw: Option<&serde_json::Value>) -> serde_json::Value {
+    args_raw
+        .and_then(|a| {
+            if let Some(s) = a.as_str() {
+                serde_json::from_str::<serde_json::Value>(s).ok()
+            } else {
+                Some(a.clone())
+            }
+        })
+        .unwrap_or_default()
+}
+
+const SECRET_JSON_KEYS: &[&str] = &[
+    "jwt",
+    "token",
+    "access_token",
+    "refresh_token",
+    "authorization",
+    "password",
+    "secret",
+    "api_key",
+];
+
+fn redact_secret_fields(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                if SECRET_JSON_KEYS
+                    .iter()
+                    .any(|secret| k.eq_ignore_ascii_case(secret))
+                {
+                    continue;
+                }
+                out.insert(k, redact_secret_fields(v));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(redact_secret_fields).collect())
+        }
+        other => other,
+    }
+}
+
+fn format_bridge_json(value: &serde_json::Value) -> String {
+    let redacted = redact_secret_fields(value.clone());
+    serde_json::to_string_pretty(&redacted).unwrap_or_else(|_| redacted.to_string())
+}
+
+fn build_spawn_worker_params(parsed: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let goal = parsed
+        .get("goal")
+        .and_then(|g| g.as_str())
+        .unwrap_or("")
+        .trim();
+    if goal.is_empty() {
+        return Err("Error: goal is required.".to_string());
+    }
+    let mut params = serde_json::json!({ "goal": goal });
+    if let Some(tools) = parsed.get("allowed_tools") {
+        params["allowed_tools"] = tools.clone();
+    }
+    if let Some(timeout) = parsed.get("timeout_secs").and_then(|v| v.as_u64()) {
+        params["timeout_secs"] = serde_json::json!(timeout.clamp(5, 600));
+    }
+    let isolation = parsed
+        .get("isolation")
+        .and_then(|v| v.as_str())
+        .or_else(|| parsed.get("runtime").and_then(|v| v.as_str()))
+        .unwrap_or("local")
+        .trim();
+    let isolation_l = isolation.to_ascii_lowercase();
+    if isolation_l == "ssh" || isolation_l == "remote-idle" {
+        return Err("Error: chat can spawn local or docker workers only.".to_string());
+    }
+    params["isolation"] = serde_json::json!(if isolation.is_empty() {
+        "local"
+    } else {
+        isolation
+    });
+    if let Some(budget) = parsed.get("budget_tokens") {
+        params["budget_tokens"] = budget.clone();
+    }
+    Ok(params)
+}
+
+async fn execute_chat_worker_tool(
+    state: &AppState,
+    name: &str,
+    parsed: &serde_json::Value,
+) -> String {
+    let params = match name {
+        "spawn_worker" => match build_spawn_worker_params(parsed) {
+            Ok(p) => p,
+            Err(e) => return e,
+        },
+        "list_workers" => {
+            let mut params = serde_json::json!({});
+            if let Some(status) = parsed.get("status").and_then(|v| v.as_str()) {
+                params["status"] = serde_json::json!(status);
+            }
+            params
+        }
+        "join_worker" => {
+            let worker_id = parsed
+                .get("worker_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if worker_id.is_empty() {
+                return "Error: worker_id is required.".to_string();
+            }
+            let mut params = serde_json::json!({ "worker_id": worker_id });
+            if let Some(wait) = parsed.get("wait_secs").and_then(|v| v.as_u64()) {
+                params["wait_secs"] = serde_json::json!(wait.min(60));
+            }
+            params
+        }
+        _ => return format!("Unknown worker tool: {name}"),
+    };
+    match bridge_call(state, name, params).await {
+        Ok(resp) => {
+            info!(tool = name, "worker tool via chat");
+            format_bridge_json(&resp)
+        }
+        Err(e) => {
+            warn!(error = %e, tool = name, "worker tool failed");
+            format!("Failed to {name}: {e}")
+        }
+    }
 }
 
 /// Non-code work that still benefits from a reasoning pass.
@@ -6407,6 +6548,10 @@ async fn call_ollama_chat(
            done later, at a specific time, or on a recurring basis.\n\
          - **list_scheduled_tasks**: Show all active scheduled tasks.\n\
          - **cancel_scheduled_task**: Cancel a scheduled task by ID.\n\
+         - **spawn_worker**: Start an isolated child worker (local or docker) with its own JWT and budget. \
+           The current worker entrypoint proves isolation with a ping, then exits. Tell the user the worker_id and status — never a token.\n\
+         - **list_workers**: List workers spawned from this chat agent.\n\
+         - **join_worker**: Get a worker's status and summary by worker_id.\n\
          - **read_file / write_file / view_image**: Read, write, or analyze local files.\n\
          - **read_pdf / read_docx**: Extract text from PDF or Word documents.\n\
          - **run_command**: Execute a shell command (requires user approval). Use for builds, tests, git.\n\n\
@@ -6857,6 +7002,72 @@ async fn call_ollama_chat(
                     "task_id": {
                         "type": "string",
                         "description": "The ID of the scheduled task to cancel"
+                    }
+                }
+            }
+        }
+    }));
+    tools_vec.push(serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "spawn_worker",
+            "description": "Spawn an isolated child worker with its own JWT and budget. The child currently proves isolation with a ping and returns a summary. Use when the user asks to spawn, start, or run an isolated worker.",
+            "parameters": {
+                "type": "object",
+                "required": ["goal"],
+                "properties": {
+                    "goal": {
+                        "type": "string",
+                        "description": "What the child should accomplish"
+                    },
+                    "allowed_tools": {
+                        "type": "string",
+                        "description": "Comma-separated tool names the child may call (default: ping)"
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": "Seconds before the child is marked timeout (default 300, max 600)"
+                    },
+                    "isolation": {
+                        "type": "string",
+                        "description": "Runtime: local (default) or docker"
+                    }
+                }
+            }
+        }
+    }));
+    tools_vec.push(serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "list_workers",
+            "description": "List isolated workers spawned by this chat agent.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "description": "Filter by status: pending, running, completed, failed, timeout"
+                    }
+                }
+            }
+        }
+    }));
+    tools_vec.push(serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "join_worker",
+            "description": "Get an isolated worker's status and summary by ID.",
+            "parameters": {
+                "type": "object",
+                "required": ["worker_id"],
+                "properties": {
+                    "worker_id": {
+                        "type": "string",
+                        "description": "Worker ID returned by spawn_worker"
+                    },
+                    "wait_secs": {
+                        "type": "integer",
+                        "description": "Seconds to wait for a terminal status (default 0, max 60)"
                     }
                 }
             }
@@ -7770,6 +7981,10 @@ async fn call_ollama_chat(
                                     }
                                 }
                             }
+                        }
+                        "spawn_worker" | "list_workers" | "join_worker" => {
+                            execute_chat_worker_tool(state, name, &parse_chat_tool_args(args_raw))
+                                .await
                         }
                         _ => format!("Unknown tool: {name}"),
                     };
@@ -9440,6 +9655,8 @@ mod tests {
         assert!(chat_has_tool_intent(
             "Remind me tomorrow to restart the stack"
         ));
+        assert!(chat_has_tool_intent("Spawn a worker to ping the bridge"));
+        assert!(chat_has_tool_intent("List workers that are running"));
         assert!(chat_is_complex(
             "Compare SQLite and Postgres for a multi-tenant SaaS and recommend one"
         ));
@@ -9586,6 +9803,48 @@ mod tests {
         assert!(runtime_identity_changed(Some(&before), &after));
         assert!(!runtime_identity_changed(Some(&after), &after));
         assert!(chat_runtime_identity_content(&chat).contains("qwen3.6:35b"));
+    }
+
+    #[test]
+    fn test_redact_worker_jwt_from_tool_result() {
+        let raw = serde_json::json!({
+            "worker_id": "abc",
+            "jwt": "header.payload.sig",
+            "token": "should-not-leak",
+            "nested": { "api_key": "k", "status": "running" }
+        });
+        let text = format_bridge_json(&raw);
+        assert!(text.contains("abc"));
+        assert!(text.contains("running"));
+        assert!(!text.contains("header.payload.sig"));
+        assert!(!text.contains("should-not-leak"));
+        assert!(!text.contains("\"k\""));
+    }
+
+    #[test]
+    fn test_spawn_worker_params_default_local_and_reject_ssh() {
+        let ok = build_spawn_worker_params(&serde_json::json!({
+            "goal": "ping the bridge"
+        }))
+        .unwrap();
+        assert_eq!(ok["goal"], "ping the bridge");
+        assert_eq!(ok["isolation"], "local");
+
+        let docker = build_spawn_worker_params(&serde_json::json!({
+            "goal": "ping",
+            "isolation": "docker",
+            "timeout_secs": 9000
+        }))
+        .unwrap();
+        assert_eq!(docker["isolation"], "docker");
+        assert_eq!(docker["timeout_secs"], 600);
+
+        assert!(build_spawn_worker_params(&serde_json::json!({
+            "goal": "x",
+            "isolation": "ssh"
+        }))
+        .is_err());
+        assert!(build_spawn_worker_params(&serde_json::json!({})).is_err());
     }
 
     // -----------------------------------------------------------------------
