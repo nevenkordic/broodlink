@@ -610,6 +610,15 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/formulas/:name", get(handler_get_formula))
         .route("/formulas/:name/update", post(handler_update_formula))
         .route("/formulas/:name/toggle", post(handler_toggle_formula))
+        .route("/formula-drafts", get(handler_list_formula_drafts))
+        .route(
+            "/formula-drafts/:id/confirm",
+            post(handler_confirm_formula_draft),
+        )
+        .route(
+            "/formula-drafts/:id/dismiss",
+            post(handler_dismiss_formula_draft),
+        )
         // v0.7.0 user management (admin-only, checked in handlers)
         .route("/users", get(handler_list_users).post(handler_create_user))
         .route("/users/:id/role", post(handler_change_role))
@@ -4323,6 +4332,273 @@ async fn handler_toggle_formula(
     Ok(ok_response(serde_json::json!({
         "name": name,
         "enabled": new_enabled,
+    })))
+}
+
+async fn handler_list_formula_drafts(
+    State(state): State<Arc<AppState>>,
+    req: Request<axum::body::Body>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Operator)?;
+
+    let q = req
+        .uri()
+        .query()
+        .and_then(|qs| {
+            qs.split('&')
+                .find_map(|pair| pair.strip_prefix("q=").map(ToString::to_string))
+        })
+        .map(|raw| raw.replace('+', " "));
+
+    let rows: Vec<(
+        String,
+        Option<String>,
+        String,
+        String,
+        Option<String>,
+        serde_json::Value,
+        serde_json::Value,
+        String,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT id, workflow_run_id, suggested_name, display_name, description,
+                definition, tags, status, created_at::text
+         FROM formula_drafts
+         WHERE status = 'pending'
+         ORDER BY created_at DESC",
+    )
+    .fetch_all(&state.pg)
+    .await?;
+
+    let mut drafts: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(
+            |(id, wf, name, display, desc, definition, tags, status, created)| {
+                serde_json::json!({
+                    "id": id,
+                    "workflow_run_id": wf,
+                    "name": name,
+                    "display_name": display,
+                    "description": desc,
+                    "definition": definition,
+                    "tags": tags,
+                    "status": status,
+                    "created_at": created,
+                    "is_system": false,
+                })
+            },
+        )
+        .collect();
+
+    if let Some(query) = q {
+        let needle = query.to_ascii_lowercase();
+        drafts.retain(|d| {
+            let name = d["name"].as_str().unwrap_or("").to_ascii_lowercase();
+            let display = d["display_name"]
+                .as_str()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let tags_hit = d["tags"].as_array().is_some_and(|arr| {
+                arr.iter().any(|t| {
+                    t.as_str()
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                        .contains(&needle)
+                })
+            });
+            name.contains(&needle) || display.contains(&needle) || tags_hit
+        });
+    }
+
+    Ok(ok_response(serde_json::json!({
+        "drafts": drafts,
+        "total": drafts.len(),
+    })))
+}
+
+async fn publish_custom_formula(
+    state: &AppState,
+    name: &str,
+    display_name: &str,
+    description: Option<&str>,
+    definition: &serde_json::Value,
+    tags: &serde_json::Value,
+) -> Result<(String, &'static str, i32), StatusApiError> {
+    let existing: Option<(String, bool, i32)> =
+        sqlx::query_as("SELECT id, is_system, version FROM formula_registry WHERE name = $1")
+            .bind(name)
+            .fetch_optional(&state.pg)
+            .await?;
+
+    if let Some((id, is_system, version)) = existing {
+        if is_system {
+            return Err(StatusApiError::BadRequest(format!(
+                "name '{name}' is reserved for a system formula"
+            )));
+        }
+        let def_hash = broodlink_formulas::definition_hash(definition);
+        let next = broodlink_formulas::bump_formula_version(version);
+        sqlx::query(
+            "UPDATE formula_registry
+             SET display_name = $1, description = $2, definition = $3, definition_hash = $4,
+                 tags = $5, version = $6, is_system = false, updated_at = NOW()
+             WHERE id = $7",
+        )
+        .bind(display_name)
+        .bind(description)
+        .bind(definition)
+        .bind(&def_hash)
+        .bind(tags)
+        .bind(next)
+        .bind(&id)
+        .execute(&state.pg)
+        .await?;
+        let meta = broodlink_formulas::FormulaTomlMeta {
+            display_name,
+            description: description.unwrap_or(""),
+        };
+        if let Err(e) = broodlink_formulas::persist_formula_toml(
+            &state.config.beads.formulas_custom_dir,
+            name,
+            definition,
+            &meta,
+        ) {
+            tracing::warn!(formula = %name, error = %e, "write-through to disk failed (draft bump)");
+        }
+        return Ok((id, "updated", next));
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let def_hash = broodlink_formulas::definition_hash(definition);
+    sqlx::query(
+        "INSERT INTO formula_registry
+         (id, name, display_name, description, definition, definition_hash, tags, author, is_system)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'operator', false)",
+    )
+    .bind(&id)
+    .bind(name)
+    .bind(display_name)
+    .bind(description)
+    .bind(definition)
+    .bind(&def_hash)
+    .bind(tags)
+    .execute(&state.pg)
+    .await?;
+
+    let meta = broodlink_formulas::FormulaTomlMeta {
+        display_name,
+        description: description.unwrap_or(""),
+    };
+    if let Err(e) = broodlink_formulas::persist_formula_toml(
+        &state.config.beads.formulas_custom_dir,
+        name,
+        definition,
+        &meta,
+    ) {
+        tracing::warn!(formula = %name, error = %e, "write-through to disk failed (draft confirm)");
+    }
+    Ok((id, "created", 1))
+}
+
+async fn handler_confirm_formula_draft(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    req: Request<axum::body::Body>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Operator)?;
+
+    let row: Option<(
+        String,
+        String,
+        Option<String>,
+        serde_json::Value,
+        serde_json::Value,
+        String,
+    )> = sqlx::query_as(
+        "SELECT suggested_name, display_name, description, definition, tags, status
+         FROM formula_drafts WHERE id = $1",
+    )
+    .bind(&id)
+    .fetch_optional(&state.pg)
+    .await?;
+
+    let (name, display, description, definition, tags, status) =
+        row.ok_or_else(|| StatusApiError::NotFound(format!("formula draft not found: {id}")))?;
+    if status != "pending" {
+        return Err(StatusApiError::BadRequest(format!(
+            "draft {id} is already {status}"
+        )));
+    }
+    if !broodlink_formulas::validate_formula_name(&name) {
+        return Err(StatusApiError::BadRequest(format!(
+            "invalid suggested formula name: {name}"
+        )));
+    }
+
+    let (formula_id, action, version) = publish_custom_formula(
+        &state,
+        &name,
+        &display,
+        description.as_deref(),
+        &definition,
+        &tags,
+    )
+    .await?;
+
+    sqlx::query(
+        "UPDATE formula_drafts SET status = 'confirmed', resolved_at = NOW() WHERE id = $1",
+    )
+    .bind(&id)
+    .execute(&state.pg)
+    .await?;
+
+    Ok(ok_response(serde_json::json!({
+        "draft_id": id,
+        "formula_id": formula_id,
+        "name": name,
+        "version": version,
+        "is_system": false,
+        "status": action,
+    })))
+}
+
+async fn handler_dismiss_formula_draft(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    req: Request<axum::body::Body>,
+) -> Result<Json<serde_json::Value>, StatusApiError> {
+    let ctx = req
+        .extensions()
+        .get::<AuthContext>()
+        .cloned()
+        .ok_or_else(|| StatusApiError::Internal("missing auth context".to_string()))?;
+    require_role(&ctx, UserRole::Operator)?;
+
+    let updated = sqlx::query(
+        "UPDATE formula_drafts SET status = 'dismissed', resolved_at = NOW()
+         WHERE id = $1 AND status = 'pending'",
+    )
+    .bind(&id)
+    .execute(&state.pg)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Err(StatusApiError::NotFound(format!(
+            "pending formula draft not found: {id}"
+        )));
+    }
+    Ok(ok_response(serde_json::json!({
+        "draft_id": id,
+        "status": "dismissed",
     })))
 }
 

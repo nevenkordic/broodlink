@@ -4917,4 +4917,29 @@ timeout_secs = 60
         assert!(evaluate_condition("status == \"pass\"", &results));
         assert!(!evaluate_condition("status == \"fail\"", &results));
     }
+
+    #[test]
+    fn test_coordinator_defaults_to_local_runtime() {
+        let map = std::collections::HashMap::new();
+        let (name, backend, _) = broodlink_runtime::select_runtime(&map, None).unwrap();
+        assert_eq!(name, "local");
+        assert_eq!(backend, broodlink_runtime::IsolationBackend::Local);
+    }
+
+    #[test]
+    fn test_coordinator_picks_named_runtime() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "burst".to_string(),
+            broodlink_config::RuntimeConfig {
+                backend: "docker".to_string(),
+                image: Some("broodlink/worker:latest".to_string()),
+                ..broodlink_config::RuntimeConfig::default()
+            },
+        );
+        let (name, backend, cfg) = broodlink_runtime::select_runtime(&map, Some("burst")).unwrap();
+        assert_eq!(name, "burst");
+        assert_eq!(backend, broodlink_runtime::IsolationBackend::Docker);
+        assert_eq!(cfg.image.as_deref(), Some("broodlink/worker:latest"));
+    }
 }

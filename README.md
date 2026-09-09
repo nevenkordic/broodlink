@@ -62,7 +62,7 @@ After startup, you'll have:
                     Agents (Claude, Gemma4, custom bots, ...)
                             │
                     ┌───────▼───────┐
-                    │ beads-bridge  │ 127.0.0.1:3310  Tool API (96 tools)
+                    │ beads-bridge  │ 127.0.0.1:3310  Tool API (102 tools)
                     │               │   JWT RS256 (algorithm-validated)
                     │               │   + Rate Limiting
                     └──┬────┬───┬──┘
@@ -134,7 +134,7 @@ After startup, you'll have:
 | Service | Port | Transport | Purpose |
 |---------|------|-----------|---------|
 | broodlink | 3310* | HTTP | Unified binary: setup wizard, process manager (starts all services + infrastructure), reverse proxy to status-api and Ollama, native chat UI, model management API. Embeds the full Hugo dashboard via `rust-embed`. Bootstrap graph startup pipeline (DAG of stages: Prefetch → Config → Dependencies → Databases → Services → DeferredInit → Ready with topological sorting and cycle detection). Trust-gated deferred initialization (phased tool access based on agent trust levels: UNTRUSTED → PROBATION → STANDARD → ELEVATED → SYSTEM). *Default port; configurable via `--port`. |
-| beads-bridge | 3310 | HTTP + NATS | Universal tool API (96 tools), JWT RS256 auth with kid-based multi-key validation, rate limiting, budget enforcement, circuit breakers, JWKS endpoint, SSE streaming, task negotiation tools (decline/context request), deny-list permission pre-filter (O(1) in-memory tool blocking before DB guardrail queries) |
+| beads-bridge | 3310 | HTTP + NATS | Universal tool API (102 tools), JWT RS256 auth with kid-based multi-key validation, rate limiting, budget enforcement, circuit breakers, JWKS endpoint, SSE streaming, task negotiation tools (decline/context request), isolated workers, deny-list permission pre-filter (O(1) in-memory tool blocking before DB guardrail queries) |
 | coordinator | -- | NATS only | Smart task routing with weighted scoring and token-based prompt pre-filter (keyword overlap scoring before weighted multi-factor routing), atomic claiming, exponential backoff, dead-letter queue with auto-retry, workflow orchestration with conditional steps, parallel groups, per-step retries, timeouts, and error handlers, LLM-powered sub-task decomposition (configurable, fail-open), agent-to-agent delegation protocol (request/accept/decline/complete lifecycle), automated verification pipeline on task completion (pass/fail/skip), scheduled task promotion (60s polling), task negotiation protocol (decline/redirect/context request with max-decline dead-letter), transcript compaction (auto-compacts agent context at 80% token budget, keeps system prompt + summary + last N messages) |
 | heartbeat | -- | NATS + DB | 5-min sync cycle: Dolt commit, agent metrics, daily summary, stale agent deactivation, KG entity/edge expiry with weight decay, daily budget replenishment, formula registry sync, notification rule evaluation |
 | embedding-worker | -- | NATS + DB | Outbox poll -- Ollama `nomic-embed-text` embeddings -- Qdrant upsert -- LLM entity extraction for knowledge graph, circuit breakers, smart chunk boundaries (heading/code-fence/paragraph-aware splitting) |
@@ -283,7 +283,7 @@ broodlink/
 │   └── broodlink-fs/             # File system helpers, attachment storage
 ├── rust/
 │   ├── broodlink/                # Unified binary: setup wizard, process manager, dashboard, chat UI
-│   ├── beads-bridge/             # Universal tool API (96 tools, task negotiation)
+│   ├── beads-bridge/             # Universal tool API (102 tools, isolated workers)
 │   ├── coordinator/              # NATS task routing + workflow orchestration + decomposition + delegation + verification
 │   ├── heartbeat/                # Periodic sync + health checks
 │   ├── embedding-worker/         # Outbox → Ollama → Qdrant pipeline + KG entity extraction

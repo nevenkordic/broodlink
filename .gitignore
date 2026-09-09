@@ -40,12 +40,14 @@ Thumbs.db
 .idea/
 .vscode/
 .claude/
-.cursor/*
-!.cursor/rules/
-!.cursor/rules/**
+.cursor/
+.copilot/
+.gemini/
+.windsurf/
 *.swp
 .aider.chat.history.md
 .aider.input.history
+.aider/
 
 # Node (vendored JS only, no npm)
 node_modules/

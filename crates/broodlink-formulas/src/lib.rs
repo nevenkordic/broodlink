@@ -472,6 +472,244 @@ pub fn validate_formula_name(name: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Self-authoring drafts (from completed workflow runs)
+// ---------------------------------------------------------------------------
+
+/// Outcome of a finished workflow, used to decide whether to draft a formula.
+#[derive(Debug, Clone)]
+pub struct WorkflowOutcome {
+    pub workflow_id: String,
+    pub formula_name: String,
+    pub total_steps: u32,
+    pub retries: u32,
+    pub duration_secs: u64,
+    /// `"pass"`, `"fail"`, or `None` when verification did not run.
+    pub verification: Option<String>,
+    pub step_results: serde_json::Value,
+}
+
+impl WorkflowOutcome {
+    /// Build an outcome from a `workflow_runs` row plus its `step_results` JSON.
+    #[must_use]
+    pub fn from_run(
+        workflow_id: impl Into<String>,
+        formula_name: impl Into<String>,
+        total_steps: u32,
+        duration_secs: u64,
+        step_results: serde_json::Value,
+    ) -> Self {
+        let verification = step_results
+            .get("verification")
+            .and_then(|v| v.as_str())
+            .map(str::to_ascii_lowercase);
+        let retries = step_results
+            .get("retries")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            .min(u64::from(u32::MAX)) as u32;
+        Self {
+            workflow_id: workflow_id.into(),
+            formula_name: formula_name.into(),
+            total_steps,
+            retries,
+            duration_secs,
+            verification,
+            step_results,
+        }
+    }
+}
+
+/// A verified multi-step (or retried) task is worth saving as a custom formula.
+///
+/// Never treats a failed verification as worth saving. System formulas are
+/// never auto-published; this only decides whether to *draft*.
+#[must_use]
+pub fn is_worth_saving(outcome: &WorkflowOutcome) -> bool {
+    if outcome.verification.as_deref() == Some("fail") {
+        return false;
+    }
+    outcome.total_steps >= 3
+        || outcome.retries > 0
+        || outcome.verification.as_deref() == Some("pass")
+}
+
+/// Suggest a custom formula name that will not collide with a system formula.
+#[must_use]
+pub fn suggested_formula_name(source: &str) -> String {
+    let mut base: String = source
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    while base.contains("--") {
+        base = base.replace("--", "-");
+    }
+    let base = base.trim_matches('-').to_string();
+    if base.is_empty() {
+        "saved-workflow".to_string()
+    } else if base.ends_with("-saved") {
+        base
+    } else {
+        format!("{base}-saved")
+    }
+}
+
+/// Next integer version after `current` (registry versions start at 1).
+#[must_use]
+pub fn bump_formula_version(current: i32) -> i32 {
+    current.saturating_add(1)
+}
+
+/// Draft a `FormulaFile` from a completed workflow's step log.
+///
+/// The draft uses the same schema as disk formulas / the visual editor.
+/// Operator confirm writes `custom/`; this function never sets `is_system`.
+#[must_use]
+pub fn draft_from_workflow(outcome: &WorkflowOutcome) -> FormulaFile {
+    let steps = steps_from_results(&outcome.step_results, outcome.total_steps);
+    let name = suggested_formula_name(&outcome.formula_name);
+    FormulaFile {
+        formula: FormulaMetadata {
+            name,
+            version: Some("1".to_string()),
+            description: Some(format!(
+                "Drafted from workflow {} ({} steps, {}s)",
+                outcome.workflow_id, outcome.total_steps, outcome.duration_secs
+            )),
+            parameters: None,
+            model_domain: None,
+        },
+        steps,
+        on_failure: None,
+        parameters: None,
+    }
+}
+
+fn steps_from_results(step_results: &serde_json::Value, total_steps: u32) -> Vec<FormulaStep> {
+    if let Some(arr) = step_results.get("steps").and_then(|s| s.as_array()) {
+        return arr
+            .iter()
+            .enumerate()
+            .map(|(i, step)| {
+                let name = step
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .map_or_else(|| format!("step-{}", i + 1), ToString::to_string);
+                let prompt = step
+                    .get("prompt")
+                    .and_then(|p| p.as_str())
+                    .or_else(|| step.get("output").and_then(|p| p.as_str()))
+                    .or_else(|| step.get("result").and_then(|p| p.as_str()))
+                    .unwrap_or("Replay this step from the saved workflow.")
+                    .to_string();
+                let tools = step.get("tools").and_then(|t| {
+                    t.as_array().map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(ToString::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                });
+                FormulaStep {
+                    name,
+                    agent_role: step
+                        .get("agent_role")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("worker")
+                        .to_string(),
+                    tools,
+                    prompt,
+                    input: None,
+                    output: step
+                        .get("output_key")
+                        .and_then(|o| o.as_str())
+                        .unwrap_or("result")
+                        .to_string(),
+                    when: None,
+                    retries: None,
+                    backoff: None,
+                    timeout_seconds: None,
+                    group: None,
+                    examples: None,
+                    system_prompt: None,
+                    output_schema: None,
+                    model_domain: None,
+                }
+            })
+            .collect();
+    }
+
+    if let Some(obj) = step_results.as_object() {
+        let mut named: Vec<FormulaStep> = obj
+            .iter()
+            .filter(|(k, _)| {
+                !matches!(
+                    k.as_str(),
+                    "verification" | "retries" | "duration_secs" | "status"
+                )
+            })
+            .map(|(key, value)| {
+                let prompt = value
+                    .as_str()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| value.to_string());
+                FormulaStep {
+                    name: key.clone(),
+                    agent_role: "worker".to_string(),
+                    tools: None,
+                    prompt,
+                    input: None,
+                    output: key.clone(),
+                    when: None,
+                    retries: None,
+                    backoff: None,
+                    timeout_seconds: None,
+                    group: None,
+                    examples: None,
+                    system_prompt: None,
+                    output_schema: None,
+                    model_domain: None,
+                }
+            })
+            .collect();
+        if !named.is_empty() {
+            named.sort_by(|a, b| a.name.cmp(&b.name));
+            return named;
+        }
+    }
+
+    (1..=total_steps.max(1))
+        .map(|i| FormulaStep {
+            name: format!("step-{i}"),
+            agent_role: "worker".to_string(),
+            tools: None,
+            prompt: format!("Execute step {i} of the saved workflow."),
+            input: None,
+            output: format!("step_{i}"),
+            when: None,
+            retries: None,
+            backoff: None,
+            timeout_seconds: None,
+            group: None,
+            examples: None,
+            system_prompt: None,
+            output_schema: None,
+            model_domain: None,
+        })
+        .collect()
+}
+
+/// Tags applied to every auto-draft (searchable; never marks the formula system).
+#[must_use]
+pub fn draft_tags(source_formula: &str) -> serde_json::Value {
+    serde_json::json!(["auto-draft", source_formula])
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -678,5 +916,100 @@ mod tests {
         assert!(names.contains(&"daily-review"));
         assert!(names.contains(&"knowledge-gap"));
         assert!(names.contains(&"coding-agent"));
+    }
+
+    #[test]
+    fn test_is_worth_saving_multi_step() {
+        let outcome = WorkflowOutcome::from_run("wf-1", "research", 3, 120, serde_json::json!({}));
+        assert!(is_worth_saving(&outcome));
+    }
+
+    #[test]
+    fn test_is_worth_saving_verification_pass() {
+        let outcome = WorkflowOutcome::from_run(
+            "wf-2",
+            "research",
+            1,
+            10,
+            serde_json::json!({"verification": "pass"}),
+        );
+        assert!(is_worth_saving(&outcome));
+    }
+
+    #[test]
+    fn test_is_worth_saving_rejects_failed_verification() {
+        let outcome = WorkflowOutcome::from_run(
+            "wf-3",
+            "research",
+            8,
+            90,
+            serde_json::json!({"verification": "fail"}),
+        );
+        assert!(!is_worth_saving(&outcome));
+    }
+
+    #[test]
+    fn test_is_worth_saving_retries() {
+        let outcome = WorkflowOutcome::from_run(
+            "wf-4",
+            "build-feature",
+            2,
+            40,
+            serde_json::json!({"retries": 2}),
+        );
+        assert!(is_worth_saving(&outcome));
+    }
+
+    #[test]
+    fn test_is_worth_saving_trivial_task() {
+        let outcome = WorkflowOutcome::from_run("wf-5", "ping", 1, 2, serde_json::json!({}));
+        assert!(!is_worth_saving(&outcome));
+    }
+
+    #[test]
+    fn test_suggested_formula_name_never_system_slug() {
+        assert_eq!(suggested_formula_name("research"), "research-saved");
+        assert_eq!(
+            suggested_formula_name("Build Feature!"),
+            "build-feature-saved"
+        );
+        assert_eq!(suggested_formula_name(""), "saved-workflow");
+        assert!(validate_formula_name(&suggested_formula_name(
+            "daily-review"
+        )));
+    }
+
+    #[test]
+    fn test_draft_from_workflow_schema() {
+        let outcome = WorkflowOutcome::from_run(
+            "wf-9",
+            "research",
+            3,
+            55,
+            serde_json::json!({
+                "steps": [
+                    {"name": "search", "prompt": "Find sources", "agent_role": "researcher"},
+                    {"name": "summarise", "output": "Write a brief"}
+                ],
+                "verification": "pass"
+            }),
+        );
+        let draft = draft_from_workflow(&outcome);
+        assert_eq!(draft.formula.name, "research-saved");
+        assert_eq!(draft.steps.len(), 2);
+        assert_eq!(draft.steps[0].name, "search");
+        assert_eq!(draft.steps[0].agent_role, "researcher");
+        let jsonb = formula_to_jsonb(&draft);
+        assert!(jsonb.get("steps").and_then(|s| s.as_array()).is_some());
+        assert_eq!(
+            draft_tags("research"),
+            serde_json::json!(["auto-draft", "research"])
+        );
+    }
+
+    #[test]
+    fn test_bump_formula_version() {
+        assert_eq!(bump_formula_version(1), 2);
+        assert_eq!(bump_formula_version(i32::MAX), i32::MAX);
     }
 }

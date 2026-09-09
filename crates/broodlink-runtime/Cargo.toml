@@ -8,8 +8,11 @@ license.workspace = true
 [dependencies]
 broodlink-config = { path = "../broodlink-config" }
 async-nats.workspace = true
-tokio = { workspace = true, features = ["signal"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["signal", "process"] }
 tracing.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

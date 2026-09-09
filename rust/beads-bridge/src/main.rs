@@ -235,6 +235,12 @@ pub struct Claims {
     pub agent_id: String,
     pub exp: u64,
     pub iat: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1231,6 +1237,7 @@ static TOOL_REGISTRY: std::sync::LazyLock<Vec<serde_json::Value>> = std::sync::L
             tool_def("list_formulas", "List workflow formulas from the registry.", serde_json::json!({
                 "enabled_only": p_bool("Only return enabled formulas (default true)"),
                 "tag": p_str("Filter by tag (optional)"),
+                "q": p_str("Search by name or display name (optional)"),
             }), &[]),
             tool_def("get_formula", "Get a workflow formula definition from the registry.", serde_json::json!({
                 "name": p_str("Formula name (e.g. 'research', 'build-feature')"),
@@ -1250,6 +1257,29 @@ static TOOL_REGISTRY: std::sync::LazyLock<Vec<serde_json::Value>> = std::sync::L
                 "enabled": p_bool("Enable/disable formula (optional)"),
                 "tags": p_str("New tags as JSON array string (optional)"),
             }), &["name"]),
+            tool_def("list_formula_drafts", "List pending formula drafts waiting for operator confirm.", serde_json::json!({
+                "q": p_str("Search by name or tag (optional)"),
+            }), &[]),
+            tool_def("confirm_formula_draft", "Publish a pending formula draft as a custom formula (never system).", serde_json::json!({
+                "draft_id": p_str("Formula draft ID to confirm"),
+            }), &["draft_id"]),
+            tool_def("dismiss_formula_draft", "Dismiss a pending formula draft without publishing.", serde_json::json!({
+                "draft_id": p_str("Formula draft ID to dismiss"),
+            }), &["draft_id"]),
+            tool_def("spawn_worker", "Spawn an isolated child worker with its own JWT and budget.", serde_json::json!({
+                "goal": p_str("What the child should accomplish"),
+                "allowed_tools": p_str("Comma-separated tool names the child may call"),
+                "timeout_secs": p_int("Seconds before the child is marked timeout (default 300)"),
+                "isolation": p_str("Runtime name or backend: local, docker, ssh, remote-idle"),
+                "budget_tokens": p_int("Token budget granted to the child (optional)"),
+            }), &["goal"]),
+            tool_def("list_workers", "List isolated workers spawned by this agent.", serde_json::json!({
+                "status": p_str("Filter by status: pending, running, completed, failed, timeout"),
+            }), &[]),
+            tool_def("join_worker", "Wait for a child worker and return its summary (not the full transcript).", serde_json::json!({
+                "worker_id": p_str("Worker ID returned by spawn_worker"),
+                "wait_secs": p_int("Seconds to wait for a terminal status (default 0 = status only)"),
+            }), &["worker_id"]),
             // --- File I/O (v0.10.0) ---
             tool_def("read_file", "Read a text file from disk within allowed directories.", serde_json::json!({
                 "path": p_str("Absolute path to the file"),
@@ -1526,6 +1556,17 @@ async fn tool_dispatch(
         "tool invoked"
     );
 
+    // Child worker JWT: only the allow-listed tools (+ ping) may run.
+    if !claims.allowed_tools.is_empty()
+        && tool_name != "ping"
+        && !claims.allowed_tools.iter().any(|t| t == &tool_name)
+    {
+        return Err(BroodlinkError::Guardrail {
+            policy: "worker_scope".to_string(),
+            message: format!("worker is not allowed to call '{tool_name}'"),
+        });
+    }
+
     // Deny-list pre-filter — O(1) in-memory check before any DB calls
     if let Some(reason) = state.tool_deny_list.check(&tool_name, agent_id) {
         warn!(
@@ -1698,6 +1739,12 @@ async fn tool_dispatch(
         "get_formula" => tool_get_formula(&state, params).await,
         "create_formula" => tool_create_formula(&state, params).await,
         "update_formula" => tool_update_formula(&state, params).await,
+        "list_formula_drafts" => tool_list_formula_drafts(&state, params).await,
+        "confirm_formula_draft" => tool_confirm_formula_draft(&state, params).await,
+        "dismiss_formula_draft" => tool_dismiss_formula_draft(&state, params).await,
+        "spawn_worker" => tool_spawn_worker(&state, agent_id, params).await,
+        "list_workers" => tool_list_workers(&state, agent_id, params).await,
+        "join_worker" => tool_join_worker(&state, agent_id, params).await,
 
         // --- File I/O (v0.10.0) ---
         "read_file" => tool_read_file(&state, params).await,
@@ -5718,6 +5765,9 @@ fn is_readonly_tool(tool: &str) -> bool {
             | "list_chat_sessions"
             | "list_formulas"
             | "get_formula"
+            | "list_formula_drafts"
+            | "list_workers"
+            | "join_worker"
             | "list_scheduled_tasks"
             | "list_notification_rules"
     )
@@ -6593,6 +6643,27 @@ async fn tool_list_formulas(
         });
     }
 
+    if let Some(q) = params
+        .get("q")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        let needle = q.to_ascii_lowercase();
+        formulas.retain(|f| {
+            let name = f
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let display = f
+                .get("display_name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            name.contains(&needle) || display.contains(&needle)
+        });
+    }
+
     Ok(serde_json::json!({
         "formulas": formulas,
         "total": formulas.len(),
@@ -6958,6 +7029,545 @@ async fn tool_update_formula(
         "updated_fields": updates,
         "version_bumped": bump_version,
     }))
+}
+
+fn parse_allowed_tools(params: &serde_json::Value) -> Vec<String> {
+    if let Some(arr) = params.get("allowed_tools").and_then(|v| v.as_array()) {
+        return arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .collect();
+    }
+    param_str_opt(params, "allowed_tools")
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn mint_worker_jwt(
+    config: &broodlink_config::Config,
+    child_agent_id: &str,
+    worker_id: &str,
+    allowed_tools: &[String],
+    budget_tokens: i64,
+    ttl_secs: u64,
+) -> Result<String, BroodlinkError> {
+    let key_path = format!("{}/jwt-private.pem", config.jwt.keys_dir);
+    let pem = std::fs::read(&key_path).map_err(|e| {
+        BroodlinkError::Auth(format!("failed to read JWT private key at {key_path}: {e}"))
+    })?;
+    let encoding_key = jsonwebtoken::EncodingKey::from_rsa_pem(&pem)
+        .map_err(|e| BroodlinkError::Auth(format!("invalid JWT private key: {e}")))?;
+    let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
+    let claims = Claims {
+        sub: child_agent_id.to_string(),
+        agent_id: child_agent_id.to_string(),
+        iat: now,
+        exp: now.saturating_add(ttl_secs.max(60)),
+        worker_id: Some(worker_id.to_string()),
+        allowed_tools: allowed_tools.to_vec(),
+        budget_tokens: Some(budget_tokens),
+    };
+    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    jsonwebtoken::encode(&header, &claims, &encoding_key)
+        .map_err(|e| BroodlinkError::Auth(format!("JWT encoding failed: {e}")))
+}
+
+fn worker_allowed_for_parent(parent_agent_id: &str, row_parent: &str) -> bool {
+    parent_agent_id == row_parent
+}
+
+async fn tool_list_formula_drafts(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let rows: Vec<(
+        String,
+        Option<String>,
+        String,
+        String,
+        Option<String>,
+        serde_json::Value,
+        String,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT id, workflow_run_id, suggested_name, display_name, description,
+                tags, status, created_at::text
+         FROM formula_drafts
+         WHERE status = 'pending'
+         ORDER BY created_at DESC",
+    )
+    .fetch_all(&state.pg)
+    .await?;
+
+    let mut drafts: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(id, wf, name, display, desc, tags, status, created)| {
+            serde_json::json!({
+                "id": id,
+                "workflow_run_id": wf,
+                "name": name,
+                "display_name": display,
+                "description": desc,
+                "tags": tags,
+                "status": status,
+                "created_at": created,
+                "is_system": false,
+            })
+        })
+        .collect();
+
+    if let Some(q) = params
+        .get("q")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        let needle = q.to_ascii_lowercase();
+        drafts.retain(|d| {
+            let name = d["name"].as_str().unwrap_or("").to_ascii_lowercase();
+            let display = d["display_name"]
+                .as_str()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let tags_hit = d["tags"].as_array().is_some_and(|arr| {
+                arr.iter().any(|t| {
+                    t.as_str()
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                        .contains(&needle)
+                })
+            });
+            name.contains(&needle) || display.contains(&needle) || tags_hit
+        });
+    }
+
+    Ok(serde_json::json!({
+        "drafts": drafts,
+        "total": drafts.len(),
+    }))
+}
+
+async fn tool_confirm_formula_draft(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let draft_id = param_str(params, "draft_id")?;
+    let row: Option<(
+        String,
+        String,
+        Option<String>,
+        serde_json::Value,
+        serde_json::Value,
+        String,
+    )> = sqlx::query_as(
+        "SELECT suggested_name, display_name, description, definition, tags, status
+         FROM formula_drafts WHERE id = $1",
+    )
+    .bind(draft_id)
+    .fetch_optional(&state.pg)
+    .await?;
+
+    let (name, display, description, definition, tags, status) = row
+        .ok_or_else(|| BroodlinkError::NotFound(format!("formula draft not found: {draft_id}")))?;
+    if status != "pending" {
+        return Err(BroodlinkError::Validation {
+            field: "draft_id".to_string(),
+            message: format!("draft is already {status}"),
+        });
+    }
+    if !broodlink_formulas::validate_formula_name(&name) {
+        return Err(BroodlinkError::Validation {
+            field: "name".to_string(),
+            message: format!("invalid suggested formula name: {name}"),
+        });
+    }
+
+    let existing: Option<(String, bool, i32)> =
+        sqlx::query_as("SELECT id, is_system, version FROM formula_registry WHERE name = $1")
+            .bind(&name)
+            .fetch_optional(&state.pg)
+            .await?;
+
+    let (formula_id, action, version) = if let Some((id, is_system, version)) = existing {
+        if is_system {
+            return Err(BroodlinkError::Validation {
+                field: "name".to_string(),
+                message: format!("name '{name}' is reserved for a system formula"),
+            });
+        }
+        let def_hash = broodlink_formulas::definition_hash(&definition);
+        let next = broodlink_formulas::bump_formula_version(version);
+        sqlx::query(
+            "UPDATE formula_registry
+             SET display_name = $1, description = $2, definition = $3, definition_hash = $4,
+                 tags = $5, version = $6, is_system = false, updated_at = NOW()
+             WHERE id = $7",
+        )
+        .bind(&display)
+        .bind(&description)
+        .bind(&definition)
+        .bind(&def_hash)
+        .bind(&tags)
+        .bind(next)
+        .bind(&id)
+        .execute(&state.pg)
+        .await?;
+        (id, "updated", next)
+    } else {
+        let id = uuid::Uuid::new_v4().to_string();
+        let def_hash = broodlink_formulas::definition_hash(&definition);
+        sqlx::query(
+            "INSERT INTO formula_registry
+             (id, name, display_name, description, definition, definition_hash, tags, author, is_system)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'operator', false)",
+        )
+        .bind(&id)
+        .bind(&name)
+        .bind(&display)
+        .bind(&description)
+        .bind(&definition)
+        .bind(&def_hash)
+        .bind(&tags)
+        .execute(&state.pg)
+        .await?;
+        (id, "created", 1)
+    };
+
+    let meta = broodlink_formulas::FormulaTomlMeta {
+        display_name: &display,
+        description: description.as_deref().unwrap_or(""),
+    };
+    if let Err(e) = broodlink_formulas::persist_formula_toml(
+        &state.config.beads.formulas_custom_dir,
+        &name,
+        &definition,
+        &meta,
+    ) {
+        warn!(formula = %name, error = %e, "write-through to disk failed (draft confirm)");
+    }
+
+    sqlx::query(
+        "UPDATE formula_drafts SET status = 'confirmed', resolved_at = NOW() WHERE id = $1",
+    )
+    .bind(draft_id)
+    .execute(&state.pg)
+    .await?;
+
+    Ok(serde_json::json!({
+        "draft_id": draft_id,
+        "formula_id": formula_id,
+        "name": name,
+        "version": version,
+        "is_system": false,
+        "status": action,
+    }))
+}
+
+async fn tool_dismiss_formula_draft(
+    state: &AppState,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let draft_id = param_str(params, "draft_id")?;
+    let updated = sqlx::query(
+        "UPDATE formula_drafts SET status = 'dismissed', resolved_at = NOW()
+         WHERE id = $1 AND status = 'pending'",
+    )
+    .bind(draft_id)
+    .execute(&state.pg)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Err(BroodlinkError::NotFound(format!(
+            "pending formula draft not found: {draft_id}"
+        )));
+    }
+    Ok(serde_json::json!({
+        "draft_id": draft_id,
+        "status": "dismissed",
+    }))
+}
+
+async fn tool_spawn_worker(
+    state: &AppState,
+    parent_agent_id: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let goal = param_str(params, "goal")?;
+    if goal.is_empty() {
+        return Err(BroodlinkError::Validation {
+            field: "goal".to_string(),
+            message: "goal must not be empty".to_string(),
+        });
+    }
+    let allowed_tools = {
+        let parsed = parse_allowed_tools(params);
+        if parsed.is_empty() {
+            vec!["ping".to_string()]
+        } else {
+            parsed
+        }
+    };
+    let timeout_secs = params
+        .get("timeout_secs")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(300)
+        .clamp(5, 3600);
+    let budget_tokens = params
+        .get("budget_tokens")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(state.config.budget.default_tool_cost.saturating_mul(50));
+    let requested = param_str_opt(params, "isolation").or_else(|| param_str_opt(params, "runtime"));
+    let (runtime_name, backend, runtime_cfg) =
+        broodlink_runtime::select_runtime(&state.config.runtimes, requested).map_err(|e| {
+            BroodlinkError::Validation {
+                field: "isolation".to_string(),
+                message: e.to_string(),
+            }
+        })?;
+
+    let worker_id = uuid::Uuid::new_v4().to_string();
+    let child_agent_id = format!("worker-{}", &worker_id[..8]);
+    let jwt = mint_worker_jwt(
+        &state.config,
+        &child_agent_id,
+        &worker_id,
+        &allowed_tools,
+        budget_tokens,
+        timeout_secs.saturating_add(60),
+    )?;
+
+    let spec = broodlink_runtime::WorkerSpec {
+        worker_id: worker_id.clone(),
+        parent_agent_id: parent_agent_id.to_string(),
+        child_agent_id: child_agent_id.clone(),
+        goal: goal.to_string(),
+        allowed_tools: allowed_tools.clone(),
+        timeout_secs,
+        jwt: jwt.clone(),
+        bridge_url: format!("http://127.0.0.1:{}", state.config.beads_bridge.port),
+    };
+    let plan = broodlink_runtime::plan_invocation(&spec, &runtime_name, backend, &runtime_cfg)
+        .map_err(|e| BroodlinkError::Validation {
+            field: "isolation".to_string(),
+            message: e.to_string(),
+        })?;
+
+    let audit_str = plan.audit.to_string();
+    if let Err(e) = write_audit_log(
+        &state.pg,
+        &worker_id,
+        &child_agent_id,
+        SERVICE_NAME,
+        "worker_spawn",
+        true,
+        Some(&audit_str),
+    )
+    .await
+    {
+        warn!(error = %e, "failed to write worker spawn audit");
+    }
+
+    let tools_json = serde_json::Value::Array(
+        allowed_tools
+            .iter()
+            .map(|t| serde_json::Value::String(t.clone()))
+            .collect(),
+    );
+    sqlx::query(
+        "INSERT INTO workers
+         (id, parent_agent_id, child_agent_id, goal, allowed_tools, timeout_secs,
+          isolation_backend, runtime_name, status, budget_tokens, audit_payload, started_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'running', $9, $10, NOW())",
+    )
+    .bind(&worker_id)
+    .bind(parent_agent_id)
+    .bind(&child_agent_id)
+    .bind(goal)
+    .bind(&tools_json)
+    .bind(i32::try_from(timeout_secs).unwrap_or(300))
+    .bind(backend.as_str())
+    .bind(&runtime_name)
+    .bind(budget_tokens)
+    .bind(&plan.audit)
+    .execute(&state.pg)
+    .await?;
+
+    let _ = sqlx::query(
+        "INSERT INTO agent_profiles (agent_id, display_name, role, cost_tier, transport, active, max_concurrent, budget_tokens, created_at, updated_at)
+         VALUES (?, ?, 'worker', 'low', 'api', true, 1, ?, NOW(), NOW())
+         ON DUPLICATE KEY UPDATE budget_tokens = VALUES(budget_tokens), updated_at = NOW(), active = true",
+    )
+    .bind(&child_agent_id)
+    .bind(&child_agent_id)
+    .bind(budget_tokens)
+    .execute(&state.dolt)
+    .await;
+
+    match broodlink_runtime::spawn_planned(&plan).await {
+        Ok(child) => {
+            let pg = state.pg.clone();
+            let watch_id = worker_id.clone();
+            tokio::spawn(async move {
+                let mut child = child;
+                let outcome = broodlink_runtime::wait_child(&mut child, timeout_secs).await;
+                let (status, summary) = match outcome {
+                    Ok(0) => ("completed", "worker finished".to_string()),
+                    Ok(code) => ("failed", format!("worker exited {code}")),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("timed out") {
+                            ("timeout", msg)
+                        } else {
+                            ("failed", msg)
+                        }
+                    }
+                };
+                let _ = sqlx::query(
+                    "UPDATE workers SET status = $1, result_summary = $2, completed_at = NOW()
+                     WHERE id = $3",
+                )
+                .bind(status)
+                .bind(summary)
+                .bind(&watch_id)
+                .execute(&pg)
+                .await;
+            });
+        }
+        Err(e) => {
+            sqlx::query(
+                "UPDATE workers SET status = 'failed', result_summary = $1, completed_at = NOW()
+                 WHERE id = $2",
+            )
+            .bind(e.to_string())
+            .bind(&worker_id)
+            .execute(&state.pg)
+            .await?;
+        }
+    }
+
+    Ok(serde_json::json!({
+        "worker_id": worker_id,
+        "child_agent_id": child_agent_id,
+        "runtime": runtime_name,
+        "backend": backend.as_str(),
+        "status": "running",
+        "jwt": jwt,
+        "allowed_tools": allowed_tools,
+        "timeout_secs": timeout_secs,
+        "budget_tokens": budget_tokens,
+    }))
+}
+
+async fn tool_list_workers(
+    state: &AppState,
+    parent_agent_id: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let status = param_str_opt(params, "status");
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    )> = if let Some(st) = status {
+        sqlx::query_as(
+            "SELECT id, child_agent_id, goal, isolation_backend, runtime_name, status,
+                    result_summary, created_at::text
+             FROM workers
+             WHERE parent_agent_id = $1 AND status = $2
+             ORDER BY created_at DESC
+             LIMIT 50",
+        )
+        .bind(parent_agent_id)
+        .bind(st)
+        .fetch_all(&state.pg)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT id, child_agent_id, goal, isolation_backend, runtime_name, status,
+                    result_summary, created_at::text
+             FROM workers
+             WHERE parent_agent_id = $1
+             ORDER BY created_at DESC
+             LIMIT 50",
+        )
+        .bind(parent_agent_id)
+        .fetch_all(&state.pg)
+        .await?
+    };
+
+    let workers: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(
+            |(id, child, goal, backend, runtime, status, summary, created)| {
+                serde_json::json!({
+                    "worker_id": id,
+                    "child_agent_id": child,
+                    "goal": goal,
+                    "backend": backend,
+                    "runtime": runtime,
+                    "status": status,
+                    "result_summary": summary,
+                    "created_at": created,
+                })
+            },
+        )
+        .collect();
+
+    Ok(serde_json::json!({
+        "workers": workers,
+        "total": workers.len(),
+    }))
+}
+
+async fn tool_join_worker(
+    state: &AppState,
+    parent_agent_id: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, BroodlinkError> {
+    let worker_id = param_str(params, "worker_id")?;
+    let wait_secs = params
+        .get("wait_secs")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        .min(3600);
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+    loop {
+        let row: Option<(String, String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT parent_agent_id, status, isolation_backend, runtime_name, result_summary
+             FROM workers WHERE id = $1",
+        )
+        .bind(worker_id)
+        .fetch_optional(&state.pg)
+        .await?;
+        let (row_parent, status, backend, runtime, summary) =
+            row.ok_or_else(|| BroodlinkError::NotFound(format!("worker not found: {worker_id}")))?;
+        if !worker_allowed_for_parent(parent_agent_id, &row_parent) {
+            return Err(BroodlinkError::Auth(
+                "worker does not belong to this agent".to_string(),
+            ));
+        }
+        let terminal = matches!(status.as_str(), "completed" | "failed" | "timeout");
+        if terminal || wait_secs == 0 || tokio::time::Instant::now() >= deadline {
+            return Ok(serde_json::json!({
+                "worker_id": worker_id,
+                "status": status,
+                "backend": backend,
+                "runtime": runtime,
+                "result_summary": summary,
+            }));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -9076,8 +9686,8 @@ mod tests {
         // Must match the number of match arms in tool_dispatch (excluding the _ fallback)
         assert_eq!(
             TOOL_REGISTRY.len(),
-            96,
-            "tool registry should have 96 tools"
+            102,
+            "tool registry should have 102 tools"
         );
     }
 
@@ -10007,6 +10617,30 @@ mod tests {
             names.contains(&"update_formula"),
             "registry missing update_formula"
         );
+        assert!(
+            names.contains(&"list_formula_drafts"),
+            "registry missing list_formula_drafts"
+        );
+        assert!(
+            names.contains(&"confirm_formula_draft"),
+            "registry missing confirm_formula_draft"
+        );
+        assert!(
+            names.contains(&"dismiss_formula_draft"),
+            "registry missing dismiss_formula_draft"
+        );
+        assert!(
+            names.contains(&"spawn_worker"),
+            "registry missing spawn_worker"
+        );
+        assert!(
+            names.contains(&"list_workers"),
+            "registry missing list_workers"
+        );
+        assert!(
+            names.contains(&"join_worker"),
+            "registry missing join_worker"
+        );
         // v0.10.0 file tools
         assert!(names.contains(&"read_file"), "registry missing read_file");
         assert!(names.contains(&"write_file"), "registry missing write_file");
@@ -10074,6 +10708,57 @@ mod tests {
         assert!(
             !is_readonly_tool("update_formula"),
             "update_formula should NOT be readonly"
+        );
+        assert!(
+            is_readonly_tool("list_formula_drafts"),
+            "list_formula_drafts should be readonly"
+        );
+        assert!(
+            !is_readonly_tool("confirm_formula_draft"),
+            "confirm_formula_draft should NOT be readonly"
+        );
+        assert!(
+            is_readonly_tool("list_workers"),
+            "list_workers should be readonly"
+        );
+        assert!(
+            is_readonly_tool("join_worker"),
+            "join_worker should be readonly"
+        );
+        assert!(
+            !is_readonly_tool("spawn_worker"),
+            "spawn_worker should NOT be readonly"
+        );
+    }
+
+    #[test]
+    fn test_worker_claims_optional_fields() {
+        let input = json!({
+            "sub": "worker-abc",
+            "agent_id": "worker-abc",
+            "exp": 9999999999_u64,
+            "iat": 1700000000_u64,
+            "worker_id": "w-1",
+            "allowed_tools": ["ping", "list_formulas"],
+            "budget_tokens": 40
+        });
+        let claims: Claims = serde_json::from_value(input).unwrap();
+        assert_eq!(claims.worker_id.as_deref(), Some("w-1"));
+        assert_eq!(claims.allowed_tools, vec!["ping", "list_formulas"]);
+        assert_eq!(claims.budget_tokens, Some(40));
+    }
+
+    #[test]
+    fn test_parse_allowed_tools_csv_and_array() {
+        let csv = json!({"allowed_tools": "ping, list_formulas"});
+        assert_eq!(
+            parse_allowed_tools(&csv),
+            vec!["ping".to_string(), "list_formulas".to_string()]
+        );
+        let arr = json!({"allowed_tools": ["ping", "get_formula"]});
+        assert_eq!(
+            parse_allowed_tools(&arr),
+            vec!["ping".to_string(), "get_formula".to_string()]
         );
     }
 

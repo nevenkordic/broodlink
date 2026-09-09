@@ -52,6 +52,9 @@ run_suite "Rust unit tests (cargo test)" \
 run_suite "LaunchAgent portability" \
   "bash tests/launchagent-portability.sh"
 
+run_suite "Capability plan (setup/drafts/runtimes)" \
+  "bash tests/capability.sh"
+
 run_suite "Security audit" \
   "bash tests/security-audit.sh"
 

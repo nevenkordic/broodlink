@@ -11,8 +11,12 @@
 //! - [`shutdown_signal`]: graceful SIGINT/SIGTERM handler
 //! - [`connect_nats`]: cluster-aware NATS connection
 
+use broodlink_config::RuntimeConfig;
+use std::collections::{BTreeMap, HashMap};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::process::{Child, Command};
 use tracing::{error, info};
 
 // ---------------------------------------------------------------------------
@@ -201,6 +205,298 @@ pub async fn connect_nats(
     Ok(client)
 }
 
+// ---------------------------------------------------------------------------
+// Isolated workers / pluggable runtimes
+// ---------------------------------------------------------------------------
+
+/// Isolation backend named in `[runtimes.<name>].backend`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationBackend {
+    Local,
+    Docker,
+    Ssh,
+    RemoteIdle,
+}
+
+impl IsolationBackend {
+    /// Parse a backend name from config or a `spawn_worker` argument.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::UnknownBackend`] when `name` is not one of
+    /// `local`, `docker`, `ssh`, or `remote-idle`.
+    pub fn parse(name: &str) -> Result<Self, RuntimeError> {
+        match name {
+            "local" => Ok(Self::Local),
+            "docker" => Ok(Self::Docker),
+            "ssh" => Ok(Self::Ssh),
+            "remote-idle" => Ok(Self::RemoteIdle),
+            other => Err(RuntimeError::UnknownBackend(other.to_string())),
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Docker => "docker",
+            Self::Ssh => "ssh",
+            Self::RemoteIdle => "remote-idle",
+        }
+    }
+}
+
+/// Errors from runtime selection, planning, or spawn.
+#[derive(Debug, thiserror::Error)]
+pub enum RuntimeError {
+    #[error("unknown isolation backend: {0}")]
+    UnknownBackend(String),
+    #[error("unknown runtime name: {0}")]
+    UnknownRuntime(String),
+    #[error("runtime {0} is missing required field {1}")]
+    MissingField(String, String),
+    #[error("failed to spawn worker: {0}")]
+    Spawn(String),
+}
+
+/// Worker job handed to a runtime backend.
+#[derive(Debug, Clone)]
+pub struct WorkerSpec {
+    pub worker_id: String,
+    pub parent_agent_id: String,
+    pub child_agent_id: String,
+    pub goal: String,
+    pub allowed_tools: Vec<String>,
+    pub timeout_secs: u64,
+    pub jwt: String,
+    pub bridge_url: String,
+}
+
+/// Planned argv/env for one backend. Audit payload is backend-agnostic.
+#[derive(Debug, Clone)]
+pub struct PlannedInvocation {
+    pub runtime_name: String,
+    pub backend: IsolationBackend,
+    pub argv: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    /// Task identity written to `audit_log` — identical across backends.
+    pub audit: serde_json::Value,
+}
+
+/// Pick a named runtime, or the implicit `local` default.
+///
+/// `requested` may be a runtime name (`docker`) or a backend (`ssh`).
+///
+/// # Errors
+///
+/// Returns [`RuntimeError::UnknownRuntime`] or [`RuntimeError::UnknownBackend`].
+pub fn select_runtime(
+    runtimes: &HashMap<String, RuntimeConfig>,
+    requested: Option<&str>,
+) -> Result<(String, IsolationBackend, RuntimeConfig), RuntimeError> {
+    match requested {
+        None | Some("") | Some("local") => {
+            if let Some((name, cfg)) = runtimes.iter().find(|(_, c)| c.backend == "local") {
+                Ok((name.clone(), IsolationBackend::Local, cfg.clone()))
+            } else {
+                Ok((
+                    "local".to_string(),
+                    IsolationBackend::Local,
+                    RuntimeConfig {
+                        backend: "local".to_string(),
+                        ..RuntimeConfig::default()
+                    },
+                ))
+            }
+        }
+        Some(name) => {
+            if let Some(cfg) = runtimes.get(name) {
+                let backend = IsolationBackend::parse(&cfg.backend)?;
+                Ok((name.to_string(), backend, cfg.clone()))
+            } else {
+                let backend = IsolationBackend::parse(name)?;
+                let cfg = runtimes
+                    .values()
+                    .find(|c| c.backend == backend.as_str())
+                    .cloned()
+                    .unwrap_or(RuntimeConfig {
+                        backend: backend.as_str().to_string(),
+                        ..RuntimeConfig::default()
+                    });
+                Ok((name.to_string(), backend, cfg))
+            }
+        }
+    }
+}
+
+/// Build the command a backend will run. Does not start a process.
+///
+/// # Errors
+///
+/// Returns [`RuntimeError::MissingField`] when an `ssh` runtime has no host.
+pub fn plan_invocation(
+    spec: &WorkerSpec,
+    runtime_name: &str,
+    backend: IsolationBackend,
+    runtime: &RuntimeConfig,
+) -> Result<PlannedInvocation, RuntimeError> {
+    let mut env = BTreeMap::new();
+    env.insert("BROODLINK_WORKER_ID".into(), spec.worker_id.clone());
+    env.insert(
+        "BROODLINK_WORKER_PARENT".into(),
+        spec.parent_agent_id.clone(),
+    );
+    env.insert("BROODLINK_WORKER_AGENT".into(), spec.child_agent_id.clone());
+    env.insert("BROODLINK_WORKER_GOAL".into(), spec.goal.clone());
+    env.insert(
+        "BROODLINK_WORKER_TOOLS".into(),
+        spec.allowed_tools.join(","),
+    );
+    env.insert(
+        "BROODLINK_WORKER_TIMEOUT".into(),
+        spec.timeout_secs.to_string(),
+    );
+    env.insert("BROODLINK_WORKER_JWT".into(), spec.jwt.clone());
+    env.insert("BROODLINK_BRIDGE_URL".into(), spec.bridge_url.clone());
+
+    // Task identity only — backend is stored on the worker row, not here,
+    // so local and docker produce identical audit rows for the same task.
+    let audit = serde_json::json!({
+        "event": "worker_spawn",
+        "worker_id": spec.worker_id,
+        "parent_agent_id": spec.parent_agent_id,
+        "child_agent_id": spec.child_agent_id,
+        "goal": spec.goal,
+        "allowed_tools": spec.allowed_tools,
+        "timeout_secs": spec.timeout_secs,
+    });
+
+    let argv = match backend {
+        IsolationBackend::Local | IsolationBackend::RemoteIdle => {
+            vec!["/bin/bash".into(), worker_script_path()]
+        }
+        IsolationBackend::Docker => {
+            let image = runtime
+                .image
+                .clone()
+                .unwrap_or_else(|| "curlimages/curl:8.13.0".to_string());
+            let argv = vec![
+                "docker".into(),
+                "run".into(),
+                "--rm".into(),
+                "-e".into(),
+                "BROODLINK_WORKER_JWT".into(),
+                "-e".into(),
+                "BROODLINK_BRIDGE_URL".into(),
+                "-e".into(),
+                "BROODLINK_WORKER_ID".into(),
+                "-e".into(),
+                "BROODLINK_WORKER_GOAL".into(),
+                "-e".into(),
+                "BROODLINK_WORKER_TOOLS".into(),
+                image,
+            ];
+            let mut argv = argv;
+            argv.push("sh".into());
+            argv.push("-c".into());
+            argv.push(docker_inner_script());
+            argv
+        }
+        IsolationBackend::Ssh => {
+            let host = runtime.host.as_deref().filter(|h| !h.is_empty()).ok_or(
+                RuntimeError::MissingField(runtime_name.to_string(), "host".to_string()),
+            )?;
+            let target = match runtime.user.as_deref().filter(|u| !u.is_empty()) {
+                Some(user) => format!("{user}@{host}"),
+                None => host.to_string(),
+            };
+            vec![
+                "ssh".into(),
+                "-o".into(),
+                "BatchMode=yes".into(),
+                "-o".into(),
+                "StrictHostKeyChecking=accept-new".into(),
+                target,
+                worker_script_path(),
+            ]
+        }
+    };
+
+    Ok(PlannedInvocation {
+        runtime_name: runtime_name.to_string(),
+        backend,
+        argv,
+        env,
+        audit,
+    })
+}
+
+fn worker_script_path() -> String {
+    std::env::var("BROODLINK_WORKER_SCRIPT").unwrap_or_else(|_| {
+        let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        here.join("../../scripts/broodlink-worker.sh")
+            .canonicalize()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "scripts/broodlink-worker.sh".to_string())
+    })
+}
+
+fn docker_inner_script() -> String {
+    // Reads JWT from the environment — never interpolated into the plan string.
+    "curl -sS -X POST -H \"Authorization: Bearer ${BROODLINK_WORKER_JWT}\" -H \"Content-Type: application/json\" -d '{\"params\":{}}' \"${BROODLINK_BRIDGE_URL%/}/api/v1/tool/ping\"".to_string()
+}
+
+/// Whether the `docker` CLI is on PATH.
+#[must_use]
+pub fn docker_available() -> bool {
+    std::process::Command::new("docker")
+        .arg("version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Spawn a planned invocation. Caller must `wait` or `wait_child` the handle;
+/// dropping it kills the process.
+///
+/// # Errors
+///
+/// Returns [`RuntimeError::Spawn`] when the process cannot be started.
+pub async fn spawn_planned(plan: &PlannedInvocation) -> Result<Child, RuntimeError> {
+    if plan.argv.is_empty() {
+        return Err(RuntimeError::Spawn("empty argv".to_string()));
+    }
+    if plan.backend == IsolationBackend::Docker && !docker_available() {
+        return Err(RuntimeError::Spawn(
+            "docker CLI is not available".to_string(),
+        ));
+    }
+    let mut cmd = Command::new(&plan.argv[0]);
+    cmd.args(&plan.argv[1..])
+        .envs(&plan.env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd.spawn().map_err(|e| RuntimeError::Spawn(e.to_string()))
+}
+
+/// Wait for a child, treating overrun as a timeout error.
+///
+/// # Errors
+///
+/// Returns [`RuntimeError::Spawn`] on I/O failure or when the timeout is hit.
+pub async fn wait_child(child: &mut Child, timeout_secs: u64) -> Result<i32, RuntimeError> {
+    match tokio::time::timeout(Duration::from_secs(timeout_secs.max(1)), child.wait()).await {
+        Ok(Ok(status)) => Ok(status.code().unwrap_or(1)),
+        Ok(Err(e)) => Err(RuntimeError::Spawn(e.to_string())),
+        Err(_) => {
+            let _ = child.kill().await;
+            Err(RuntimeError::Spawn("worker timed out".to_string()))
+        }
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -253,5 +549,96 @@ mod tests {
         cb.record_failure();
         let err = cb.check().unwrap_err();
         assert_eq!(err, "qdrant");
+    }
+
+    fn sample_spec() -> WorkerSpec {
+        WorkerSpec {
+            worker_id: "w-1".into(),
+            parent_agent_id: "claude".into(),
+            child_agent_id: "worker-w-1".into(),
+            goal: "summarise the inbox".into(),
+            allowed_tools: vec!["ping".into(), "list_formulas".into()],
+            timeout_secs: 60,
+            jwt: "test-jwt".into(),
+            bridge_url: "http://127.0.0.1:3310".into(),
+        }
+    }
+
+    #[test]
+    fn test_select_runtime_defaults_local() {
+        let (name, backend, cfg) = select_runtime(&HashMap::new(), None).unwrap();
+        assert_eq!(name, "local");
+        assert_eq!(backend, IsolationBackend::Local);
+        assert_eq!(cfg.backend, "local");
+    }
+
+    #[test]
+    fn test_select_runtime_by_backend_name() {
+        let (name, backend, _) = select_runtime(&HashMap::new(), Some("docker")).unwrap();
+        assert_eq!(name, "docker");
+        assert_eq!(backend, IsolationBackend::Docker);
+    }
+
+    #[test]
+    fn test_select_runtime_unknown() {
+        let err = select_runtime(&HashMap::new(), Some("kubernetes")).unwrap_err();
+        assert!(matches!(err, RuntimeError::UnknownBackend(_)));
+    }
+
+    #[test]
+    fn test_plan_local_and_docker_share_audit() {
+        let spec = sample_spec();
+        let local_cfg = RuntimeConfig {
+            backend: "local".into(),
+            ..RuntimeConfig::default()
+        };
+        let docker_cfg = RuntimeConfig {
+            backend: "docker".into(),
+            image: Some("broodlink/worker:test".into()),
+            ..RuntimeConfig::default()
+        };
+        let local = plan_invocation(&spec, "local", IsolationBackend::Local, &local_cfg).unwrap();
+        let docker =
+            plan_invocation(&spec, "docker", IsolationBackend::Docker, &docker_cfg).unwrap();
+        assert_eq!(local.audit, docker.audit);
+        assert_eq!(local.audit["event"], "worker_spawn");
+        assert_eq!(local.audit["goal"], "summarise the inbox");
+        assert!(local.audit.get("backend").is_none());
+        assert_eq!(docker.argv[0], "docker");
+        assert!(docker.argv.contains(&"broodlink/worker:test".into()));
+        assert_eq!(local.argv[0], "/bin/bash");
+    }
+
+    #[test]
+    fn test_plan_ssh_requires_host() {
+        let spec = sample_spec();
+        let cfg = RuntimeConfig {
+            backend: "ssh".into(),
+            ..RuntimeConfig::default()
+        };
+        let err = plan_invocation(&spec, "lab", IsolationBackend::Ssh, &cfg).unwrap_err();
+        assert!(matches!(err, RuntimeError::MissingField(_, _)));
+    }
+
+    #[test]
+    fn test_plan_ssh_target() {
+        let spec = sample_spec();
+        let cfg = RuntimeConfig {
+            backend: "ssh".into(),
+            host: Some("lab.example".into()),
+            user: Some("broodlink".into()),
+            ..RuntimeConfig::default()
+        };
+        let plan = plan_invocation(&spec, "lab", IsolationBackend::Ssh, &cfg).unwrap();
+        assert!(plan.argv.contains(&"broodlink@lab.example".into()));
+        assert_eq!(plan.audit, {
+            let local_cfg = RuntimeConfig {
+                backend: "local".into(),
+                ..RuntimeConfig::default()
+            };
+            plan_invocation(&spec, "local", IsolationBackend::Local, &local_cfg)
+                .unwrap()
+                .audit
+        });
     }
 }
