@@ -1,0 +1,63 @@
+# Broodlink gitleaks config — extends the default rule set and adds
+# project-specific detectors. Allowlists are limited to known test
+# placeholders and the public env template. Do not add production
+# values here.
+
+title = "Broodlink"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "broodlink-assigned-secret"
+description = "Broodlink secret environment variable assigned a literal value"
+regex = '''BROODLINK_(?:DOLT_PASSWORD|POSTGRES_PASSWORD|QDRANT_API_KEY|STATUS_API_KEY|A2A_API_KEY|NATS_TOKEN|WEBHOOK_SIGNING_KEY|BRAVE_API_KEY|JWT_PRIVATE_KEY)\s*=\s*(?:['"][^$'"\n]{8,}['"]|[A-Za-z0-9+/=_\-]{8,})'''
+tags = ["broodlink", "secret"]
+
+[[rules]]
+id = "brave-search-api-key"
+description = "Brave Search API key"
+regex = '''BSA[A-Za-z0-9_-]{25,}'''
+tags = ["brave", "apikey"]
+
+[[allowlists]]
+description = "Documented local-dev / test placeholders (not production secrets)"
+regexes = [
+  '''dev-api-key''',
+  '''test-password-42''',
+  '''secret123''',
+  '''changeme''',
+  '''broodlink_dev''',
+]
+
+[[allowlists]]
+description = "Public env template — values must stay empty or placeholders"
+paths = [
+  '''(^|/)\.env\.example$''',
+]
+
+[[allowlists]]
+description = "Deliberately invalid tokens used to assert 401 responses"
+regexes = [
+  '''invalid-garbage-token-12345''',
+  '''bad\.jwt\.token''',
+  '''not-a-bearer-token''',
+]
+
+[[allowlists]]
+description = "Auth-rejection tests send known-invalid Bearer tokens"
+ids = ["curl-auth-header"]
+paths = [
+  '''(^|/)tests/''',
+  '''(^|/)status-site/tests/''',
+]
+
+[[allowlists]]
+description = "Local build artifacts (gitignored; not present on CI checkout)"
+paths = [
+  '''(^|/)target/''',
+  '''(^|/)status-site/public/''',
+  '''(^|/)\.venv/''',
+  '''(^|/)agents/\.venv/''',
+  '''(^|/)agents/\.pytest_cache/''',
+]

@@ -473,6 +473,23 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 
 ## [Unreleased]
 
+### Security
+
+- **Separate Build workflow**: Release `cargo build` moved from `CI` into
+  `.github/workflows/build.yml` so lint/test/secret-scan stay independent of
+  the compile check.
+- **Public-repo secret leak prevention**: CI now runs `tests/security-audit.sh`
+  and gitleaks (working tree + git history) on every pull request. Tightened
+  `.gitignore` (env files, keystores, SSH keys, local config), allowlisted
+  only `.env.example`, and added a tracked pre-commit hook
+  (`scripts/install-git-hooks.sh`). The audit treats `.env.example` as the
+  sole public env template and rejects non-placeholder values.
+- **Config test isolation**: `Config::load_from` so broodlink-config unit tests
+  no longer race on the process-global `BROODLINK_CONFIG` env var.
+- **Dependency patches**: anyhow 1.0.104, crossbeam-epoch 0.9.21, h2 0.4.16.
+  Remaining transitive advisories (h2 0.3.x, lopdf via pdf-extract) ignored
+  in deny.toml until upstream upgrades.
+
 ### Added
 
 - **Visual Workflow Editor**: New standalone `/workflows/` dashboard page with

@@ -52,22 +52,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
-  build:
-    name: Build (release)
-    runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, security]
-    env:
-      RUSTFLAGS: "-D warnings"
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Hugo
-        run: curl -fsSL "https://github.com/gohugoio/hugo/releases/download/v${HUGO_VERSION}/hugo_extended_${HUGO_VERSION}_linux-amd64.tar.gz" | tar xz -C /usr/local/bin hugo
-      - name: Build static assets
-        run: hugo --minify --source status-site
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace --release
-
   security:
     name: Security audit
     runs-on: ubuntu-latest
@@ -94,10 +78,34 @@ jobs:
           --ignore RUSTSEC-2026-0099
           --ignore RUSTSEC-2026-0104
           --ignore RUSTSEC-2026-0105
+          --ignore RUSTSEC-2026-0258
+          --ignore RUSTSEC-2026-0187
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Repo secret policy
+        run: bash tests/security-audit.sh
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /tmp gitleaks
+          sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+      - name: Gitleaks (working tree)
+        run: gitleaks detect --source . --no-git --verbose --redact --config .gitleaks.toml
+      - name: Gitleaks (git history)
+        run: gitleaks detect --source . --verbose --redact --config .gitleaks.toml
 
   shellcheck:
     name: ShellCheck
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck scripts/*.sh
+      - run: shellcheck scripts/*.sh .githooks/pre-commit tests/security-audit.sh
