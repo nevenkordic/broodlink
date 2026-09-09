@@ -52,6 +52,9 @@ ignore = [
   # via pdf-extract 0.7 → lopdf 0.34. Fixed in lopdf 0.42 / pdf-extract 0.12;
   # that bump needs a newer rustc (let-chains) and is a separate upgrade.
   "RUSTSEC-2026-0187",
+  # h2 empty DATA frame DoS — patched in 0.4.16. The 0.3.x line is pinned by
+  # reqwest 0.11 / hyper 0.14; 0.4 is upgraded in Cargo.lock.
+  "RUSTSEC-2026-0258",
 ]
 
 [bans]
